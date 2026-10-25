@@ -180,11 +180,15 @@ def test_software_exit_cannot_reenter_same_symbol_in_same_scan(engine, monkeypat
     engine._buy('BTC/USDT', 800, 100, .04)
     engine.public.price, engine.running = 112, True
     monkeypatch.setattr(trader, 'entry_signal', lambda *a, **kw: (True, 'forced', 100))
+    # The quote is far from the flat fake candles; only the exit may exclude BTC.
+    monkeypatch.setattr(trader, 'entry_price_ok', lambda *a, **kw: True)
     seen = []
     monkeypatch.setattr(engine, '_enter_candidates', lambda rows: seen.extend(rows))
     engine.scan_once(allow_orders=True)
     assert not any(p['symbol'] == 'BTC/USDT' for p in engine._active_positions('paper'))
-    assert not any(row[2] == 'BTC/USDT' for row in seen)
+    assert storage.rows("SELECT reason FROM trades WHERE side='SELL'")
+    assert seen and not any(row[2] == 'BTC/USDT' for row in seen)
+    assert any(row[2] == 'ETH/USDT' for row in seen)
 
 
 def test_executable_quote_too_far_from_signal_close_blocks_entry(engine):

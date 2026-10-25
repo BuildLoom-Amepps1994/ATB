@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import mimetypes
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -33,6 +34,10 @@ async def lifespan(application):
 
 
 app = FastAPI(title='CryptoPilot Local', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+# A Windows registry can map .js to text/plain; with nosniff the browser would
+# then refuse to run the dashboard. Static types never depend on the registry.
+mimetypes.add_type('text/javascript', '.js')
+mimetypes.add_type('text/css', '.css')
 app.mount('/static', StaticFiles(directory=str(STATIC)), name='static')
 
 
@@ -73,28 +78,31 @@ async def local_security(request: Request, call_next):
     request.state.csp_nonce = nonce
     def reject(message):
         return _security_headers(JSONResponse({'error': message}, status_code=403), nonce)
-    hosts = request.headers.getlist('host')
-    if len(hosts) != 1:
-        return reject('Local access only.')
-    # Read the trusted ASGI scheme directly: building Request.url first can
-    # raise on a malformed IPv6 Host before our validation gets to reject it.
-    local_origin = _origin(request.scope.get('scheme', 'http') + '://' + hosts[0])
-    if local_origin is None:
-        return reject('Local access only.')
     try:
+        hosts = request.headers.getlist('host')
+        if len(hosts) != 1:
+            return reject('Local access only.')
+        # Read the trusted ASGI scheme directly: building Request.url first can
+        # raise on a malformed IPv6 Host before our validation gets to reject it.
+        local_origin = _origin(request.scope.get('scheme', 'http') + '://' + hosts[0])
+        if local_origin is None:
+            return reject('Local access only.')
         if request.client is None or not ipaddress.ip_address(request.client.host).is_loopback:
             return reject('Local access only.')
-    except ValueError:
+        origins = request.headers.getlist('origin')
+        if len(origins) > 1 or (origins and _origin(origins[0]) != local_origin):
+            return reject('Cross-site action denied.')
+        if request.headers.get('sec-fetch-site') == 'cross-site':
+            return reject('Cross-site action denied.')
+        if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+            tokens = request.headers.getlist('x-cryptopilot-token')
+            # compare_digest accepts ASCII text only; anything else is simply wrong.
+            if len(tokens) != 1 or not tokens[0].isascii() or not secrets.compare_digest(tokens[0], CSRF):
+                return reject('Invalid local action token.')
+    except Exception:
+        # A malformed header must fail closed, never reach the default
+        # traceback handler that echoes request details to the console.
         return reject('Local access only.')
-    origins = request.headers.getlist('origin')
-    if len(origins) > 1 or (origins and _origin(origins[0]) != local_origin):
-        return reject('Cross-site action denied.')
-    if request.headers.get('sec-fetch-site') == 'cross-site':
-        return reject('Cross-site action denied.')
-    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
-        tokens = request.headers.getlist('x-cryptopilot-token')
-        if len(tokens) != 1 or not secrets.compare_digest(tokens[0], CSRF):
-            return reject('Invalid local action token.')
     try:
         response = await call_next(request)
     except Exception as exc:
@@ -244,8 +252,7 @@ def history(symbol: str = 'BTC/USDT', timeframe: str = '1h'):
 
 @app.post('/api/scan')
 def scan():
-    if engine.running:
-        raise HTTPException(status_code=400, detail='Automatic scanning is already active.')
+    # The engine checks for an active worker under its own lock.
     return ensure_ok(lambda: {'markets': engine.scan_once(allow_orders=False)})
 
 

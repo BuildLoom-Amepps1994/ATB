@@ -1,4 +1,9 @@
-"""Read-only local reconciliation report. Never resolves orders or contacts APIs."""
+"""Offline reconciliation report, plus one explicit, confirmed halt reset.
+
+The report never resolves orders or contacts APIs. --clear-halt only records a
+reconciliation a person has already completed against the exchange's own
+order history; it never retries, cancels or guesses an order outcome.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,12 +12,18 @@ import re
 import sqlite3
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from launcher import AlreadyRunning, InstanceLock, data_directory
 
 EXCHANGES = ('mexc', 'kraken')
-STATUSES = {'pending', 'submitted', 'uncertain', 'filled', 'accounted', 'rejected'}
+STATUSES = {'pending', 'submitted', 'uncertain', 'filled', 'accounted', 'rejected', 'reconciled'}
+RESOLVED = ('accounted', 'rejected', 'reconciled')
+
+
+def confirmation_phrase(exchange: str) -> str:
+    return f'I HAVE RECONCILED {exchange.upper()} ORDERS'
 SETTINGS_REASONS = {'invalid_json', 'invalid_values', 'unreadable', 'missing',
                     'save_in_progress', 'recovery_record_invalid', 'backup_unavailable'}
 MANUAL_KEY = re.compile(r'^manual_request\.(paper|live)\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(mexc|kraken)$')
@@ -62,7 +73,7 @@ def _manual_requests(connection):
 def _read_report(folder: Path) -> dict:
     """Caller owns the instance lock. Do not call any application initializer."""
     database = folder / 'portfolio.sqlite3'
-    report = {'notice': NOTICE, 'database_exists': database.is_file(), 'schema_version': None,
+    report = {'notice': NOTICE, 'data_folder': str(folder), 'database_exists': database.is_file(), 'schema_version': None,
               'configured_exchange': None, 'portfolio_scopes': [], 'unresolved_orders': [],
               'unresolved_order_count': 0, 'legacy_live_record_count': 0,
               'live_halt_exchanges': [], 'incomplete_manual_request_counts': {'pending': 0, 'failed': 0, 'malformed': 0},
@@ -131,8 +142,8 @@ def _read_report(folder: Path) -> dict:
                 return report
             # Never print raw free-text reasons, arbitrary extra fields, API
             # account fingerprints, audit messages, settings or exchange order IDs.
-            report['unresolved_order_count'] = connection.execute("SELECT COUNT(*) FROM order_journal WHERE status NOT IN ('accounted','rejected')").fetchone()[0]
-            orders = connection.execute("SELECT intent_id,created_at,exchange,symbol,side,status FROM order_journal WHERE status NOT IN ('accounted','rejected') ORDER BY created_at LIMIT 1000")
+            report['unresolved_order_count'] = connection.execute("SELECT COUNT(*) FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled')").fetchone()[0]
+            orders = connection.execute("SELECT intent_id,created_at,exchange,symbol,side,status FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled') ORDER BY created_at LIMIT 1000")
             for row in orders:
                 report['unresolved_orders'].append({
                     'intent_id': row['intent_id'] if isinstance(row['intent_id'], str) and re.fullmatch('[0-9a-f]{32}', row['intent_id']) else None,
@@ -146,18 +157,85 @@ def _read_report(folder: Path) -> dict:
         connection.close()
 
 
-def report(folder: Path | None = None) -> dict:
+def _existing_folder(folder: Path | None) -> Path:
     location = Path(folder) if folder is not None else data_directory()
+    if not location.is_dir():
+        # The lock would otherwise create an empty data folder and report on it.
+        raise FileNotFoundError(f'No CryptoPilot data folder exists at {location}.')
+    return location
+
+
+def report(folder: Path | None = None) -> dict:
+    location = _existing_folder(folder)
     with InstanceLock(location):
         return _read_report(location)
 
 
+def clear_halt(folder: Path | None, exchange: str, confirmation: str) -> dict:
+    """Record a completed manual reconciliation for one exchange.
+
+    Unresolved order intents become 'reconciled' and the durable halt flag is
+    removed, in one transaction with an audit entry. Legacy live records are
+    untouched: they need a reviewed ledger repair, not a reset.
+    """
+    if exchange not in EXCHANGES:
+        raise ValueError('Unsupported exchange.')
+    if confirmation != confirmation_phrase(exchange):
+        raise ValueError('The exact confirmation phrase is required: ' + confirmation_phrase(exchange))
+    location = _existing_folder(folder)
+    with InstanceLock(location):
+        database = location / 'portfolio.sqlite3'
+        if not database.is_file():
+            raise FileNotFoundError('No local database exists; there is no halt to clear.')
+        connection = sqlite3.connect(str(database), timeout=5)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute('BEGIN IMMEDIATE')
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {'meta', 'order_journal', 'audit'} <= tables:
+                raise ValueError('The database schema is not one this tool can update.')
+            timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+            placeholders = ','.join('?' * len(RESOLVED))
+            reconciled = connection.execute(
+                f'UPDATE order_journal SET status=?,updated_at=? WHERE exchange=? AND status NOT IN ({placeholders})',
+                ('reconciled', timestamp, exchange, *RESOLVED)).rowcount
+            removed = connection.execute('DELETE FROM meta WHERE key=? AND value=?', ('live_halt.' + exchange, '1')).rowcount
+            connection.execute('INSERT INTO audit(created_at,level,message) VALUES (?,?,?)',
+                               (timestamp, 'warning', f'{exchange.upper()} live halt cleared by the recovery tool after confirmed manual reconciliation; '
+                                                      f'{reconciled} order intent(s) marked reconciled.'))
+            legacy = 0
+            for table in ('positions', 'trades'):
+                if table in tables and {'mode', 'exchange'} <= {row[1] for row in connection.execute(f'PRAGMA table_info({table})')}:
+                    legacy += connection.execute(f"SELECT COUNT(*) FROM {table} WHERE mode='live' AND exchange='legacy-unassigned'").fetchone()[0]
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+    return {'exchange': exchange, 'reconciled_orders': reconciled, 'halt_flag_removed': bool(removed),
+            'legacy_live_record_count': legacy,
+            'notice': 'Live trading for this exchange is no longer halted by the journal.' if not legacy
+            else 'Legacy live records still block live trading; they require a reviewed ledger repair.'}
+
+
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--output', type=Path, help='Also save a new JSON report outside the application data folder (existing files are never overwritten).')
+    parser.add_argument('--clear-halt', choices=EXCHANGES, metavar='EXCHANGE',
+                        help='After reconciling every listed order against the exchange, mark the intents reconciled and remove the live halt for this exchange.')
+    parser.add_argument('--confirm', default='',
+                        help='Required with --clear-halt: the exact phrase "I HAVE RECONCILED <EXCHANGE> ORDERS".')
     args = parser.parse_args(argv)
     try:
         folder = data_directory().resolve()
+        if args.clear_halt:
+            if args.output is not None:
+                print('Use --output with a report, not with --clear-halt.', file=sys.stderr)
+                return 1
+            result = clear_halt(folder, args.clear_halt, args.confirm)
+            print(json.dumps(result, indent=2, allow_nan=False))
+            return 0
         destination = args.output.expanduser().resolve() if args.output is not None else None
         if destination is not None and (destination == folder or folder in destination.parents):
             print('Report output must be outside the application data folder. No report was written.', file=sys.stderr)
@@ -170,8 +248,15 @@ def main(argv=None) -> int:
         print(encoded)
         return 0
     except AlreadyRunning:
-        print('Close CryptoPilot before generating a recovery report. The application data folder is currently locked.', file=sys.stderr)
-    except (OSError, sqlite3.Error, ValueError):
+        print('Close CryptoPilot before using the recovery tool. The application data folder is currently locked.', file=sys.stderr)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+    except ValueError as exc:
+        if args.clear_halt:
+            print(str(exc) + ' Nothing was changed.', file=sys.stderr)
+        else:
+            print('Could not read the local database or create the report. No trading state was changed; check file access and the output location.', file=sys.stderr)
+    except (OSError, sqlite3.Error):
         print('Could not read the local database or create the report. No trading state was changed; check file access and the output location.', file=sys.stderr)
     return 1
 

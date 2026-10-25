@@ -53,7 +53,9 @@ class TradingEngine:
         self.cfg = storage.settings()
         self.exchange_name = self.cfg['exchange']
         self.public = self._new_exchange(self.exchange_name)
-        self.data = MarketData(self.public, wait=self.stop_event.wait)
+        self.data = MarketData(self.public, wait=self._retry_wait)
+        self.markets_loaded_at = 0.0
+        self._halt_pending = None
         self.private = self.api_key = self.api_secret = None
         self.credential_source = 'none'
         self.mode = 'paper'
@@ -93,7 +95,40 @@ class TradingEngine:
     def _key(self, name: str) -> str:
         return storage.scope_key(name, self.exchange_name)
 
+    def _retry_wait(self, seconds: float) -> bool:
+        """Back-off between public read retries.
+
+        A Stop interrupts the wait only while an order could follow the read.
+        Idle dashboard reads (charts, backtests, manual scans) keep their
+        retries even though the event stays set after the last Stop.
+        """
+        if self.running or self._manual_order_active:
+            return self.stop_event.wait(seconds)
+        time.sleep(seconds)
+        return False
+
+    def _catalogue(self) -> dict:
+        """Loaded public market definitions. CCXT keeps None until load_markets."""
+        markets = getattr(self.public, 'markets', None)
+        return markets if isinstance(markets, dict) else {}
+
+    @staticmethod
+    def _order_id(order) -> str | None:
+        identifier = order.get('id') if isinstance(order, dict) else None
+        return str(identifier) if identifier not in (None, '') else None
+
     def _durable_live_block(self) -> bool:
+        pending = self._halt_pending
+        if pending:
+            # A halt whose flag could not be written stays in force and is
+            # re-persisted at the first opportunity.
+            try:
+                storage.set_meta(storage.scope_key('live_halt', pending), '1')
+                self._halt_pending = None
+            except Exception:
+                pass
+            if pending == self.exchange_name:
+                return True
         return bool(storage.unresolved_orders() or storage.legacy_live_records()
                     or storage.get_meta(self._key('live_halt')) == '1')
 
@@ -102,7 +137,7 @@ class TradingEngine:
 
     def _require_idle(self):
         if self._busy():
-            raise ValueError('Wait for the bot and any active scan to finish before changing this setting.')
+            raise storage.ConfigValidationError('Wait for the bot and any active scan to finish before changing this setting.')
 
     def _restore_from_keyring(self):
         pair = credentials.load(self.exchange_name)
@@ -120,13 +155,16 @@ class TradingEngine:
         daily_state = (storage.get_meta(self._key(f'baseline.live.{today}'))
                        or storage.get_meta(self._key(f'breached.live.{today}')))
         if (tracked or daily_state) and previous != fingerprint:
-            raise ValueError('Live positions, orders, or current-day risk state belong to another or unverified API identity; reconcile before replacing credentials.')
+            raise storage.ConfigValidationError('Live positions, orders, or current-day risk state belong to another or unverified API identity; reconcile before replacing credentials.')
         if bind and previous != fingerprint:
             storage.set_meta(meta, fingerprint)
 
     def _read_balance(self, client=None) -> dict:
+        # MEXC selects its spot wallet by type; Kraken forwards unknown fields
+        # to its balance endpoint, so it receives no extra parameters.
+        params = {'type': 'spot'} if self.exchange_name == 'mexc' else {}
         with self.private_lock:
-            balance = (client or self._ensure_private()).fetch_balance({'type': 'spot'})
+            balance = (client or self._ensure_private()).fetch_balance(params)
         if not isinstance(balance, dict) or not isinstance(balance.get('free'), dict):
             raise ValueError('Exchange returned an invalid spot balance')
         free = balance['free'].get('USDT', 0)
@@ -138,11 +176,11 @@ class TradingEngine:
 
     def connect(self, key: str, secret: str, remember: bool = False):
         if not isinstance(key, str) or not key.strip() or not isinstance(secret, str) or not secret.strip():
-            raise ValueError('API key and secret are both required.')
+            raise storage.ConfigValidationError('API key and secret are both required.')
         with self.lock:
             self._require_idle()
             if self.mode != 'paper':
-                raise ValueError('Return to paper mode before changing credentials.')
+                raise storage.ConfigValidationError('Return to paper mode before changing credentials.')
             self._account_guard(key)
             self.control_busy = True
         try:
@@ -163,6 +201,13 @@ class TradingEngine:
                         self.credential_source = 'Operating-system credential manager'
                 except credentials.CredentialStoreUnavailable:
                     storage.audit('warning', 'Secure credential storage unavailable; credentials remain in process memory.')
+            else:
+                try:
+                    saved = credentials.load(self.exchange_name)
+                except Exception:
+                    saved = None
+                if saved and saved[0] != key:
+                    storage.audit('warning', 'Different saved credentials remain in the operating-system credential manager and reload after a restart. Disconnect to remove them.')
             storage.audit('info', f'{self.exchange_name.upper()} spot account connected. Live trading still requires explicit opt-in.')
         finally:
             with self.lock:
@@ -172,7 +217,7 @@ class TradingEngine:
         with self.lock:
             self._require_idle()
             if self.mode != 'paper':
-                raise ValueError('Switch to paper mode before disconnecting.')
+                raise storage.ConfigValidationError('Switch to paper mode before disconnecting.')
             self.private = self.api_key = self.api_secret = None
             self.manual_order_context = str(uuid.uuid4())
             self.latest_balance = self.balance_updated_at = None
@@ -186,7 +231,7 @@ class TradingEngine:
                 self._account_guard(self.api_key)
             if self.private is None:
                 if not self.api_key or not self.api_secret:
-                    raise ValueError('Connect exchange API credentials before enabling live trading.')
+                    raise storage.ConfigValidationError('Connect exchange API credentials before enabling live trading.')
                 self._account_guard(self.api_key)
                 client = self._new_exchange(self.exchange_name, self.api_key, self.api_secret)
                 client.load_markets()
@@ -208,17 +253,16 @@ class TradingEngine:
                 if storage.settings_health()['review_required']:
                     raise storage.ConfigValidationError('Review and explicitly save the recovered settings before enabling live trading.')
                 if confirmation != 'ENABLE LIVE TRADING' or eligible is not True:
-                    raise ValueError('Live trading requires the exact confirmation and exchange eligibility acknowledgement.')
+                    raise storage.ConfigValidationError('Live trading requires the exact confirmation and exchange eligibility acknowledgement.')
                 if self.live_halted or self._durable_live_block():
                     self.live_halted = True
-                    raise ValueError('Live trading is blocked by unresolved orders or legacy account records; reconcile them manually first.')
+                    raise storage.ConfigValidationError('Live trading is blocked by unresolved orders or legacy account records; reconcile them manually first.')
                 self.control_busy = True
             else:
-                raise ValueError('Invalid trading mode.')
+                raise storage.ConfigValidationError('Invalid trading mode.')
         if mode == 'live':
             try:
-                if self.api_key:
-                    self._account_guard(self.api_key, bind=True)
+                # The identity binds only after the account read succeeds.
                 self._ensure_private()
                 with self.lock:
                     self.mode = mode
@@ -234,13 +278,13 @@ class TradingEngine:
             revised = storage.validate_settings(data, base=self.cfg)
             changed_exchange = revised['exchange'] != self.exchange_name
             if changed_exchange and self.mode != 'paper':
-                raise ValueError('Return to paper mode before changing exchanges.')
+                raise storage.ConfigValidationError('Return to paper mode before changing exchanges.')
             candidate_public = candidate_data = None
             if changed_exchange:
                 # Constructor/adapter failures cannot leave an old authenticated
                 # client paired with a new exchange ledger scope.
                 candidate_public = self._new_exchange(revised['exchange'])
-                candidate_data = MarketData(candidate_public, wait=self.stop_event.wait)
+                candidate_data = MarketData(candidate_public, wait=self._retry_wait)
             storage.save_settings(revised)
             self.cfg = revised
             if changed_exchange:
@@ -253,7 +297,7 @@ class TradingEngine:
                 self.last_asks.clear()
                 self.last_price_times.clear()
                 self.market_rows, self.discovered = [], []
-                self.last_universe_update = 0
+                self.last_universe_update = self.markets_loaded_at = 0
                 self.live_halted = self._durable_live_block()
                 self._restore_from_keyring()
             self.risk_block = None
@@ -276,7 +320,7 @@ class TradingEngine:
                 if storage.settings_health()['review_required']:
                     raise storage.ConfigValidationError('Review and explicitly save the recovered settings before starting live trading.')
                 if self.live_halted or self._durable_live_block():
-                    raise ValueError('Live trading is halted pending manual order/account reconciliation.')
+                    raise storage.ConfigValidationError('Live trading is halted pending manual order/account reconciliation.')
             self.control_busy = True
             generation = self.stop_generation
         try:
@@ -314,9 +358,9 @@ class TradingEngine:
         next_scan = 0.0
         try:
             while not self.stop_event.is_set():
-                self._monitor_if_due()
+                exited = self._monitor_if_due()
                 if time.monotonic() >= next_scan and not self.stop_event.is_set():
-                    self.scan_once(allow_orders=True)
+                    self.scan_once(allow_orders=True, exited_symbols=exited)
                     # Never catch up with a burst of scans after a slow API.
                     next_scan = time.monotonic() + float(self.cfg['scan_seconds'])
                 delay = max(.05, min(next_scan, self._next_monitor) - time.monotonic())
@@ -409,11 +453,35 @@ class TradingEngine:
                 or any(market.get(k) for k in ('contract', 'swap', 'future', 'option'))
                 or market.get('type', 'spot') != 'spot'):
             return False
+        info = market.get('info')
+        if isinstance(info, dict):
+            # MEXC lists pairs that accept limit orders only; every bot order is a market order.
+            order_types = info.get('orderTypes')
+            if isinstance(order_types, list) and 'MARKET' not in order_types:
+                return False
         base = symbol.split('/')[0]
-        return not any(base.endswith(suffix) for suffix in ('3L', '3S', '5L', '5S', 'UP', 'DOWN', 'BULL', 'BEAR'))
+        # Leveraged tokens carry a direction suffix after a real base (BTC3L,
+        # ETHBULL). A base that is only the suffix, or one letter plus it (JUP), is a coin.
+        return not any(base.endswith(suffix) and len(base) - len(suffix) >= 2
+                       for suffix in ('3L', '3S', '5L', '5S', 'UP', 'DOWN', 'BULL', 'BEAR'))
 
     def _fetch_markets(self):
-        return self.data.markets()
+        """Load the public catalogue once, then refresh it hourly.
+
+        A failed refresh keeps the previous catalogue rather than trading on
+        nothing; a listing change is still caught at the exchange.
+        """
+        if self.markets_loaded_at and time.monotonic() - self.markets_loaded_at < 3600:
+            return self.data.markets()
+        try:
+            markets = self.data.read('load_markets', True) if self.markets_loaded_at else self.data.markets()
+        except Exception as exc:
+            if not self.markets_loaded_at:
+                raise
+            storage.audit('warning', f'Market catalogue refresh unavailable: {type(exc).__name__}; the previous catalogue remains in use.')
+            return self._catalogue()
+        self.markets_loaded_at = time.monotonic()
+        return markets
 
     def _universe(self) -> list[str]:
         held = [p['symbol'] for p in self._active_positions(self.mode)]
@@ -424,8 +492,9 @@ class TradingEngine:
                     raise ValueError('Bulk tickers unsupported')
                 tickers = self.data.read('fetch_tickers')
                 ranking = []
+                catalogue = self._catalogue()
                 for symbol, ticker in tickers.items():
-                    if self._spot(symbol, self.public.markets.get(symbol)):
+                    if self._spot(symbol, catalogue.get(symbol)):
                         volume = finite_positive(ticker.get('quoteVolume'))
                         if volume >= self.cfg['min_quote_volume']:
                             ranking.append((volume, symbol))
@@ -445,7 +514,7 @@ class TradingEngine:
 
     def _cash(self, mode: str) -> float:
         if mode == 'paper':
-            raw = storage.get_meta(self._key('paper_cash'), '10000')
+            raw = storage.get_meta(self._key('paper_cash'), str(self.cfg['paper_start_usdt']))
             value = float(raw)
             if not math.isfinite(value) or value < 0:
                 raise ValueError('Paper cash ledger is invalid')
@@ -484,7 +553,13 @@ class TradingEngine:
             invalid('Missing or crossed bid-ask quotes')
         observed = time.time()
         raw_timestamp = ticker.get('timestamp')
-        timestamp = observed if raw_timestamp is None else finite_positive(raw_timestamp) / 1000
+        if raw_timestamp is None:
+            # Exchanges without ticker timestamps (Kraken) are aged from the
+            # moment the response arrived, not from this later observation.
+            received = finite_positive(ticker.get('_received_at'))
+            timestamp = received if received and received <= observed else observed
+        else:
+            timestamp = finite_positive(raw_timestamp) / 1000 + self._clock_offset()
         if (not timestamp or timestamp > observed + 30
                 or observed - timestamp > self.cfg['data_max_age_seconds']):
             invalid('Ticker timestamp is stale or invalid')
@@ -497,6 +572,18 @@ class TradingEngine:
                 self.last_asks.pop(symbol, None)
             self.last_price_times[symbol] = timestamp
         return ask if for_buy else bid, finite_positive(ticker.get('quoteVolume')), spread
+
+    def _clock_offset(self) -> float:
+        """Seconds to add to an exchange timestamp to compare it with this PC's clock.
+
+        CCXT measures local-minus-server once per catalogue load when
+        adjustForTimeDifference is enabled (MEXC). Without it, no offset applies.
+        """
+        options = getattr(self.public, 'options', None)
+        difference = options.get('timeDifference') if isinstance(options, dict) else None
+        if isinstance(difference, bool) or not isinstance(difference, (int, float)) or not math.isfinite(difference):
+            return 0.0
+        return difference / 1000
 
     def _equity(self, mode: str, cash: float, positions: list[dict]) -> float:
         liquidation_factor = (1 - self.cfg['slippage_pct'] / 100) * (1 - self.cfg['fee_pct'] / 100)
@@ -532,6 +619,10 @@ class TradingEngine:
         # cannot be bypassed by restarting the process.
         try:
             storage.set_meta(self._key('live_halt'), '1')
+        except Exception:
+            with self.lock:
+                self._halt_pending = self.exchange_name
+        try:
             storage.audit('error', 'LIVE HALT: ' + description + '. Reconcile manually; no automatic resubmission.')
         except Exception:
             pass
@@ -544,22 +635,64 @@ class TradingEngine:
                 self.risk_block = self.last_error = description
                 self.stop_event.set()
 
+    CONFIRM_DELAYS = (.25, .5, 1., 2., 3.)
+
     def _confirm_filled(self, client, symbol: str, order: dict) -> dict:
-        for attempt in range(3):
+        """Poll until the accepted order reports a final state.
+
+        The order already exists at the exchange, so a Stop request never
+        shortens this wait: an unread outcome would only become a halt.
+        """
+        last = len(self.CONFIRM_DELAYS) - 1
+        for attempt, delay in enumerate(self.CONFIRM_DELAYS):
             if isinstance(order, dict):
                 if (order.get('id') and order.get('status') in ('closed', 'canceled', 'cancelled', 'expired')
                         and finite_positive(order.get('filled'))):
                     return order  # A final partial fill is accounted, never silently erased.
                 if not order.get('id'):
                     break
-                if attempt < 2:
-                    self.stop_event.wait(.2 * (attempt + 1))
+                if attempt < last:
+                    time.sleep(delay)
                     try:
                         with self.private_lock:
                             order = client.fetch_order(order['id'], symbol)
                     except Exception:
                         continue
         raise RuntimeError('Order acceptance/final fill is uncertain; manual reconciliation is required')
+
+    def _resolve_fees(self, client, symbol: str, order: dict) -> dict:
+        """Attach fees from the order's own trades when the order reports none.
+
+        MEXC order records carry no fee; its trade records do. A failed or
+        empty read leaves the order unchanged, so the configured estimate
+        applies rather than a blocked ledger.
+        """
+        reported = order.get('fees') or ([order['fee']] if isinstance(order.get('fee'), dict) else [])
+        if any(isinstance(fee, dict) and fee.get('currency') and fee.get('cost') is not None for fee in reported):
+            return order
+        supported = getattr(client, 'has', {}).get('fetchOrderTrades')
+        order_id = self._order_id(order)
+        if not supported or not order_id:
+            return order
+        params = {}
+        if supported == 'emulated':
+            # Kraken resolves trades from the identifiers its order record lists.
+            trades = order.get('trades')
+            if not isinstance(trades, list) or not trades:
+                return order
+            params['trades'] = trades
+        try:
+            with self.private_lock:
+                trades = client.fetch_order_trades(order_id, symbol, None, None, params)
+        except Exception as exc:
+            storage.audit('warning', f'Executed fees for {symbol} unavailable: {type(exc).__name__}; the configured fee estimate applies.')
+            return order
+        if not isinstance(trades, list) or not trades:
+            return order
+        fees = [trade.get('fee') for trade in trades if isinstance(trade, dict)]
+        if len(fees) != len(trades) or not all(isinstance(fee, dict) and fee.get('currency') for fee in fees):
+            return order
+        return {**order, 'fees': fees}
 
     def _submit(self, client, symbol: str, side: str, *, quantity=None, cost=None):
         """Durable intent precedes exactly one submission; reads alone may repeat."""
@@ -570,24 +703,31 @@ class TradingEngine:
                 return None, None
             intent = storage.create_order_intent(self.exchange_name, symbol, side,
                                                   quantity=quantity, cost=cost)
+            # Kraken charges fees in the base asset by default, which the ledger
+            # cannot value; fciq requests the quote (USDT) for both sides.
+            params = {'oflags': 'fciq'} if self.exchange_name == 'kraken' else {}
             with self.private_lock:
                 if not self._orders_allowed():
                     storage.update_order_intent(intent, 'rejected')
                     return None, None
                 if side == 'BUY':
-                    order = client.create_market_buy_order_with_cost(symbol, cost)
+                    order = client.create_market_buy_order_with_cost(symbol, cost, params)
                 else:
-                    order = client.create_order(symbol, 'market', 'sell', quantity)
+                    order = client.create_order(symbol, 'market', 'sell', quantity, None, params)
                 create_returned = True
-            storage.update_order_intent(intent, 'submitted', order_id=str(order.get('id', '')) if isinstance(order, dict) else None)
+            storage.update_order_intent(intent, 'submitted', order_id=self._order_id(order))
             order = self._confirm_filled(client, symbol, order)
-            storage.update_order_intent(intent, 'filled', order_id=str(order.get('id', '')))
+            storage.update_order_intent(intent, 'filled', order_id=self._order_id(order))
+            try:
+                order = self._resolve_fees(client, symbol, order)
+            except Exception:
+                pass  # A fee read is optional; the fill itself is confirmed.
             return intent, order
         except Exception as exc:
             # A documented exchange rejection confirms no order was accepted.
             # Transport errors and unrecognized responses always remain uncertain.
             rejected = tuple(cls for name in ('InsufficientFunds', 'InvalidOrder', 'AuthenticationError',
-                                              'PermissionDenied', 'BadSymbol', 'NotSupported')
+                                              'PermissionDenied', 'BadSymbol', 'BadRequest', 'NotSupported')
                              if isinstance(cls := getattr(ccxt, name, None), type))
             if intent and not create_returned and rejected and isinstance(exc, rejected):
                 try:
@@ -673,7 +813,7 @@ class TradingEngine:
         existing = next((p for p in self._active_positions(self.mode) if p['symbol'] == symbol), None)
         if (not all(finite_positive(v) for v in (budget, price, fraction)) or fraction >= 1
                 or (existing and (not merge_dust or not self._is_dust(
-                    existing, getattr(self.public, 'markets', {}).get(symbol), price)))):
+                    existing, self._catalogue().get(symbol), price)))):
             return False
         mode, exchange = self.mode, self.exchange_name
         fee_rate, slip = self.cfg['fee_pct'] / 100, self.cfg['slippage_pct'] / 100
@@ -691,8 +831,13 @@ class TradingEngine:
                 raise storage.ConfigValidationError('This exchange adapter does not support bounded-cost market buys.')
             with self.private_lock:
                 market = client.market(symbol)
-                if not self._spot(symbol, market):
-                    raise ValueError('Live orders require a verified active spot market')
+                # The authenticated client keeps the catalogue it loaded at
+                # connection; the public copy is refreshed hourly.
+                if not self._spot(symbol, market) or not self._spot(symbol, self._catalogue().get(symbol)):
+                    raise storage.ConfigValidationError('Live orders require a verified active spot market.')
+                info = market.get('info')
+                if isinstance(info, dict) and info.get('quoteOrderQtyMarketAllowed') is False:
+                    raise storage.ConfigValidationError('This pair does not accept market buys by USDT amount on the exchange.')
                 if existing and not self._is_dust(existing, market, price):
                     raise storage.ConfigValidationError('The existing position exceeds the verified exchange dust limit.')
                 spend = float(client.cost_to_precision(symbol, budget / (1 + fee_rate)))
@@ -711,7 +856,7 @@ class TradingEngine:
                 qty, cost = filled - base_fee, gross + quote_fee
                 if qty <= 0 or cost > budget * 1.03:
                     raise ValueError('Executed quantity/cost differs from the reserved budget')
-                order_id = str(order.get('id', ''))
+                order_id = self._order_id(order)
             except Exception as exc:
                 self._halt_uncertain(f'BUY {symbol}: {type(exc).__name__}; fill/fee accounting requires review')
                 return False
@@ -789,12 +934,17 @@ class TradingEngine:
                 self.risk_block = f'No freely available tracked balance for {symbol}; manual review required'
                 storage.audit('error', self.risk_block)
                 return False
+            if available < tracked * (1 - 1e-9):
+                storage.audit('warning', f'{symbol}: free exchange balance {available:.8g} is below the tracked quantity {tracked:.8g}; only the available amount can be sold.')
             with self.private_lock:
                 market = client.market(symbol)
-                if not self._spot(symbol, market):
-                    raise ValueError('Live exits require a verified active spot market')
+                if not self._spot(symbol, market) or not self._spot(symbol, self._catalogue().get(symbol)):
+                    raise storage.ConfigValidationError('Live exits require a verified active spot market.')
                 requested = min(tracked, available)
-                amount = float(client.amount_to_precision(symbol, requested))
+                try:
+                    amount = float(client.amount_to_precision(symbol, requested))
+                except (ccxt.InvalidOrder, ValueError, TypeError):
+                    amount = 0.0  # Below the smallest tradable step: retained below.
             limits = market.get('limits') or {}
             min_quantity = finite_positive((limits.get('amount') or {}).get('min'))
             min_cost = finite_positive((limits.get('cost') or {}).get('min'))
@@ -811,7 +961,7 @@ class TradingEngine:
                 consumed = filled + base_fee
                 if consumed > tracked * (1 + 1e-10) or filled > amount * (1 + 1e-10):
                     raise ValueError('Fill or base fee would consume untracked holdings')
-                order_id = str(order.get('id', ''))
+                order_id = self._order_id(order)
             except Exception as exc:
                 self._halt_uncertain(f'SELL {symbol}: {type(exc).__name__}; fill/fee accounting requires review')
                 return False
@@ -858,7 +1008,7 @@ class TradingEngine:
     def _protect_positions(self, symbol: str, price: float):
         for position in self._active_positions(self.mode):
             if position['symbol'] == symbol:
-                if self._is_dust(position, getattr(self.public, 'markets', {}).get(symbol), price):
+                if self._is_dust(position, self._catalogue().get(symbol), price):
                     continue
                 if price <= position['stop']:
                     self._sell(position, price, 'Stored stop / trailing stop (software monitored)')
@@ -879,21 +1029,24 @@ class TradingEngine:
                 self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
                 return
             if (self._orders_allowed() and not self._is_dust(
-                    position, getattr(self.public, 'markets', {}).get(symbol), price)):
+                    position, self._catalogue().get(symbol), price)):
                 if price <= stop:
                     self._sell(position, price, 'Updated trailing stop (software monitored)')
                 elif trend_broken:
                     self._sell(position, price, 'Completed-candle trend reversal')
 
-    def scan_once(self, allow_orders: bool = False):
+    def scan_once(self, allow_orders: bool = False, exited_symbols=None):
         # Acquiring this while holding the state lock makes config/start checks
         # atomic with a scan. The state lock is released before every network read.
         with self.lock:
-            if self.control_busy and not allow_orders:
-                raise ValueError('An account operation is in progress')
+            if not allow_orders:
+                if self.control_busy:
+                    raise storage.ConfigValidationError('An account operation is in progress.')
+                if self.running or (self.thread and self.thread.is_alive()):
+                    raise storage.ConfigValidationError('Automatic scanning is already active.')
             acquired = self.scan_lock.acquire(blocking=False)
             if not acquired and not allow_orders:
-                return list(self.market_rows)
+                raise storage.ConfigValidationError('Wait for the active chart, backtest or order operation to finish.')
         if not acquired:
             # A worker queues behind a chart/backtest rather than losing an
             # entire risk-management scan until its next polling interval.
@@ -906,7 +1059,8 @@ class TradingEngine:
         with self.lock:
             self.last_scan, self.last_error = now(), None
         assessments, candidates = [], []
-        exited_symbols = set()
+        # Exits the worker's last protective poll performed stay excluded here.
+        exited_symbols = set(exited_symbols or ())
         successful_assessments = 0
         try:
             horizon = self.cfg['time_horizon']
@@ -925,7 +1079,7 @@ class TradingEngine:
                 tickers = self.data.tickers(symbols)
             except Exception:
                 tickers = {}
-            catalogue = getattr(self.public, 'markets', {})
+            catalogue = self._catalogue()
             for symbol in symbols:
                 if allow_orders and self.stop_event.is_set():
                     break
@@ -1202,7 +1356,7 @@ class TradingEngine:
                 self.risk_block = 'A held asset has a stale or missing price; new entries blocked'
             return
         with self.lock:
-            catalogue = getattr(self.public, 'markets', {})
+            catalogue = self._catalogue()
             tradable = [p for p in positions if not self._is_dust(p, catalogue.get(p['symbol']), self.last_prices[p['symbol']])]
             protective_pending = any(self.last_prices[p['symbol']] <= p['stop']
                                      or self.last_prices[p['symbol']] >= p['target'] for p in tradable)
@@ -1227,19 +1381,23 @@ class TradingEngine:
             tradable = [p for p in positions if not self._is_dust(p, catalogue.get(p['symbol']), self.last_prices[p['symbol']])]
             if len(tradable) >= self.cfg['max_positions'] or any(p['symbol'] == symbol for p in positions):
                 continue
-            if not self._marks_fresh(positions) or not self._fresh(symbol):
+            if not self._marks_fresh(positions):
+                # Held assets value the equity every candidate is sized from.
                 with self.lock:
-                    self.risk_block = 'Portfolio or candidate price became stale; entries blocked'
+                    self.risk_block = 'A held asset has a stale or missing price; new entries blocked'
                 break
             key = self._key(f'last_entry.{self.mode}.{symbol}')
             if storage.get_meta(key) == str(candle):
                 continue
             primary_tf = HORIZONS[self.cfg['time_horizon']][0]
-            if storage.get_meta(self._key(f'last_exit.{self.mode}.{symbol}.{primary_tf}')) == str(candle):
+            if self._exited_since(symbol, primary_tf, candle):
                 continue
             # Re-read a candidate immediately before reserving funds. A scan of
             # many coins can otherwise place an entry using an old quote.
-            price, volume, spread = self._observe_ticker(symbol, self.data.ticker(symbol), for_buy=True)
+            try:
+                price, volume, spread = self._observe_ticker(symbol, self.data.ticker(symbol), for_buy=True)
+            except ValueError:
+                continue  # One unquotable candidate must not end the pass.
             if (volume < self.cfg['min_quote_volume'] or spread is None
                     or spread > self.cfg['max_spread_pct']
                     or not entry_price_ok(price, signal_close, atr, observed_price=observed_price)):
@@ -1258,16 +1416,26 @@ class TradingEngine:
             if self.mode == 'live' and self.live_halted:
                 break
 
+    def _exited_since(self, symbol: str, primary_tf: str, candle) -> bool:
+        """True when a software exit happened on or after the signal candle."""
+        saved = storage.get_meta(self._key(f'last_exit.{self.mode}.{symbol}.{primary_tf}'))
+        if not saved:
+            return False
+        try:
+            return int(candle) <= int(float(saved))
+        except (TypeError, ValueError):
+            return True  # An unreadable record blocks rather than permits reentry.
+
     def _acquire_analysis(self, *, research=False):
         with self.lock:
             if research and (self.running or (self.thread and self.thread.is_alive())):
-                raise ValueError('Stop the bot before downloading a research backtest so protective monitoring can continue')
+                raise storage.ConfigValidationError('Stop the bot before downloading a research backtest so protective monitoring can continue.')
             if self.control_busy or not self.scan_lock.acquire(blocking=False):
-                raise ValueError('Wait for the active scan or account operation to finish')
+                raise storage.ConfigValidationError('Wait for the active scan or account operation to finish.')
 
     def history(self, symbol: str, tf: str = '1h') -> list[dict]:
         if tf not in TIMEFRAME_SECONDS:
-            raise ValueError('Invalid chart timeframe')
+            raise storage.ConfigValidationError('Invalid chart timeframe.')
         with self.lock:
             active = self.running or (self.thread and self.thread.is_alive())
             if active:
@@ -1277,7 +1445,7 @@ class TradingEngine:
                 wall, monotonic = time.time(), time.monotonic()
                 if (not saved or not saved[2] <= wall < saved[0]
                         or monotonic >= saved[3]):
-                    raise ValueError('Waiting for a cached chart from the active scan; stop the bot to download another timeframe')
+                    raise storage.ConfigValidationError('Waiting for a cached chart from the active scan; stop the bot to download another timeframe.')
                 frame = saved[1].copy()
         if active:
             return self._history_rows(frame)
@@ -1285,7 +1453,7 @@ class TradingEngine:
         try:
             catalogue = self._fetch_markets()
             if not self._spot(symbol, catalogue.get(symbol)):
-                raise ValueError('Pair is not an allowed active spot market')
+                raise storage.ConfigValidationError('Pair is not an allowed active spot market.')
             frame = self.data.candles(symbol, tf, limit=180)
             return self._history_rows(frame)
         finally:
@@ -1305,12 +1473,12 @@ class TradingEngine:
     def research_backtest(self, symbol: str, tf: str = '1h') -> dict:
         higher_tf = {'1m': '5m', '5m': '1h', '1h': '4h', '4h': '1d', '1d': '1w'}.get(tf)
         if higher_tf is None:
-            raise ValueError('Backtests support 1m, 5m, 1h, 4h, and 1d timeframes')
+            raise storage.ConfigValidationError('Backtests support 1m, 5m, 1h, 4h, and 1d timeframes.')
         self._acquire_analysis(research=True)
         try:
             catalogue = self._fetch_markets()
             if not self._spot(symbol, catalogue.get(symbol)):
-                raise ValueError('Pair is not an allowed active spot market')
+                raise storage.ConfigValidationError('Pair is not an allowed active spot market.')
             cutoff = int(time.time() * 1000)
             rows = self.data.read('fetch_ohlcv', symbol, tf, limit=900)
             higher = self.data.read('fetch_ohlcv', symbol, higher_tf, limit=900)
@@ -1339,7 +1507,7 @@ class TradingEngine:
                 mark = self.last_prices.get(symbol)
                 age = self._price_age(symbol)
                 dust = bool(self._fresh(symbol) and self._is_dust(
-                    position, getattr(self.public, 'markets', {}).get(symbol), mark))
+                    position, self._catalogue().get(symbol), mark))
                 detailed.append({**position, 'mark': mark, 'mark_stale': not self._fresh(symbol),
                                  'price_basis': 'bid', 'dust': dust, 'exit_untradable': dust,
                                  'price_age_seconds': round(age, 1) if age is not None else None,

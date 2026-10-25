@@ -207,20 +207,24 @@ def _settings_state():
     if _SETTINGS_CACHE is not None and _SETTINGS_CACHE[0] == signature:
         return _copy_settings(_SETTINGS_CACHE[1]), dict(_SETTINGS_CACHE[2])
     backup_path, recovery_path = _settings_paths()
-    backup, _, _, _ = _read_settings_file(backup_path)
-    # Legacy partial configurations can be adopted once. After a complete
-    # last-good copy exists, removed risk fields must not silently use defaults.
-    current, fault, raw, exchange = _read_settings_file(CONFIG_PATH, require_complete=backup is not None)
+    backup, backup_fault, backup_raw, _ = _read_settings_file(backup_path)
+    # Legacy partial configurations can be adopted once. After a last-good
+    # copy was ever written, removed risk fields must not silently use defaults.
+    current, fault, raw, exchange = _read_settings_file(CONFIG_PATH, require_complete=backup_fault != 'missing')
     record = _read_recovery_record()
     # Only a genuinely new profile may be initialized without explicit review.
     if (fault == 'missing' and not backup_path.exists() and not recovery_path.exists()
             and not DB_PATH.exists()):
         save_settings(DEFAULTS)
         current, fault, raw, exchange = _read_settings_file(CONFIG_PATH)
-        backup, _, _, _ = _read_settings_file(backup_path)
+        backup, backup_fault, backup_raw, _ = _read_settings_file(backup_path)
         record = _read_recovery_record()
     if fault is not None:
         record = _latch_settings_review(fault, raw)
+    elif backup_fault not in (None, 'missing'):
+        # A damaged last-good copy is evidence of a disk problem. Keep it for
+        # review instead of overwriting it with the only remaining copy.
+        record = _latch_settings_review('backup_unavailable', backup_raw)
     elif record is None and backup is None:
         # Adopt a valid pre-upgrade configuration as the first last-good copy.
         try:
@@ -312,7 +316,8 @@ def _create_positions(db):
 def init_db():
     # Preserve old rows; live records without an exchange/account identity are
     # quarantined until manually reconciled, never guessed from current settings.
-    exchange = settings()['exchange']
+    cfg = settings()
+    exchange, paper_start = cfg['exchange'], cfg['paper_start_usdt']
     with connection() as db:
         db.execute('PRAGMA journal_mode=WAL')
         # SQLite DDL is transactional only inside an explicit transaction. A
@@ -361,7 +366,7 @@ def init_db():
                             db.execute('INSERT OR IGNORE INTO meta(key,value) VALUES (?,?)', (scope_key(key, exchange), row['value']))
             db.execute("INSERT INTO meta(key,value) VALUES ('migration.legacy_paper_metadata_v2','1')")
         for name in EXCHANGES:
-            db.execute('INSERT OR IGNORE INTO meta(key,value) VALUES (?,?)', (scope_key('paper_cash', name), str(DEFAULTS['paper_start_usdt'])))
+            db.execute('INSERT OR IGNORE INTO meta(key,value) VALUES (?,?)', (scope_key('paper_cash', name), str(paper_start)))
         db.execute('''CREATE TABLE IF NOT EXISTS order_journal (
             intent_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             exchange TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
@@ -401,9 +406,15 @@ def redact(message: object) -> str:
 
 
 def audit(level: str, message: str):
+    level, message = str(level)[:20], redact(message)[:500]
     with connection() as db:
-        db.execute('INSERT INTO audit(created_at,level,message) VALUES (?,?,?)',
-                   (_now(), str(level)[:20], redact(message)[:500]))
+        # A condition reported every poll (a stale quote, a retained remainder)
+        # refreshes its latest entry instead of flushing the 300-row history.
+        latest = db.execute('SELECT id,level,message FROM audit ORDER BY id DESC LIMIT 1').fetchone()
+        if latest and latest['level'] == level and latest['message'] == message:
+            db.execute('UPDATE audit SET created_at=? WHERE id=?', (_now(), latest['id']))
+            return
+        db.execute('INSERT INTO audit(created_at,level,message) VALUES (?,?,?)', (_now(), level, message))
         db.execute('DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT 300)')
 
 
@@ -424,8 +435,13 @@ def create_order_intent(exchange: str, symbol: str, side: str, quantity: float |
     return intent_id
 
 
+RESOLVED_ORDER_STATUSES = ('accounted', 'rejected', 'reconciled')
+
+
 def update_order_intent(intent_id: str, status: str, order_id: str | None = None, db=None) -> None:
-    if status not in ('pending', 'submitted', 'uncertain', 'filled', 'accounted', 'rejected'):
+    # 'reconciled' is only ever written by the offline recovery tool after a
+    # person has compared the journal with the exchange's own order history.
+    if status not in ('pending', 'submitted', 'uncertain', 'filled', *RESOLVED_ORDER_STATUSES):
         raise ValueError('Invalid order journal status.')
     def update(connection):
         cursor = connection.execute('UPDATE order_journal SET status=?,updated_at=?,order_id=COALESCE(?,order_id) WHERE intent_id=?',
@@ -440,7 +456,7 @@ def update_order_intent(intent_id: str, status: str, order_id: str | None = None
 
 
 def unresolved_orders(exchange: str | None = None) -> list[dict]:
-    sql = "SELECT * FROM order_journal WHERE status NOT IN ('accounted','rejected')"
+    sql = "SELECT * FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled')"
     return rows(sql + (' AND exchange=?' if exchange else '') + ' ORDER BY created_at', (exchange,) if exchange else ())
 
 
@@ -450,8 +466,9 @@ def legacy_live_records() -> int:
 
 def reset_paper(exchange: str):
     scope_key('', exchange)
+    paper_start = settings()['paper_start_usdt']
     with connection() as db:
         db.execute("DELETE FROM positions WHERE mode='paper' AND exchange=?", (exchange,))
         db.execute("DELETE FROM trades WHERE mode='paper' AND exchange=?", (exchange,))
-        db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (scope_key('paper_cash', exchange), str(DEFAULTS['paper_start_usdt'])))
+        db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (scope_key('paper_cash', exchange), str(paper_start)))
         db.execute("DELETE FROM meta WHERE (key LIKE 'last_entry.paper.%' OR key LIKE 'last_exit.paper.%' OR key LIKE 'manual_request.paper.%' OR key LIKE 'baseline.paper.%' OR key LIKE 'breached.paper.%') AND key LIKE ?", ('%.' + exchange,))

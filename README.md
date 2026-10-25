@@ -6,6 +6,8 @@ Version **1.2.0** repairs the packaged TLS startup failure and adds a stopped-bo
 
 Version **1.3.0** improves executable-side pricing, crash recovery and research integrity. Holdings and software exits use validated bid quotes, while Buy checks use asks. Last trade prices cannot hide a sell-side loss. Verified below-minimum remainders retain their cost/quantity and exposure but do not occupy a tradable slot or block all other coins. Damaged settings retain the last validated limits and require explicit review/save before live activation. Manual fill results and candle reentry guards now commit in the same database transaction as their fills.
 
+The **code review fixes** that follow 1.3.0 close several live-execution gaps: fill confirmation now waits for the exchange even when Stop was pressed, Kraken orders request USDT-denominated fees, MEXC fills read their actual fees from the order's trades, a stopped bot's chart and backtest reads retry again, an unloaded market catalogue can no longer crash a scan, the catalogue refreshes hourly, and the offline recovery tool gains an explicit, confirmed `--clear-halt`. See [review fixes and remaining limits](BOT_IMPROVEMENTS_REVIEW.md).
+
 Live and research signals share bounded indicator windows and an entry-gap guard. The research screen compares fixed-rule earlier/later periods and a full-period double-cost replay, reports insufficient coverage/sample size, and saves a JSON report with assumptions and candle fingerprints. These are descriptive checks, not an independent profitable strategy certification. See [1.3 validation and remaining limits](BOT_IMPROVEMENTS_1.3.0.md).
 
 ## Run on Windows
@@ -55,7 +57,7 @@ Keys can stay in the process or be saved as one paired record in a trusted OS cr
 
 Live activation requires stopping the bot, a verified API connection, eligibility acknowledgement, and the exact phrase **ENABLE LIVE TRADING**. Mode activation alone places no orders. Press Start for automation, or use the manual ticket while stopped and confirm each action with **PLACE LIVE BUY** / **PLACE LIVE SELL**. Restarting always returns to stopped paper mode. API-key fingerprint checks prevent reusing tracked live positions or current-day live risk state with a different key identity. This conservatively blocks legitimate key rotation too; reconciliation may be required. A key fingerprint is not an exchange-verified account identifier.
 
-Every live submit first commits an order intent. Confirmed fills and portfolio updates are recorded durably; uncertain outcomes or ledger failures halt live execution and remain blocked after restart. Partial fills remain tracked. Quote/base fees are used when reported. Missing fee data uses configured estimates; unsupported fee currencies halt execution for manual reconciliation. Inspect actual exchange balances/orders after any unexpected shutdown, timeout or discrepancy. Live equity covers free USDT plus tracked bot positions, not your complete account.
+Every live submit first commits an order intent. Confirmed fills and portfolio updates are recorded durably; uncertain outcomes or ledger failures halt live execution and remain blocked after restart. Partial fills remain tracked. Quote/base fees are used when reported. Kraken orders are sent with the `fciq` flag so fees are charged in USDT; MEXC order records carry no fee, so the fee is read from the order's own trades. Missing fee data uses configured estimates; unsupported fee currencies halt execution for manual reconciliation. A Stop request never shortens the wait for an accepted order's final state. Inspect actual exchange balances/orders after any unexpected shutdown, timeout or discrepancy. Live equity covers free USDT plus tracked bot positions, not your complete account.
 
 ## Persistence, upgrades and recovery
 
@@ -65,7 +67,15 @@ Before upgrading, close the old app and back up the **entire data folder**. Do n
 
 Legacy paper records migrate to their original configured exchange. Old live rows without reliable exchange/account identity are preserved as `legacy-unassigned` and block live activation. An unresolved order must never be treated as failed solely because its HTTP request timed out. Paper research remains available while live is blocked.
 
-With the app closed, run `python recovery.py` (or use `.venv\Scripts\python.exe`) for a local, read-only diagnostic report. `--output report.json` saves its safe fields to a new file outside the application data folder. This tool makes no exchange requests, reads no credential store, and cannot clear a halt. Reconcile every outstanding intent/legacy holding using the exchange's official account interface, preserve evidence and backups, and have the ledger mapping reviewed before restoring live operation. There is deliberately no automatic retry or blind reset for uncertain live orders.
+With the app closed, run `python recovery.py` (or use `.venv\Scripts\python.exe`) for a local, read-only diagnostic report. `--output report.json` saves its safe fields to a new file outside the application data folder. The report makes no exchange requests and reads no credential store. Reconcile every outstanding intent/legacy holding using the exchange's official account interface, preserve evidence and backups, and have the ledger mapping reviewed before restoring live operation. There is deliberately no automatic retry or blind reset for uncertain live orders.
+
+Once every listed order for an exchange has been checked against the exchange's own order history, and any filled quantity has been added to or removed from the tracked positions by hand, clear that exchange's halt with the app still closed:
+
+```
+python recovery.py --clear-halt mexc --confirm "I HAVE RECONCILED MEXC ORDERS"
+```
+
+This marks the exchange's unresolved intents `reconciled`, removes the durable halt flag and writes an activity entry, all in one transaction. It never retries, cancels or guesses an order outcome, and it leaves legacy live records in place; those still block live trading until the ledger has been repaired under review.
 
 ## Backtests
 
@@ -99,6 +109,6 @@ Double-click `BUILD_WINDOWS_EXE.bat` to create an isolated build environment and
 | `app.py` | Loopback HTTP API, exact-origin action protection, safe errors |
 | `static/` | Dashboard, charts and connection handling |
 | `launcher.py` | Profile lock, exclusive port and browser startup |
-| `recovery.py` | Read-only local recovery report |
+| `recovery.py` | Offline recovery report and the confirmed `--clear-halt` reset |
 
 Engineering references: [CCXT manual](https://docs.ccxt.com/docs/manual), [keyring security](https://keyring.readthedocs.io/en/stable/#security-considerations), [MEXC spot API](https://www.mexc.com/api-docs/spot-v3/introduction), [Kraken API](https://docs.kraken.com/api/).

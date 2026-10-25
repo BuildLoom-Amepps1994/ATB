@@ -52,13 +52,16 @@ function updateControls() {
 async function action(name, path, data, message, configRefresh = false) {
   if (busy.has(name)) return;
   busy.add(name); updateControls();
+  let accepted = false;
   try {
     await api(path, 'POST', data, {timeoutMs: name === 'scan' ? 120000 : 30000});
+    accepted = true;
     if (message) toast(message);
   } catch (error) { toast(error.message, true); }
   finally {
     // A timed-out mutation can have committed. Always re-read state and never retry it automatically.
-    await refresh(configRefresh, true); busy.delete(name); updateControls();
+    // A rejected settings save keeps the typed values on screen for correction.
+    await refresh(configRefresh && accepted, true); busy.delete(name); updateControls();
   }
 }
 function readSettings() {
@@ -131,14 +134,19 @@ async function refresh(fill = false, force = false) {
 async function poll() {
   await refresh(); clearTimeout(pollTimer); pollTimer = setTimeout(poll, document.hidden ? 30000 : state?.mode === 'live' || state?.running ? 2000 : 10000);
 }
+let chartLoaded = null;
 async function selectChart(symbol) {
   chartSymbol = symbol; $('chartSymbol').textContent = symbol; $('chartPair').value = symbol;
-  chartData = []; draw(); $('chartStatus').textContent = 'Loading completed candles…';
+  // A refresh of the same pair keeps the last frame on screen until the new one arrives;
+  // a different selection must never show another pair's candles.
+  if (!chartLoaded || chartLoaded.symbol !== symbol || chartLoaded.tf !== chartTF) { chartData = []; chartLoaded = null; draw(); }
+  $('chartStatus').textContent = 'Loading completed candles…';
   try {
     const result = await chartRequest(signal => api('/history?symbol=' + encodeURIComponent(symbol) + '&timeframe=' + chartTF, 'GET', undefined, {signal, timeoutMs: 45000}));
     if (!result) return;
-    chartData = result.value.candles; $('chartStatus').textContent = chartData.length + ' completed candles · updated ' + new Date().toLocaleTimeString(); draw();
-  } catch (error) { $('chartStatus').textContent = 'Chart unavailable: ' + error.message; }
+    chartData = result.value.candles; chartLoaded = {symbol, tf: chartTF};
+    $('chartStatus').textContent = chartData.length + ' completed candles · updated ' + new Date().toLocaleTimeString(); draw();
+  } catch (error) { $('chartStatus').textContent = 'Chart unavailable: ' + error.message + (chartData.length ? ' · showing the previous frame' : ''); }
 }
 function canvasSetup(canvas) {
   const dpr = Math.min(2, window.devicePixelRatio || 1), box = canvas.getBoundingClientRect(); canvas.width = Math.round(box.width * dpr); canvas.height = Math.round(box.height * dpr);

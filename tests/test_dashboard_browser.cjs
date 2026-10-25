@@ -1,0 +1,157 @@
+// Optional offline browser regression test. Requires Playwright and an installed Chromium browser.
+// node tests/test_dashboard_browser.cjs; set CRYPTOPILOT_BROWSER_CHANNEL=msedge to use installed Edge.
+const {chromium} = require(process.env.CRYPTOPILOT_PLAYWRIGHT_MODULE || 'playwright');
+const fs = require('node:fs');
+const assert = require('node:assert/strict');
+const root = require('node:path').resolve(__dirname, '..');
+(async()=>{
+ const browser = await chromium.launch({headless:true,...(process.env.CRYPTOPILOT_BROWSER_CHANNEL ? {channel:process.env.CRYPTOPILOT_BROWSER_CHANNEL} : {})});
+ try {
+ const page = await browser.newPage({viewport:{width:1450,height:1100}});
+ const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ const config={exchange:'mexc',watchlist:['BTC/USDT','ETH/USDT'],auto_discovery:false,time_horizon:'balanced',scan_seconds:180,protective_poll_seconds:5,risk_pct:.65,max_position_pct:8,max_exposure_pct:40,max_portfolio_risk_pct:3,data_max_age_seconds:120,max_positions:5,max_meme_position_pct:3,max_meme_exposure_pct:10,daily_loss_limit_pct:3,min_quote_volume:5000000};
+ const data={config,settings_health:{review_required:false},exchange:'mexc',manual_order_context:'00000000-0000-4000-8000-000000000001',running:false,stopping:false,mode:'paper',equity:10000,cash:10000,realized:0,positions:[],trades:[],audit:[],connected:false,credentials_stored:false,markets:[{symbol:'BTC/USDT',price:100,rsi:'<img src=x onerror=alert(1)>',score:12,status:'No signal'}],live_halted:false};
+ const sample={available:true,return_pct:1,max_drawdown_pct:2,closed_trades:1,data_range:{start_ms:1700000000000,end_ms:1700003600000},coverage:{higher_ready_pct:95},sample_notes:['Fewer than 5 closed trades.']};
+ const diagnostics={development:sample,holdout:sample,double_cost:sample,parameters:{risk_pct:.65},notes:['<svg onload=alert(1)>']};
+ let offline=false,holdOrder=false,partialSell=false,releaseOrder;const mutations=[],orders=[];
+ await page.route('http://127.0.0.1:8765/**',async route=>{
+  const url=new URL(route.request().url());
+  if(route.request().method()!=='GET')mutations.push(url.pathname);
+  if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:fs.readFileSync(root+'/static/index.html','utf8').replace('__CRYPTOPILOT_CSRF__','"test-token"').replace('__CRYPTOPILOT_NONCE__','test-nonce'),headers:{'Content-Security-Policy':"default-src 'none'; script-src 'self' 'nonce-test-nonce'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:"}});
+  if(url.pathname.startsWith('/static/'))return route.fulfill({contentType:'application/javascript',body:fs.readFileSync(root+url.pathname)});
+  if(url.pathname==='/api/state'){if(offline)return route.abort();return route.fulfill({json:data});}
+  if(url.pathname==='/api/history')return route.fulfill({json:{candles:Array.from({length:100},(_,i)=>({t:1700000000000+i*3600000,close:100+i,ema20:i<19?null:99+i,ema50:i<49?null:95+i}))}});
+  if(url.pathname==='/api/backtest')return route.fulfill({json:{return_pct:1,buy_hold_pct:2,max_drawdown_pct:3,closed_trades:4,win_rate_pct:50,ending_equity:10100,equity_curve:[{time:1700000000000,equity:10000},{time:1700003600000,equity:10100}],data_range:{start_ms:1700000000000,end_ms:1700003600000},research_report:diagnostics,warning:'Historical research only.'}});
+  if(url.pathname==='/api/order'){
+   const body=route.request().postDataJSON();orders.push(body);
+   if(holdOrder)await new Promise(resolve=>{releaseOrder=resolve;});
+   const partial=partialSell&&body.side==='sell';
+   data.positions=body.side==='buy'||partial?[{symbol:body.symbol,qty:partial ? .4 : 1,entry_price:25,mark:25,stop:24,target:27,unrealized:0}]:[];
+   return route.fulfill({json:{status:partial?'partial':'filled',remaining_quantity:partial ? .4 : 0,mode:data.mode,side:body.side,symbol:body.symbol}});
+  }
+  return route.fulfill({json:{ok:true}});
+ });
+ await page.goto('http://127.0.0.1:8765/');
+ // Make automatic test scrolling deterministic on the long dashboard.
+ await page.evaluate(()=>{document.documentElement.style.scrollBehavior='auto';});
+ await page.waitForFunction(()=>document.getElementById('equity').textContent==='10,000.00');
+ await page.waitForFunction(()=>document.getElementById('chartStatus').textContent.includes('100 completed'));
+ assert.equal(await page.locator('#connectionBanner').isVisible(),false);
+ assert.equal(await page.locator('#markets img').count(),0);
+ await page.selectOption('#btSymbol','ETH/USDT');
+ await page.click('#backtestBtn');
+ await page.waitForFunction(()=>document.getElementById('backtestResults').textContent.includes('ETH/USDT'));
+ assert.equal(await page.locator('#backtestResults').getByText('Buy & hold (net costs)').count(),1);
+ assert.equal(await page.locator('#researchDiagnostics').isVisible(),true);
+ assert.equal(await page.locator('#researchDiagnostics tbody tr').count(),3);
+ assert.equal(await page.locator('#researchDiagnostics svg').count(),0);
+ assert.match(await page.locator('#researchDiagnostics').textContent(),/Later holdout/);
+ const [download]=await Promise.all([page.waitForEvent('download'),page.click('#downloadResearch')]);
+ assert.equal(download.suggestedFilename(),'CryptoPilot-research-ETH-USDT-1h.json');
+ const saved=JSON.parse(fs.readFileSync(await download.path(),'utf8'));
+ assert.equal(saved.symbol,'ETH/USDT');assert.equal(saved.results.research_report.parameters.risk_pct,.65);
+ await page.evaluate(()=>{window.originalOrderOption=document.querySelector('#orderSymbol option');});
+ await page.evaluate(()=>refresh());
+ assert.equal(await page.evaluate(()=>window.originalOrderOption===document.querySelector('#orderSymbol option')),true);
+ assert.equal(await page.locator('#btSymbol').inputValue(),'ETH/USDT');
+ await page.selectOption('#chartPair','ETH/USDT');
+ await page.waitForFunction(()=>document.getElementById('chartSymbol').textContent==='ETH/USDT');
+ await page.click('#liveBtn');
+ assert.equal(await page.locator('#confirmLive').isDisabled(),true);
+ await page.keyboard.press('Escape');
+ assert.equal(await page.locator('#liveModal').isVisible(),false);
+ await page.selectOption('#orderSymbol','ETH/USDT');
+ await page.fill('#orderBudget','25');
+ holdOrder=true;await page.click('#orderBuy');
+ await page.waitForFunction(()=>document.getElementById('orderResult').textContent.includes('Submitting one PAPER'));
+ for(let wait=0;!releaseOrder&&wait<100;wait++)await new Promise(resolve=>setTimeout(resolve,10));
+ assert.equal(typeof releaseOrder,'function');
+ assert.equal(await page.locator('#orderBuy').isDisabled(),true);
+ assert.equal(await page.locator('#orderSell').isDisabled(),true);
+ assert.equal(await page.locator('#stopBtn').isDisabled(),false);
+ await page.evaluate(()=>prepareOrder('buy'));
+ assert.equal(orders.length,1);
+ releaseOrder();holdOrder=false;
+ await page.waitForFunction(()=>document.getElementById('orderResult').textContent.includes('PAPER BUY confirmed'));
+ await page.waitForFunction(()=>!document.getElementById('orderSell').disabled);
+ assert.equal(orders[0].quote_amount,25);assert.equal(orders[0].confirmation,'');
+ assert.equal(orders[0].expected_context,'00000000-0000-4000-8000-000000000001');
+ assert.match(orders[0].request_id,/^[0-9a-f-]{36}$/);
+ await page.click('#orderSell');
+ await page.waitForFunction(()=>document.getElementById('orderResult').textContent.includes('PAPER SELL confirmed'));
+ await page.waitForFunction(()=>!document.getElementById('orderBuy').disabled);
+ assert.equal(await page.locator('#orderSell').isDisabled(),true);
+ data.mode='live';data.connected=true;data.manual_order_context='00000000-0000-4000-8000-000000000002';await page.evaluate(()=>refresh());
+ await page.click('#orderBuy');await page.fill('#orderConfirm','PLACE LIVE BUY');
+ assert.equal((await page.locator('#orderSummary').textContent()).includes('MEXC'),true);
+ data.exchange='kraken';data.config.exchange='kraken';data.manual_order_context='00000000-0000-4000-8000-000000000003';await page.evaluate(()=>refresh());
+ assert.equal(await page.locator('#confirmOrder').isDisabled(),true);
+ assert.equal(await page.locator('#orderContextChanged').isVisible(),true);
+ assert.equal(orders.length,2);
+ await page.click('#cancelOrder');
+ data.exchange='mexc';data.config.exchange='mexc';data.manual_order_context='00000000-0000-4000-8000-000000000004';await page.evaluate(()=>refresh());
+ await page.click('#orderBuy');
+ assert.equal(await page.locator('#confirmOrder').isDisabled(),true);
+ assert.equal((await page.locator('#orderSummary').textContent()).includes('ETH/USDT'),true);
+ await page.fill('#orderConfirm','PLACE LIVE SELL');
+ assert.equal(await page.locator('#confirmOrder').isDisabled(),true);
+ assert.equal(orders.length,2);
+ await page.fill('#orderConfirm','PLACE LIVE BUY');await page.click('#confirmOrder');
+ await page.waitForFunction(()=>document.getElementById('orderResult').textContent.includes('LIVE BUY confirmed'));
+ await page.waitForFunction(()=>!document.getElementById('orderSell').disabled);
+ assert.equal(orders[2].confirmation,'PLACE LIVE BUY');
+ assert.equal(orders[2].expected_context,'00000000-0000-4000-8000-000000000004');
+ assert.notEqual(orders[2].request_id,orders[0].request_id);
+ await page.click('#orderSell');await page.fill('#orderConfirm','PLACE LIVE SELL');await page.click('#confirmOrder');
+ await page.waitForFunction(()=>document.getElementById('orderResult').textContent.includes('LIVE SELL confirmed'));
+ assert.equal(orders[3].confirmation,'PLACE LIVE SELL');
+ data.mode='paper';data.connected=false;await page.evaluate(()=>refresh());
+ await page.waitForFunction(()=>!document.getElementById('orderBuy').disabled);
+ await page.click('#orderBuy');
+ await page.waitForFunction(()=>document.getElementById('orderResult').textContent.includes('PAPER BUY confirmed'));
+ await page.waitForFunction(()=>!document.getElementById('orderSell').disabled);
+ partialSell=true;await page.click('#orderSell');
+ await page.waitForFunction(()=>document.getElementById('orderResult').textContent.includes('PAPER SELL partially filled'));
+ await page.waitForFunction(()=>!document.getElementById('orderSell').disabled);
+ assert.equal((await page.locator('#orderResult').textContent()).includes('Remaining tracked quantity: 0.40000000'),true);
+ data.live_halted=true;data.valuation_stale=true;
+ data.positions=[{symbol:'ETH/USDT',qty:1,entry_price:100,mark:null,mark_stale:true,price_age_seconds:null,stop:90,target:120,unrealized:null}];
+ await page.evaluate(()=>refresh());
+ assert.equal(await page.locator('#startBtn').isDisabled(),false);
+ assert.equal(await page.locator('#liveBtn').isDisabled(),true);
+ assert.equal(await page.locator('#equityCaption').textContent(),'Stale valuation · last quote or entry estimate');
+ assert.equal(await page.locator('#positions').getByText('Quote stale').count(),1);
+ assert.equal((await page.locator('#positions').textContent()).includes('+—'),false);
+ data.live_halted=false;data.valuation_stale=false;data.positions=[];
+ data.running=true;await page.evaluate(()=>refresh());
+ assert.equal(await page.locator('#backtestBtn').isDisabled(),true);
+ assert.equal(await page.locator('#orderBuy').isDisabled(),true);
+ data.running=false;await page.evaluate(()=>refresh());
+ assert.equal(await page.locator('#backtestBtn').isDisabled(),false);
+ offline=true;await page.evaluate(()=>refresh());
+ assert.equal(await page.locator('#connectionBanner').isVisible(),true);
+ assert.equal(await page.locator('#startBtn').isDisabled(),true);
+ assert.equal(await page.locator('#orderBuy').isDisabled(),true);
+ assert.equal(await page.locator('#stopBtn').isDisabled(),false);
+ offline=false;await page.evaluate(()=>refresh());
+ assert.equal(await page.locator('#connectionBanner').isVisible(),false);
+ data.settings_health={review_required:true,using_last_known_good:true};await page.evaluate(()=>refresh());
+ assert.equal(await page.locator('#settingsRecovery').isVisible(),true);
+ assert.equal(await page.locator('#liveBtn').isDisabled(),true);
+ assert.equal(await page.locator('#saveBtn').isDisabled(),false);
+ await page.click('#reviewSettings');assert.equal(await page.locator('#riskPct').evaluate(el=>el===document.activeElement),true);
+ data.settings_health={review_required:false};await page.evaluate(()=>refresh());
+ assert.equal(await page.locator('#settingsRecovery').isVisible(),false);
+
+ await page.setViewportSize({width:390,height:844});
+ await page.evaluate(()=>window.scrollTo(0,0));
+ assert.equal(await page.locator('#chartPair').isVisible(),true);
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth > window.innerWidth),false);
+
+ assert.deepEqual(errors,[]);
+ assert.deepEqual(mutations,['/api/backtest','/api/order','/api/order','/api/order','/api/order','/api/order','/api/order']);
+ console.log('PASS: CSP boot, charts, escaping, backtests, modal keyboard, fake paper/live sequential orders, exact confirmations, duplicate-click guard, emergency stop during submit, stale/running controls; 0 page errors; desktop/mobile layouts. All HTTP routes intercepted; no real trading actions.');
+ } finally {await browser.close();}
+})().catch(e=>{console.error(e);process.exitCode=1;});
+
+

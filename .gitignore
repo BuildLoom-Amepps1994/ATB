@@ -1,0 +1,12 @@
+.venv/
+.build-venv/
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.pyc
+*.sqlite3*
+settings.json
+instance.lock
+.env*
+node_modules/

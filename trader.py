@@ -1,0 +1,1377 @@
+"""Local SPOT-only service. Paper by default; uncertain execution fails closed."""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+import ccxt
+
+import credentials
+import storage
+from market_data import MarketData
+from strategy import entry_price_ok, entry_signal, regime_signal, research_report, stop_fraction
+
+
+KNOWN_MEMES = {'DOGE', 'SHIB', 'PEPE', 'BONK', 'FLOKI', 'WIF', 'BRETT', 'POPCAT',
+               'MOG', 'TURBO', 'FARTCOIN', 'PNUT', 'BOME', 'PENGU', 'NEIRO', 'BABYDOGE'}
+
+HORIZONS = {'rapid': ('1m', '5m'), 'balanced': ('1h', '4h'),
+            'swing': ('4h', '1d'), 'position': ('1d', '1w')}
+TIMEFRAME_SECONDS = {'1m': 60, '5m': 300, '1h': 3600, '4h': 14400,
+                     '1d': 86400, '1w': 604800}
+
+
+def is_meme(symbol: str) -> bool:
+    return symbol.split('/')[0] in KNOWN_MEMES
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def finite_positive(number: Any) -> float:
+    try:
+        value = float(number)
+        return value if not isinstance(number, bool) and math.isfinite(value) and value > 0 else 0.0
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
+
+
+class TradingEngine:
+    def __init__(self):
+        storage.init_db()
+        self.lock = threading.RLock()
+        self.private_lock = threading.RLock()
+        self.scan_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.cfg = storage.settings()
+        self.exchange_name = self.cfg['exchange']
+        self.public = self._new_exchange(self.exchange_name)
+        self.data = MarketData(self.public, wait=self.stop_event.wait)
+        self.private = self.api_key = self.api_secret = None
+        self.credential_source = 'none'
+        self.mode = 'paper'
+        self.running = self.stopping = False
+        self.control_busy = False
+        self._manual_order_active = False
+        self.manual_order_context = str(uuid.uuid4())
+        self.stop_generation = 0
+        self.thread = None
+        self.last_scan = self.last_successful_scan = self.last_error = None
+        self.last_monitor = self.last_successful_monitor = self.monitor_error = None
+        self._next_monitor = 0.0
+        self.market_rows: list[dict] = []
+        self.last_prices: dict[str, float] = {}
+        self.last_asks: dict[str, float] = {}
+        self.last_price_times: dict[str, float] = {}
+        self.price_times = self.last_price_times
+        self.latest_balance = self.balance_updated_at = None
+        self.last_universe_update = 0.0
+        self.discovered: list[str] = []
+        self.risk_block = None
+        self.live_halted = self._durable_live_block()
+        self._restore_from_keyring()
+
+    @staticmethod
+    def _new_exchange(name: str, key: str = '', secret: str = ''):
+        if name not in ('mexc', 'kraken'):
+            raise ValueError('Supported exchanges: MEXC, Kraken')
+        options = {'enableRateLimit': True, 'timeout': 18000, 'maxRetriesOnFailure': 0,
+                   'options': {'defaultType': 'spot', 'maxRetriesOnFailure': 0}}
+        if name == 'mexc':
+            options['options'].update({'adjustForTimeDifference': True, 'recvWindow': 5000})
+        if key and secret:
+            options.update({'apiKey': key, 'secret': secret})
+        return getattr(ccxt, name)(options)
+
+    def _key(self, name: str) -> str:
+        return storage.scope_key(name, self.exchange_name)
+
+    def _durable_live_block(self) -> bool:
+        return bool(storage.unresolved_orders() or storage.legacy_live_records()
+                    or storage.get_meta(self._key('live_halt')) == '1')
+
+    def _busy(self) -> bool:
+        return bool(self.control_busy or self.running or (self.thread and self.thread.is_alive()) or self.scan_lock.locked())
+
+    def _require_idle(self):
+        if self._busy():
+            raise ValueError('Wait for the bot and any active scan to finish before changing this setting.')
+
+    def _restore_from_keyring(self):
+        pair = credentials.load(self.exchange_name)
+        if pair:
+            self.api_key, self.api_secret = pair
+            self.credential_source = 'Operating-system credential manager'
+            # Loading saved secrets never authenticates or enables live mode.
+
+    def _account_guard(self, key: str, *, bind: bool = False):
+        fingerprint = hashlib.sha256((self.exchange_name + '\0' + key).encode('utf8')).hexdigest()
+        meta = self._key('live_account_fingerprint')
+        previous = storage.get_meta(meta)
+        tracked = self._active_positions('live') or storage.unresolved_orders(self.exchange_name)
+        today = datetime.now(timezone.utc).date().isoformat()
+        daily_state = (storage.get_meta(self._key(f'baseline.live.{today}'))
+                       or storage.get_meta(self._key(f'breached.live.{today}')))
+        if (tracked or daily_state) and previous != fingerprint:
+            raise ValueError('Live positions, orders, or current-day risk state belong to another or unverified API identity; reconcile before replacing credentials.')
+        if bind and previous != fingerprint:
+            storage.set_meta(meta, fingerprint)
+
+    def _read_balance(self, client=None) -> dict:
+        with self.private_lock:
+            balance = (client or self._ensure_private()).fetch_balance({'type': 'spot'})
+        if not isinstance(balance, dict) or not isinstance(balance.get('free'), dict):
+            raise ValueError('Exchange returned an invalid spot balance')
+        free = balance['free'].get('USDT', 0)
+        if isinstance(free, bool) or not isinstance(free, (int, float)) or not math.isfinite(free) or free < 0:
+            raise ValueError('Exchange returned an invalid free USDT balance')
+        with self.lock:
+            self.latest_balance, self.balance_updated_at = balance, time.time()
+        return balance
+
+    def connect(self, key: str, secret: str, remember: bool = False):
+        if not isinstance(key, str) or not key.strip() or not isinstance(secret, str) or not secret.strip():
+            raise ValueError('API key and secret are both required.')
+        with self.lock:
+            self._require_idle()
+            if self.mode != 'paper':
+                raise ValueError('Return to paper mode before changing credentials.')
+            self._account_guard(key)
+            self.control_busy = True
+        try:
+            storage.register_secrets(key, secret)
+            client = self._new_exchange(self.exchange_name, key, secret)
+            with self.private_lock:
+                client.load_markets()
+                self._read_balance(client)
+            self._account_guard(key, bind=True)
+            with self.lock:
+                self.private, self.api_key, self.api_secret = client, key, secret
+                self.credential_source = 'session'
+                self.manual_order_context = str(uuid.uuid4())
+            if remember:
+                try:
+                    credentials.save(self.exchange_name, key, secret)
+                    with self.lock:
+                        self.credential_source = 'Operating-system credential manager'
+                except credentials.CredentialStoreUnavailable:
+                    storage.audit('warning', 'Secure credential storage unavailable; credentials remain in process memory.')
+            storage.audit('info', f'{self.exchange_name.upper()} spot account connected. Live trading still requires explicit opt-in.')
+        finally:
+            with self.lock:
+                self.control_busy = False
+
+    def disconnect(self):
+        with self.lock:
+            self._require_idle()
+            if self.mode != 'paper':
+                raise ValueError('Switch to paper mode before disconnecting.')
+            self.private = self.api_key = self.api_secret = None
+            self.manual_order_context = str(uuid.uuid4())
+            self.latest_balance = self.balance_updated_at = None
+            self.credential_source = 'none'
+            credentials.delete(self.exchange_name)
+            storage.audit('info', 'Session credentials cleared and saved credential removal verified.')
+
+    def _ensure_private(self):
+        with self.private_lock:
+            if self.api_key:
+                self._account_guard(self.api_key)
+            if self.private is None:
+                if not self.api_key or not self.api_secret:
+                    raise ValueError('Connect exchange API credentials before enabling live trading.')
+                self._account_guard(self.api_key)
+                client = self._new_exchange(self.exchange_name, self.api_key, self.api_secret)
+                client.load_markets()
+                self._read_balance(client)
+                self._account_guard(self.api_key, bind=True)
+                with self.lock:
+                    self.private = client
+            return self.private
+
+    def set_mode(self, mode: str, confirmation: str = '', eligible: bool = False):
+        with self.lock:
+            self._require_idle()
+            if mode == 'paper':
+                self.mode = mode
+                self.manual_order_context = str(uuid.uuid4())
+                self.risk_block = None
+                storage.audit('info', 'Trading mode: PAPER (simulation).')
+            elif mode == 'live':
+                if storage.settings_health()['review_required']:
+                    raise storage.ConfigValidationError('Review and explicitly save the recovered settings before enabling live trading.')
+                if confirmation != 'ENABLE LIVE TRADING' or eligible is not True:
+                    raise ValueError('Live trading requires the exact confirmation and exchange eligibility acknowledgement.')
+                if self.live_halted or self._durable_live_block():
+                    self.live_halted = True
+                    raise ValueError('Live trading is blocked by unresolved orders or legacy account records; reconcile them manually first.')
+                self.control_busy = True
+            else:
+                raise ValueError('Invalid trading mode.')
+        if mode == 'live':
+            try:
+                if self.api_key:
+                    self._account_guard(self.api_key, bind=True)
+                self._ensure_private()
+                with self.lock:
+                    self.mode = mode
+                    self.manual_order_context = str(uuid.uuid4())
+                storage.audit('warning', f'LIVE SPOT explicitly enabled for {self.exchange_name.upper()}.')
+            finally:
+                with self.lock:
+                    self.control_busy = False
+
+    def update_config(self, data: dict):
+        with self.lock:
+            self._require_idle()
+            revised = storage.validate_settings(data, base=self.cfg)
+            changed_exchange = revised['exchange'] != self.exchange_name
+            if changed_exchange and self.mode != 'paper':
+                raise ValueError('Return to paper mode before changing exchanges.')
+            candidate_public = candidate_data = None
+            if changed_exchange:
+                # Constructor/adapter failures cannot leave an old authenticated
+                # client paired with a new exchange ledger scope.
+                candidate_public = self._new_exchange(revised['exchange'])
+                candidate_data = MarketData(candidate_public, wait=self.stop_event.wait)
+            storage.save_settings(revised)
+            self.cfg = revised
+            if changed_exchange:
+                self.exchange_name = revised['exchange']
+                self.public, self.data = candidate_public, candidate_data
+                self.private = self.api_key = self.api_secret = None
+                self.credential_source = 'none'
+                self.latest_balance = self.balance_updated_at = None
+                self.last_prices.clear()
+                self.last_asks.clear()
+                self.last_price_times.clear()
+                self.market_rows, self.discovered = [], []
+                self.last_universe_update = 0
+                self.live_halted = self._durable_live_block()
+                self._restore_from_keyring()
+            self.risk_block = None
+            self.manual_order_context = str(uuid.uuid4())
+            storage.audit('info', 'Trading configuration validated and saved.')
+
+    def reset_paper_portfolio(self):
+        """Serialize reset with manual orders, scans, starts and account changes."""
+        with self.lock:
+            if self._busy() or self.mode != 'paper':
+                raise storage.ConfigValidationError('Stop the bot, wait for active operations, and switch to paper mode before resetting.')
+            storage.reset_paper(self.exchange_name)
+            self.risk_block = None
+            self.manual_order_context = str(uuid.uuid4())
+
+    def start(self):
+        with self.lock:
+            self._require_idle()
+            if self.mode == 'live':
+                if storage.settings_health()['review_required']:
+                    raise storage.ConfigValidationError('Review and explicitly save the recovered settings before starting live trading.')
+                if self.live_halted or self._durable_live_block():
+                    raise ValueError('Live trading is halted pending manual order/account reconciliation.')
+            self.control_busy = True
+            generation = self.stop_generation
+        try:
+            if self.mode == 'live':
+                self._ensure_private()
+            positions = self._active_positions(self.mode)
+            if self._marks_fresh(positions):
+                cash = self._cash(self.mode)
+                self._daily_allowed(self.mode, self._equity(self.mode, cash, positions))
+            with self.lock:
+                if generation != self.stop_generation:
+                    return
+                self.running, self.stopping = True, False
+                self.stop_event.clear()
+                self.thread = threading.Thread(target=self._loop, daemon=True, name='TradingEngine')
+                self.thread.start()
+            storage.audit('warning' if self.mode == 'live' else 'info', f'Bot started in {self.mode.upper()} mode.')
+        finally:
+            with self.lock:
+                self.control_busy = False
+
+    def stop(self):
+        with self.lock:
+            thread = self.thread
+            self.stop_generation += 1
+            self.stopping = bool(thread and thread.is_alive())
+            self.stop_event.set()
+            if not self.stopping:
+                self.running = False
+            storage.audit('info', 'Stop requested. Waiting for any in-flight exchange operation to finish.')
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2)
+
+    def _loop(self):
+        next_scan = 0.0
+        try:
+            while not self.stop_event.is_set():
+                self._monitor_if_due()
+                if time.monotonic() >= next_scan and not self.stop_event.is_set():
+                    self.scan_once(allow_orders=True)
+                    # Never catch up with a burst of scans after a slow API.
+                    next_scan = time.monotonic() + float(self.cfg['scan_seconds'])
+                delay = max(.05, min(next_scan, self._next_monitor) - time.monotonic())
+                if self.stop_event.wait(delay):
+                    break
+        except Exception as exc:
+            self._ledger_failure(f'Trading worker stopped: {type(exc).__name__}; inspect local portfolio and monitoring status')
+        finally:
+            with self.lock:
+                self.running = self.stopping = False
+
+    def _orders_allowed(self) -> bool:
+        return bool((self.running or self._manual_order_active) and not self.stop_event.is_set()
+                    and (self.mode == 'paper' or not self.live_halted))
+
+    def _monitor_if_due(self, *, force: bool = False) -> set[str]:
+        """Check stored exits independently of strategy scans and candle data.
+
+        The worker also calls this between candle downloads. Calls are serialized
+        on the same worker; an in-flight exchange request cannot be preempted.
+        """
+        if not self._orders_allowed() or (not force and time.monotonic() < self._next_monitor):
+            return set()
+        interval = max(2.0, min(60.0, float(self.cfg.get('protective_poll_seconds', 5))))
+        self._next_monitor = time.monotonic() + interval
+        positions = self._active_positions(self.mode)
+        exited, failures, observed = set(), 0, 0
+        with self.lock:
+            self.last_monitor, self.monitor_error = now(), None
+        if not positions:
+            return exited
+        try:
+            tickers = self.data.tickers([p['symbol'] for p in positions])
+        except Exception:
+            tickers = {}
+        for position in positions:
+            if not self._orders_allowed():
+                break
+            symbol = position['symbol']
+            try:
+                ticker = tickers.get(symbol)
+                try:
+                    price, _, _ = self._observe_ticker(symbol, ticker or self.data.ticker(symbol))
+                except ValueError:
+                    if not ticker:
+                        raise
+                    price, _, _ = self._observe_ticker(symbol, self.data.ticker(symbol))
+                observed += 1
+                self._protect_positions(symbol, price)
+                if self._orders_allowed():
+                    primary_tf = HORIZONS[self.cfg['time_horizon']][0]
+                    saved = self.data.cached_candles(symbol, primary_tf, limit=175)
+                    if saved is not None and not saved.empty:
+                        # Trail with already validated ATR; monitoring never
+                        # downloads candles or weakens a persisted stop.
+                        self._mark_positions(symbol, price, finite_positive(saved.iloc[-1]['atr']), False)
+                if not any(p['symbol'] == symbol for p in self._active_positions(self.mode)):
+                    exited.add(symbol)
+            except Exception:
+                failures += 1
+        # Finish-relative scheduling avoids hot loops on slow or failing reads.
+        self._next_monitor = time.monotonic() + interval
+        with self.lock:
+            if observed:
+                self.last_successful_monitor = now()
+            if failures:
+                self.monitor_error = f'Protective quotes unavailable for {failures} held asset(s)'
+        remaining = self._active_positions(self.mode)
+        if self._marks_fresh(remaining) and self._orders_allowed():
+            try:
+                # Filled orders invalidate this timestamp. Otherwise reuse a
+                # recent cash read while every poll still marks held assets.
+                if (self.mode == 'live' and self.latest_balance is not None
+                        and self.balance_updated_at is not None
+                        and 0 <= time.time() - self.balance_updated_at <= 30):
+                    cash = float(self.latest_balance['free'].get('USDT', 0))
+                else:
+                    cash = self._cash(self.mode)
+                self._daily_allowed(self.mode, self._equity(self.mode, cash, remaining))
+            except Exception:
+                with self.lock:
+                    self.monitor_error = self.monitor_error or 'Portfolio risk balance unavailable; fresh account data is required for new entries'
+        self._next_monitor = time.monotonic() + interval
+        return exited
+
+    @staticmethod
+    def _spot(symbol: str, market: dict | None) -> bool:
+        if (not isinstance(market, dict) or not symbol.endswith('/USDT')
+                or market.get('spot') is not True or market.get('active') is not True
+                or any(market.get(k) for k in ('contract', 'swap', 'future', 'option'))
+                or market.get('type', 'spot') != 'spot'):
+            return False
+        base = symbol.split('/')[0]
+        return not any(base.endswith(suffix) for suffix in ('3L', '3S', '5L', '5S', 'UP', 'DOWN', 'BULL', 'BEAR'))
+
+    def _fetch_markets(self):
+        return self.data.markets()
+
+    def _universe(self) -> list[str]:
+        held = [p['symbol'] for p in self._active_positions(self.mode)]
+        self._fetch_markets()
+        if self.cfg['auto_discovery'] and time.monotonic() - self.last_universe_update > 3600:
+            try:
+                if getattr(self.public, 'has', {}).get('fetchTickers') is not True:
+                    raise ValueError('Bulk tickers unsupported')
+                tickers = self.data.read('fetch_tickers')
+                ranking = []
+                for symbol, ticker in tickers.items():
+                    if self._spot(symbol, self.public.markets.get(symbol)):
+                        volume = finite_positive(ticker.get('quoteVolume'))
+                        if volume >= self.cfg['min_quote_volume']:
+                            ranking.append((volume, symbol))
+                ranking.sort(reverse=True)
+                with self.lock:
+                    self.discovered = [symbol for _, symbol in ranking[:int(self.cfg['discovered_pairs'])]]
+                    self.last_universe_update = time.monotonic()
+            except Exception as exc:
+                storage.audit('warning', f'Automatic discovery unavailable: {type(exc).__name__}.')
+        # Held symbols never compete with watchlist/discovery truncation.
+        extras = list(dict.fromkeys(self.cfg['watchlist'] + self.discovered))[:32]
+        return list(dict.fromkeys(held + extras))
+
+    def _active_positions(self, mode: str) -> list[dict]:
+        return storage.rows('SELECT * FROM positions WHERE exchange=? AND mode=? ORDER BY opened_at',
+                            (self.exchange_name, mode))
+
+    def _cash(self, mode: str) -> float:
+        if mode == 'paper':
+            raw = storage.get_meta(self._key('paper_cash'), '10000')
+            value = float(raw)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError('Paper cash ledger is invalid')
+            return value
+        return float(self._read_balance()['free'].get('USDT', 0))
+
+    def _price_age(self, symbol: str) -> float | None:
+        timestamp = self.last_price_times.get(symbol)
+        return max(0.0, time.time() - timestamp) if timestamp is not None else None
+
+    def _fresh(self, symbol: str) -> bool:
+        age = self._price_age(symbol)
+        return bool(finite_positive(self.last_prices.get(symbol)) and age is not None
+                    and age <= self.cfg['data_max_age_seconds'])
+
+    def _marks_fresh(self, positions: list[dict]) -> bool:
+        with self.lock:
+            return all(self._fresh(p['symbol']) for p in positions)
+
+    def _observe_ticker(self, symbol: str, ticker: dict, *, for_buy: bool = False) -> tuple[float, float, float | None]:
+        """Observe bid/ask quotes; last trade prices cannot value an exit.
+
+        A ticker's best quotes are indicative, not a depth or fill guarantee.
+        CCXT fields are optional, so missing or crossed quotes fail closed.
+        """
+        def invalid(message):
+            with self.lock:
+                self.last_price_times.pop(symbol, None)
+                self.last_asks.pop(symbol, None)
+            raise ValueError(message)
+        if not isinstance(ticker, dict):
+            invalid('Invalid ticker response')
+        bid, ask = finite_positive(ticker.get('bid')), finite_positive(ticker.get('ask'))
+        ask_absent = ticker.get('ask') is None
+        if not bid or (not ask and (for_buy or not ask_absent)) or (ask and bid > ask):
+            invalid('Missing or crossed bid-ask quotes')
+        observed = time.time()
+        raw_timestamp = ticker.get('timestamp')
+        timestamp = observed if raw_timestamp is None else finite_positive(raw_timestamp) / 1000
+        if (not timestamp or timestamp > observed + 30
+                or observed - timestamp > self.cfg['data_max_age_seconds']):
+            invalid('Ticker timestamp is stale or invalid')
+        spread = 100 * (ask - bid) / ((ask + bid) / 2) if ask else None
+        with self.lock:
+            self.last_prices[symbol] = bid
+            if ask:
+                self.last_asks[symbol] = ask
+            else:
+                self.last_asks.pop(symbol, None)
+            self.last_price_times[symbol] = timestamp
+        return ask if for_buy else bid, finite_positive(ticker.get('quoteVolume')), spread
+
+    def _equity(self, mode: str, cash: float, positions: list[dict]) -> float:
+        liquidation_factor = (1 - self.cfg['slippage_pct'] / 100) * (1 - self.cfg['fee_pct'] / 100)
+        with self.lock:
+            return cash + sum(p['qty'] * self.last_prices.get(p['symbol'], p['entry_price'])
+                              * liquidation_factor for p in positions)
+
+    def _daily_allowed(self, mode: str, equity: float) -> tuple[bool, float]:
+        if not math.isfinite(equity) or equity <= 0:
+            self.risk_block = 'Invalid portfolio equity'
+            return False, 100.0
+        today = datetime.now(timezone.utc).date().isoformat()
+        baseline_key, breach_key = self._key(f'baseline.{mode}.{today}'), self._key(f'breached.{mode}.{today}')
+        baseline = finite_positive(storage.get_meta(baseline_key))
+        if not baseline:
+            baseline = equity
+            storage.set_meta(baseline_key, baseline)
+        loss = 100 * (baseline - equity) / baseline
+        if loss >= self.cfg['daily_loss_limit_pct']:
+            storage.set_meta(breach_key, '1')
+        allowed = storage.get_meta(breach_key) != '1'
+        if not allowed:
+            with self.lock:
+                self.risk_block = 'Daily loss limit reached; entries blocked until the next UTC day'
+        return allowed, round(loss, 2)
+
+    def _halt_uncertain(self, description: str):
+        with self.lock:
+            self.live_halted = True
+            self.risk_block = self.last_error = description
+            self.stop_event.set()
+        # Persist independently of an order journal so an intent/ledger failure
+        # cannot be bypassed by restarting the process.
+        try:
+            storage.set_meta(self._key('live_halt'), '1')
+            storage.audit('error', 'LIVE HALT: ' + description + '. Reconcile manually; no automatic resubmission.')
+        except Exception:
+            pass
+
+    def _ledger_failure(self, description: str):
+        if self.mode == 'live':
+            self._halt_uncertain(description)
+        else:
+            with self.lock:
+                self.risk_block = self.last_error = description
+                self.stop_event.set()
+
+    def _confirm_filled(self, client, symbol: str, order: dict) -> dict:
+        for attempt in range(3):
+            if isinstance(order, dict):
+                if (order.get('id') and order.get('status') in ('closed', 'canceled', 'cancelled', 'expired')
+                        and finite_positive(order.get('filled'))):
+                    return order  # A final partial fill is accounted, never silently erased.
+                if not order.get('id'):
+                    break
+                if attempt < 2:
+                    self.stop_event.wait(.2 * (attempt + 1))
+                    try:
+                        with self.private_lock:
+                            order = client.fetch_order(order['id'], symbol)
+                    except Exception:
+                        continue
+        raise RuntimeError('Order acceptance/final fill is uncertain; manual reconciliation is required')
+
+    def _submit(self, client, symbol: str, side: str, *, quantity=None, cost=None):
+        """Durable intent precedes exactly one submission; reads alone may repeat."""
+        intent = None
+        create_returned = False
+        try:
+            if not self._orders_allowed():
+                return None, None
+            intent = storage.create_order_intent(self.exchange_name, symbol, side,
+                                                  quantity=quantity, cost=cost)
+            with self.private_lock:
+                if not self._orders_allowed():
+                    storage.update_order_intent(intent, 'rejected')
+                    return None, None
+                if side == 'BUY':
+                    order = client.create_market_buy_order_with_cost(symbol, cost)
+                else:
+                    order = client.create_order(symbol, 'market', 'sell', quantity)
+                create_returned = True
+            storage.update_order_intent(intent, 'submitted', order_id=str(order.get('id', '')) if isinstance(order, dict) else None)
+            order = self._confirm_filled(client, symbol, order)
+            storage.update_order_intent(intent, 'filled', order_id=str(order.get('id', '')))
+            return intent, order
+        except Exception as exc:
+            # A documented exchange rejection confirms no order was accepted.
+            # Transport errors and unrecognized responses always remain uncertain.
+            rejected = tuple(cls for name in ('InsufficientFunds', 'InvalidOrder', 'AuthenticationError',
+                                              'PermissionDenied', 'BadSymbol', 'NotSupported')
+                             if isinstance(cls := getattr(ccxt, name, None), type))
+            if intent and not create_returned and rejected and isinstance(exc, rejected):
+                try:
+                    storage.update_order_intent(intent, 'rejected')
+                    with self.lock:
+                        self.risk_block = f'{side} {symbol} rejected by the exchange: {type(exc).__name__}'
+                    storage.audit('warning', self.risk_block)
+                    return None, None
+                except Exception:
+                    pass
+            if intent:
+                try:
+                    storage.update_order_intent(intent, 'uncertain')
+                except Exception:
+                    pass
+            self._halt_uncertain(f'{side} {symbol}: {type(exc).__name__}; order or journal outcome requires review')
+            return None, None
+
+    def _fill_details(self, order: dict, symbol: str) -> tuple[float, float, float, float, float, float]:
+        """Return filled quantity, price, gross, quote/base fees, fee value in USDT."""
+        filled, gross = finite_positive(order.get('filled')), finite_positive(order.get('cost'))
+        if not filled or not gross:
+            raise ValueError('Confirmed order lacks finite executed quantity/cost')
+        derived_price = gross / filled
+        if not finite_positive(derived_price):
+            raise ValueError('Executed quantity and cost imply an invalid price')
+        average = order.get('average')
+        price = finite_positive(average) if average is not None else derived_price
+        if not price or abs(price / derived_price - 1) > .01:
+            raise ValueError('Executed average price contradicts quantity and cost')
+        fees = order.get('fees')
+        if not fees:
+            fees = [order['fee']] if isinstance(order.get('fee'), dict) else []
+        if not fees:
+            return filled, price, gross, gross * self.cfg['fee_pct'] / 100, 0.0, gross * self.cfg['fee_pct'] / 100
+        if not isinstance(fees, list):
+            raise ValueError('Unrecognized exchange fee response')
+        quote_fee = base_fee = 0.0
+        base, quote = symbol.split('/')
+        for fee in fees:
+            if not isinstance(fee, dict):
+                raise ValueError('Malformed exchange fee')
+            amount = fee.get('cost')
+            if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount < 0:
+                raise ValueError('Unknown or invalid exchange fee amount')
+            if amount == 0:
+                continue
+            if fee.get('currency') == quote:
+                quote_fee += amount
+            elif fee.get('currency') == base:
+                base_fee += amount
+            else:
+                raise ValueError('Fee in another asset cannot be valued reliably; reconcile manually')
+        return filled, price, gross, quote_fee, base_fee, quote_fee + base_fee * price
+
+    @staticmethod
+    def _is_dust(position: dict, market: dict | None, price: float) -> bool:
+        """A tracked remainder below an explicit exchange minimum stays owned."""
+        if not isinstance(market, dict) or not finite_positive(price):
+            return False
+        quantity = finite_positive(position.get('qty'))
+        limits = market.get('limits') or {}
+        minimum_amount = finite_positive((limits.get('amount') or {}).get('min'))
+        minimum_cost = finite_positive((limits.get('cost') or {}).get('min'))
+        return bool(quantity and ((minimum_amount and quantity < minimum_amount)
+                                  or (minimum_cost and quantity * price < minimum_cost)))
+
+    @staticmethod
+    def _complete_manual_request(db, completion, remaining: float):
+        """Commit the user-visible result with its fills, never in a later write."""
+        if completion is None:
+            return
+        payload = completion['payload']
+        result = {**payload, 'status': 'partial' if payload['side'] == 'SELL' and remaining > 0 else 'filled',
+                  'remaining_quantity': remaining, 'request_id': completion['request_id']}
+        record = {**completion['record'], 'status': 'filled', 'result': result}
+        db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)',
+                   (completion['scope'], json.dumps(record, allow_nan=False)))
+
+    def _buy(self, symbol: str, budget: float, price: float, fraction: float, *,
+             reason: str = 'Completed-candle momentum breakout', merge_dust: bool = False,
+             completion=None, entry_candle: int | None = None) -> bool:
+        existing = next((p for p in self._active_positions(self.mode) if p['symbol'] == symbol), None)
+        if (not all(finite_positive(v) for v in (budget, price, fraction)) or fraction >= 1
+                or (existing and (not merge_dust or not self._is_dust(
+                    existing, getattr(self.public, 'markets', {}).get(symbol), price)))):
+            return False
+        mode, exchange = self.mode, self.exchange_name
+        fee_rate, slip = self.cfg['fee_pct'] / 100, self.cfg['slippage_pct'] / 100
+        intent = order_id = None
+        if mode == 'paper':
+            fill_price = price * (1 + slip)
+            gross = budget / (1 + fee_rate)
+            qty, fee, cost = gross / fill_price, gross * fee_rate, budget
+        else:
+            if self.live_halted or self._durable_live_block():
+                self._halt_uncertain('Live execution blocked by unresolved order/account state')
+                return False
+            client = self._ensure_private()
+            if getattr(client, 'has', {}).get('createMarketBuyOrderWithCost') is False:
+                raise storage.ConfigValidationError('This exchange adapter does not support bounded-cost market buys.')
+            with self.private_lock:
+                market = client.market(symbol)
+                if not self._spot(symbol, market):
+                    raise ValueError('Live orders require a verified active spot market')
+                if existing and not self._is_dust(existing, market, price):
+                    raise storage.ConfigValidationError('The existing position exceeds the verified exchange dust limit.')
+                spend = float(client.cost_to_precision(symbol, budget / (1 + fee_rate)))
+            limits = market.get('limits') or {}
+            minimum = finite_positive((limits.get('cost') or {}).get('min'))
+            maximum = finite_positive((limits.get('cost') or {}).get('max'))
+            if not finite_positive(spend) or spend > budget or spend < minimum or (maximum and spend > maximum):
+                raise ValueError('Order cost does not meet exchange limits/precision')
+            if float(self._read_balance(client)['free'].get('USDT', 0)) < budget:
+                raise ValueError('Insufficient free USDT including the fee reserve')
+            intent, order = self._submit(client, symbol, 'BUY', cost=spend)
+            if order is None:
+                return False
+            try:
+                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                qty, cost = filled - base_fee, gross + quote_fee
+                if qty <= 0 or cost > budget * 1.03:
+                    raise ValueError('Executed quantity/cost differs from the reserved budget')
+                order_id = str(order.get('id', ''))
+            except Exception as exc:
+                self._halt_uncertain(f'BUY {symbol}: {type(exc).__name__}; fill/fee accounting requires review')
+                return False
+        try:
+            with storage.connection() as db:
+                if mode == 'paper':
+                    key = self._key('paper_cash')
+                    row = db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+                    cash = float(row['value'])
+                    if cost > cash:
+                        return False
+                    db.execute('UPDATE meta SET value=? WHERE key=?', (str(cash - cost), key))
+                if existing:
+                    # Only explicit manual buys can consolidate verified dust.
+                    # Retain every unit and its old cost basis in one transaction.
+                    current = db.execute('SELECT qty,cost FROM positions WHERE exchange=? AND mode=? AND symbol=?',
+                                         (exchange, mode, symbol)).fetchone()
+                    if (not current or float(current['qty']) != float(existing['qty'])
+                            or float(current['cost']) != float(existing['cost'])):
+                        raise ValueError('Tracked remainder changed before consolidation')
+                    total_qty, total_cost = qty + float(existing['qty']), cost + float(existing['cost'])
+                    average = (qty * fill_price + float(existing['qty']) * float(existing['entry_price'])) / total_qty
+                    db.execute('''UPDATE positions SET qty=?,entry_price=?,cost=?,highest=?,stop=?,target=?,opened_at=?
+                                  WHERE exchange=? AND mode=? AND symbol=?''',
+                               (total_qty, average, total_cost, max(average, fill_price), average * (1 - fraction),
+                                average * (1 + 2.75 * fraction), now(), exchange, mode, symbol))
+                else:
+                    db.execute('''INSERT INTO positions(exchange,mode,symbol,qty,entry_price,cost,highest,stop,target,opened_at)
+                                  VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                               (exchange, mode, symbol, qty, fill_price, cost, fill_price,
+                                fill_price * (1 - fraction), fill_price * (1 + 2.75 * fraction), now()))
+                db.execute('''INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,reason,order_id)
+                              VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                           (now(), exchange, mode, symbol, 'BUY', fill_price, qty, gross,
+                            fee, reason, order_id))
+                if entry_candle is not None:
+                    db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)',
+                               (self._key(f'last_entry.{mode}.{symbol}'), str(entry_candle)))
+                self._complete_manual_request(db, completion, qty + (float(existing['qty']) if existing else 0))
+                if intent:
+                    storage.update_order_intent(intent, 'accounted', order_id=order_id, db=db)
+            # Refreshing an account is a read; a failure cannot erase a filled ledger entry.
+            if mode == 'live':
+                with self.lock:
+                    self.balance_updated_at = None
+            storage.audit('trade', f'{mode.upper()} BUY {symbol}: {qty:.7g} at {fill_price:.7g}; cost {cost:.2f} USDT.')
+            return True
+        except Exception as exc:
+            self._ledger_failure(f'{mode.upper()} BUY {symbol}: {type(exc).__name__}; portfolio ledger requires review')
+            return False
+
+    def _sell(self, position: dict, market_price: float, reason: str, *, completion=None) -> bool:
+        symbol, tracked, mode = position['symbol'], float(position['qty']), position['mode']
+        if position.get('exchange', self.exchange_name) != self.exchange_name or mode != self.mode:
+            raise ValueError('Position belongs to a different exchange or trading mode')
+        if not finite_positive(market_price) or not finite_positive(tracked):
+            return False
+        fee_rate = self.cfg['fee_pct'] / 100
+        intent = order_id = None
+        if mode == 'paper':
+            filled = consumed = tracked
+            fill_price = market_price * (1 - self.cfg['slippage_pct'] / 100)
+            gross = filled * fill_price
+            quote_fee = fee = gross * fee_rate
+        else:
+            if self.live_halted or self._durable_live_block():
+                self._halt_uncertain('Live exit blocked by unresolved order/account state')
+                return False
+            client = self._ensure_private()
+            if getattr(client, 'has', {}).get('createMarketOrder') is False:
+                raise storage.ConfigValidationError('This exchange adapter does not support market exits.')
+            balance = self._read_balance(client)
+            available = finite_positive(balance.get('free', {}).get(symbol.split('/')[0]))
+            if not available:
+                self.risk_block = f'No freely available tracked balance for {symbol}; manual review required'
+                storage.audit('error', self.risk_block)
+                return False
+            with self.private_lock:
+                market = client.market(symbol)
+                if not self._spot(symbol, market):
+                    raise ValueError('Live exits require a verified active spot market')
+                requested = min(tracked, available)
+                amount = float(client.amount_to_precision(symbol, requested))
+            limits = market.get('limits') or {}
+            min_quantity = finite_positive((limits.get('amount') or {}).get('min'))
+            min_cost = finite_positive((limits.get('cost') or {}).get('min'))
+            if (not finite_positive(amount) or amount > requested * (1 + 1e-12)
+                    or amount < min_quantity or amount * market_price < min_cost):
+                self.risk_block = f'{symbol} remainder is below an exchange limit; retained in the ledger'
+                storage.audit('warning', self.risk_block)
+                return False
+            intent, order = self._submit(client, symbol, 'SELL', quantity=amount)
+            if order is None:
+                return False
+            try:
+                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                consumed = filled + base_fee
+                if consumed > tracked * (1 + 1e-10) or filled > amount * (1 + 1e-10):
+                    raise ValueError('Fill or base fee would consume untracked holdings')
+                order_id = str(order.get('id', ''))
+            except Exception as exc:
+                self._halt_uncertain(f'SELL {symbol}: {type(exc).__name__}; fill/fee accounting requires review')
+                return False
+        ratio = min(1.0, consumed / tracked)
+        basis = float(position['cost']) * ratio
+        proceeds, pnl = gross - quote_fee, gross - quote_fee - basis
+        remaining = max(0.0, tracked - consumed)
+        if remaining <= tracked * 1e-12:
+            remaining = 0.0
+        try:
+            with storage.connection() as db:
+                if mode == 'paper':
+                    key = self._key('paper_cash')
+                    cash = float(db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()['value'])
+                    db.execute('UPDATE meta SET value=? WHERE key=?', (str(cash + proceeds), key))
+                if remaining <= tracked * 1e-12:
+                    db.execute('DELETE FROM positions WHERE exchange=? AND mode=? AND symbol=?',
+                               (self.exchange_name, mode, symbol))
+                else:
+                    db.execute('UPDATE positions SET qty=?,cost=? WHERE exchange=? AND mode=? AND symbol=?',
+                               (remaining, max(0.0, float(position['cost']) - basis), self.exchange_name, mode, symbol))
+                db.execute('''INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,realized,reason,order_id)
+                              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                           (now(), self.exchange_name, mode, symbol, 'SELL', fill_price, filled,
+                            gross, fee, pnl, reason, order_id))
+                primary_tf = HORIZONS[self.cfg['time_horizon']][0]
+                duration = TIMEFRAME_SECONDS[primary_tf] * 1000
+                candle = (int(time.time() * 1000) // duration - 1) * duration
+                db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)',
+                           (self._key(f'last_exit.{mode}.{symbol}.{primary_tf}'), str(candle)))
+                self._complete_manual_request(db, completion, remaining)
+                if intent:
+                    storage.update_order_intent(intent, 'accounted', order_id=order_id, db=db)
+            if mode == 'live':
+                with self.lock:
+                    self.balance_updated_at = None
+            storage.audit('trade', f'{mode.upper()} SELL {symbol}: {filled:.7g} at {fill_price:.7g}; P/L {pnl:+.2f} USDT ({reason}).')
+            # Reentry cooldown and fill were committed together above.
+            return True
+        except Exception as exc:
+            self._ledger_failure(f'{mode.upper()} SELL {symbol}: {type(exc).__name__}; portfolio ledger requires review')
+            return False
+
+    def _protect_positions(self, symbol: str, price: float):
+        for position in self._active_positions(self.mode):
+            if position['symbol'] == symbol:
+                if self._is_dust(position, getattr(self.public, 'markets', {}).get(symbol), price):
+                    continue
+                if price <= position['stop']:
+                    self._sell(position, price, 'Stored stop / trailing stop (software monitored)')
+                elif price >= position['target']:
+                    self._sell(position, price, 'Stored profit target (software monitored)')
+
+    def _mark_positions(self, symbol: str, price: float, atr: float, trend_broken: bool):
+        for position in self._active_positions(self.mode):
+            if position['symbol'] != symbol:
+                continue
+            highest = max(float(position['highest']), price)
+            stop = max(float(position['stop']), highest - 2.5 * atr) if finite_positive(atr) else float(position['stop'])
+            try:
+                with storage.connection() as db:
+                    db.execute('UPDATE positions SET highest=?,stop=? WHERE exchange=? AND mode=? AND symbol=?',
+                               (highest, stop, self.exchange_name, self.mode, symbol))
+            except Exception as exc:
+                self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
+                return
+            if (self._orders_allowed() and not self._is_dust(
+                    position, getattr(self.public, 'markets', {}).get(symbol), price)):
+                if price <= stop:
+                    self._sell(position, price, 'Updated trailing stop (software monitored)')
+                elif trend_broken:
+                    self._sell(position, price, 'Completed-candle trend reversal')
+
+    def scan_once(self, allow_orders: bool = False):
+        # Acquiring this while holding the state lock makes config/start checks
+        # atomic with a scan. The state lock is released before every network read.
+        with self.lock:
+            if self.control_busy and not allow_orders:
+                raise ValueError('An account operation is in progress')
+            acquired = self.scan_lock.acquire(blocking=False)
+            if not acquired and not allow_orders:
+                return list(self.market_rows)
+        if not acquired:
+            # A worker queues behind a chart/backtest rather than losing an
+            # entire risk-management scan until its next polling interval.
+            while not self.stop_event.is_set():
+                if self.scan_lock.acquire(timeout=.25):
+                    acquired = True
+                    break
+            if not acquired:
+                return []
+        with self.lock:
+            self.last_scan, self.last_error = now(), None
+        assessments, candidates = [], []
+        exited_symbols = set()
+        successful_assessments = 0
+        try:
+            horizon = self.cfg['time_horizon']
+            primary_tf, higher_tf = HORIZONS[horizon]
+            if allow_orders:
+                exited_symbols.update(self._monitor_if_due())
+            try:
+                symbols = self._universe()
+            except Exception as exc:
+                # A catalogue/discovery outage must not suppress already-known
+                # held positions whose stored protective levels can be checked.
+                held = [p['symbol'] for p in self._active_positions(self.mode)]
+                symbols = list(dict.fromkeys(held + self.cfg['watchlist']))
+                storage.audit('warning', f'Market catalogue refresh unavailable: {type(exc).__name__}.')
+            try:
+                tickers = self.data.tickers(symbols)
+            except Exception:
+                tickers = {}
+            catalogue = getattr(self.public, 'markets', {})
+            for symbol in symbols:
+                if allow_orders and self.stop_event.is_set():
+                    break
+                if allow_orders:
+                    exited_symbols.update(self._monitor_if_due())
+                if not self._spot(symbol, catalogue.get(symbol)):
+                    assessments.append({'symbol': symbol, 'score': 0, 'price': 0,
+                                        'status': 'Pair unavailable, inactive, or not an allowed spot market'})
+                    continue
+                try:
+                    ticker = tickers.get(symbol)
+                    try:
+                        mark, volume, spread = self._observe_ticker(symbol, ticker or self.data.ticker(symbol))
+                    except ValueError:
+                        if not ticker:
+                            raise
+                        # A bulk snapshot can age while earlier pairs are read.
+                        mark, volume, spread = self._observe_ticker(symbol, self.data.ticker(symbol))
+                    price = self.last_asks.get(symbol, mark)
+                    # These exits deliberately precede *all* candle downloads.
+                    held_before = any(p['symbol'] == symbol for p in self._active_positions(self.mode))
+                    if allow_orders and self._orders_allowed():
+                        self._protect_positions(symbol, self.last_prices[symbol])
+                    primary = self.data.candles(symbol, primary_tf, limit=175)
+                    if allow_orders:
+                        exited_symbols.update(self._monitor_if_due())
+                    if len(primary) < 110:
+                        raise ValueError('Insufficient completed primary candles')
+                    last = primary.iloc[-1]
+                    atr = finite_positive(last['atr'])
+                    if allow_orders and self._orders_allowed():
+                        self._mark_positions(symbol, self.last_prices[symbol], atr, bool(last['close'] < last['ema50']))
+                    if held_before and not any(p['symbol'] == symbol for p in self._active_positions(self.mode)):
+                        exited_symbols.add(symbol)
+                    # HTF data gates entries only. Stops and trend exits above
+                    # remain independent of a higher-timeframe API failure.
+                    try:
+                        higher = self.data.candles(symbol, higher_tf, limit=85)
+                        regime_ok = regime_signal(higher)
+                        signal, reason, score = entry_signal(last, regime_ok=regime_ok, rapid=horizon == 'rapid')
+                    except Exception as exc:
+                        regime_ok, signal, score = False, False, 0
+                        reason = f'Higher-timeframe data unavailable: {type(exc).__name__}'
+                    liquid = volume >= self.cfg['min_quote_volume']
+                    spread_ok = spread is not None and spread <= self.cfg['max_spread_pct']
+                    if not liquid:
+                        reason = 'Low or unknown 24h quote volume'
+                    elif not spread_ok:
+                        reason = 'Wide or unknown bid-ask spread'
+                    signal_close = float(last['close'])
+                    close_enough = entry_price_ok(price, signal_close, atr)
+                    if signal and not close_enough:
+                        reason = 'Market price moved too far from the completed signal candle'
+                    candidate = bool(signal and liquid and spread_ok and close_enough
+                                     and self._fresh(symbol) and symbol not in exited_symbols)
+                    if candidate:
+                        candidates.append((score, volume, symbol, price, atr, int(last['timestamp']), signal_close))
+                    rsi = float(last['rsi'])
+                    assessments.append({'symbol': symbol, 'price': price, 'bid': self.last_prices[symbol],
+                                        'ask': self.last_asks.get(symbol), 'price_basis': 'ask' if symbol in self.last_asks else 'bid',
+                                        'score': score, 'volume': volume,
+                                        'spread': round(spread, 3) if spread is not None else None,
+                                        'rsi': round(rsi, 1) if math.isfinite(rsi) else None,
+                                        'atr_pct': round(atr / price * 100, 2),
+                                        'regime': 'uptrend' if regime_ok else 'weak',
+                                        'kind': 'MEME' if is_meme(symbol) else 'CORE' if symbol.split('/')[0] in ('BTC', 'ETH') else 'ALT',
+                                        'status': reason, 'candidate': candidate, 'timeframe': primary_tf,
+                                        'price_age_seconds': self._price_age(symbol)})
+                    successful_assessments += 1
+                except Exception as exc:
+                    with self.lock:
+                        fallback = self.last_prices.get(symbol, 0)
+                    assessments.append({'symbol': symbol, 'score': 0, 'price': fallback,
+                                        'status': f'Scan unavailable: {type(exc).__name__}',
+                                        'price_age_seconds': self._price_age(symbol)})
+            with self.lock:
+                self.market_rows = assessments
+                if successful_assessments:
+                    self.last_successful_scan = now()
+            # This guard is evaluated even when the strategy found zero setups.
+            if allow_orders and self._orders_allowed():
+                exited_symbols.update(self._monitor_if_due())
+                self._enter_candidates(sorted((c for c in candidates if c[2] not in exited_symbols), reverse=True))
+            elif self.mode == 'paper':
+                positions = self._active_positions('paper')
+                if self._marks_fresh(positions):
+                    self._daily_allowed('paper', self._equity('paper', self._cash('paper'), positions))
+            return assessments
+        except Exception as exc:
+            with self.lock:
+                self.last_error = f'{type(exc).__name__}: market/account data request failed'
+            storage.audit('error', 'Market scan: ' + self.last_error)
+            return assessments
+        finally:
+            self.scan_lock.release()
+
+    def _portfolio_risk(self, positions: list[dict]) -> float:
+        proceeds_factor = (1 - self.cfg['fee_pct'] / 100) * (1 - self.cfg['slippage_pct'] / 100)
+        with self.lock:
+            return sum(max(0.0, max(float(p['cost']), float(p['qty']) * self.last_prices.get(p['symbol'], p['entry_price']))
+                           - float(p['qty']) * float(p['stop']) * proceeds_factor) for p in positions)
+
+    def _entry_budget(self, symbol: str, positions: list[dict], cash: float,
+                      equity: float, fraction: float) -> tuple[float, float, float]:
+        """One budget calculation for both automated and explicit manual buys."""
+        fee_rate, slip = self.cfg['fee_pct'] / 100, self.cfg['slippage_pct'] / 100
+        loss_fraction = 1 - (1 - fraction) * (1 - slip) * (1 - fee_rate) / (1 + fee_rate)
+        with self.lock:
+            used = sum(p['qty'] * self.last_prices[p['symbol']] for p in positions)
+            meme_used = sum(p['qty'] * self.last_prices[p['symbol']] for p in positions if is_meme(p['symbol']))
+        available_risk = max(0.0, equity * self.cfg['max_portfolio_risk_pct'] / 100 - self._portfolio_risk(positions))
+        budget = min(equity * self.cfg['risk_pct'] / 100 / loss_fraction,
+                     available_risk / loss_fraction,
+                     equity * self.cfg['max_position_pct'] / 100,
+                     max(0.0, equity * self.cfg['max_exposure_pct'] / 100 - used), cash * .90)
+        if is_meme(symbol):
+            budget = min(budget, equity * self.cfg['max_meme_position_pct'] / 100,
+                         max(0.0, equity * self.cfg['max_meme_exposure_pct'] / 100 - meme_used))
+        return budget, available_risk, loss_fraction
+
+    def manual_trade(self, symbol: str, side: str, quote_amount=None,
+                     confirmation: str = '', request_id: str = '', expected_context: str = '') -> dict:
+        """A stopped-worker, idempotent spot order through the normal ledger.
+
+        Callers must reuse request_id after an HTTP timeout. A pending or failed
+        request is never automatically repeated, even after application restart.
+        """
+        error = storage.ConfigValidationError
+        if not isinstance(symbol, str) or not isinstance(side, str):
+            raise error('Choose a USDT spot pair and a buy or sell action.')
+        symbol, side = symbol.strip().upper(), side.strip().upper()
+        if side not in ('BUY', 'SELL') or not symbol.endswith('/USDT'):
+            raise error('Choose a USDT spot pair and a buy or sell action.')
+        amount = finite_positive(quote_amount) if side == 'BUY' else None
+        if side == 'BUY' and not amount:
+            raise error('A positive USDT buy budget is required.')
+        if side == 'SELL' and quote_amount is not None:
+            raise error('Sell closes the tracked position; do not supply a buy budget.')
+        if not request_id:
+            request_id = str(uuid.uuid4())
+        try:
+            request_id = str(uuid.UUID(request_id))
+        except (ValueError, TypeError, AttributeError):
+            raise error('A valid order request identifier is required.') from None
+        with self.lock:
+            if self._busy():
+                raise error('Stop the bot and wait for active operations before placing a manual trade.')
+            if self.mode == 'live' and confirmation != f'PLACE LIVE {side}':
+                raise error(f'Type PLACE LIVE {side} to confirm this real-money order.')
+            if ((expected_context and expected_context != self.manual_order_context)
+                    or (self.mode == 'live' and not expected_context)):
+                raise error('The account, exchange, mode or settings changed. Review the current order details and confirm again.')
+            scope = self._key(f'manual_request.{self.mode}.{request_id}')
+            payload = {'symbol': symbol, 'side': side, 'quote_amount': amount,
+                       'exchange': self.exchange_name, 'mode': self.mode}
+            fingerprint = hashlib.sha256(json.dumps({**payload, 'context': expected_context}, sort_keys=True).encode('utf8')).hexdigest()
+            saved = storage.get_meta(scope)
+            if saved:
+                record = json.loads(saved)
+                if record.get('fingerprint') != fingerprint:
+                    raise error('This order identifier was already used for a different request.')
+                if record.get('status') == 'filled':
+                    return dict(record['result'])
+                raise error('This order request was already attempted. Review trade history and order recovery before creating a new request.')
+            if self.mode == 'live' and side == 'BUY' and storage.settings_health()['review_required']:
+                raise error('Review and explicitly save the recovered settings before adding live exposure.')
+            if self.mode == 'live' and (self.live_halted or self._durable_live_block()):
+                raise error('Live execution is halted; reconcile unresolved orders before placing another trade.')
+            if not self.scan_lock.acquire(blocking=False):
+                raise error('Wait for the active market operation to finish.')
+            self.control_busy = self._manual_order_active = True
+            self.stop_event.clear()
+        record = {'fingerprint': fingerprint, 'status': 'pending', 'created_at': now()}
+        try:
+            # Durable deduplication precedes every exchange operation.
+            storage.set_meta(scope, json.dumps(record))
+            catalogue = self._fetch_markets()
+            if not self._spot(symbol, catalogue.get(symbol)):
+                raise error('This pair is not an active supported USDT spot market.')
+            positions = self._active_positions(self.mode)
+            position = next((p for p in positions if p['symbol'] == symbol), None)
+            if side == 'SELL' and position is None:
+                raise error('No tracked position exists in this exchange and trading mode.')
+            price, volume, spread = self._observe_ticker(symbol, self.data.ticker(symbol), for_buy=side == 'BUY')
+            if side == 'BUY':
+                if position and not self._is_dust(position, catalogue.get(symbol), price):
+                    raise error('A position in this pair is already tracked; sell it before opening another.')
+                if volume < self.cfg['min_quote_volume'] or spread is None or spread > self.cfg['max_spread_pct']:
+                    raise error('Quote liquidity or bid-ask spread does not meet the configured limits.')
+                # A stale asset must not disappear from the exposure calculation.
+                for held in positions:
+                    self._observe_ticker(held['symbol'], self.data.ticker(held['symbol']))
+                if not self._marks_fresh(positions):
+                    raise error('A held asset has no fresh price; new buys are blocked.')
+                tradable = [p for p in positions if not self._is_dust(p, catalogue.get(p['symbol']), self.last_prices[p['symbol']])]
+                if len(tradable) >= self.cfg['max_positions']:
+                    raise error('The maximum number of open positions has been reached.')
+                if any(self.last_prices[p['symbol']] <= p['stop'] or
+                       self.last_prices[p['symbol']] >= p['target'] for p in tradable):
+                    raise error('A tracked asset is awaiting a protective exit; close it before adding risk.')
+                primary_tf = HORIZONS[self.cfg['time_horizon']][0]
+                primary = self.data.candles(symbol, primary_tf, limit=175)
+                if len(primary) < 110:
+                    raise error('Insufficient completed history to size a protective stop.')
+                atr = finite_positive(primary.iloc[-1]['atr'])
+                if not atr:
+                    raise error('Historical volatility is unavailable; a protective stop cannot be sized.')
+                fraction = stop_fraction(atr, price, rapid=self.cfg['time_horizon'] == 'rapid')
+                cash = self._cash(self.mode)
+                equity = self._equity(self.mode, cash, positions)
+                if not self._daily_allowed(self.mode, equity)[0]:
+                    raise error('The daily loss limit is latched; new buys are blocked until the next UTC day.')
+                cap, _, _ = self._entry_budget(symbol, positions, cash, equity, fraction)
+                if amount < 12 or amount > cap + 1e-8:
+                    raise error(f'Buy budget must be at least 12 USDT and within the current risk cap of {max(0, cap):.2f} USDT.')
+                # Refresh after history/balance reads; stale sizing cannot submit.
+                refreshed, volume, spread = self._observe_ticker(symbol, self.data.ticker(symbol), for_buy=True)
+                if (not entry_price_ok(refreshed, price, atr, observed_price=price) or volume < self.cfg['min_quote_volume']
+                        or spread is None or spread > self.cfg['max_spread_pct']):
+                    raise error('The quote moved or liquidity changed while preparing the order; review and submit a new request.')
+                if not self._marks_fresh(positions) or not self._orders_allowed():
+                    raise error('Order preparation was stopped or portfolio prices became stale.')
+                # Recompute using the final quote and current liquidation marks.
+                fraction = stop_fraction(atr, refreshed, rapid=self.cfg['time_horizon'] == 'rapid')
+                equity = self._equity(self.mode, cash, positions)
+                cap, _, _ = self._entry_budget(symbol, positions, cash, equity, fraction)
+                if amount > cap + 1e-8 or not self._daily_allowed(self.mode, equity)[0]:
+                    raise error('Portfolio risk changed while preparing this order; review the budget before trying again.')
+                completion = {'scope': scope, 'record': record, 'payload': payload, 'request_id': request_id}
+                filled = self._buy(symbol, amount, refreshed, fraction, reason='Explicit manual spot buy',
+                                   merge_dust=position is not None, completion=completion,
+                                   entry_candle=int(primary.iloc[-1]['timestamp']))
+            else:
+                if not self._orders_allowed():
+                    raise error('Order preparation was stopped.')
+                completion = {'scope': scope, 'record': record, 'payload': payload, 'request_id': request_id}
+                filled = self._sell(position, price, 'Explicit manual close of tracked spot position', completion=completion)
+            if not filled:
+                if self.live_halted:
+                    raise error('Order outcome requires manual reconciliation. Live trading is halted; do not retry this order.')
+                if self.risk_block and 'rejected by the exchange:' in self.risk_block:
+                    raise error(self.risk_block + '. No order was accepted; correct the account or order settings before creating a new request.')
+                raise error('The order was not completed. Review risk status, exchange limits and trade history before trying again.')
+            completed = json.loads(storage.get_meta(scope))
+            if completed.get('status') != 'filled' or completed.get('fingerprint') != fingerprint:
+                raise error('The fill result is unavailable. Review trade history before another order.')
+            return dict(completed['result'])
+        except Exception:
+            try:
+                with storage.connection() as db:
+                    saved = db.execute('SELECT value FROM meta WHERE key=?', (scope,)).fetchone()
+                    completed = json.loads(saved['value']) if saved else {}
+                    # Post-commit reporting/logging errors cannot turn a known
+                    # fill into a failed request or permit another submission.
+                    if completed.get('status') == 'filled' and completed.get('fingerprint') == fingerprint:
+                        return dict(completed['result'])
+                    record['status'] = 'failed'
+                    db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (scope, json.dumps(record)))
+            except Exception:
+                pass
+            raise
+        finally:
+            with self.lock:
+                self._manual_order_active = self.control_busy = False
+                self.scan_lock.release()
+
+    def _enter_candidates(self, candidates):
+        if self.mode == 'live' and storage.settings_health()['review_required']:
+            self.risk_block = 'Recovered settings require an explicit review and save; new live entries blocked'
+            return
+        positions = self._active_positions(self.mode)
+        if not self._marks_fresh(positions):
+            with self.lock:
+                self.risk_block = 'A held asset has a stale or missing price; new entries blocked'
+            return
+        with self.lock:
+            catalogue = getattr(self.public, 'markets', {})
+            tradable = [p for p in positions if not self._is_dust(p, catalogue.get(p['symbol']), self.last_prices[p['symbol']])]
+            protective_pending = any(self.last_prices[p['symbol']] <= p['stop']
+                                     or self.last_prices[p['symbol']] >= p['target'] for p in tradable)
+            if protective_pending:
+                self.risk_block = 'A held position is awaiting a protective exit; new entries blocked'
+                return
+        cash = self._cash(self.mode)
+        equity = self._equity(self.mode, cash, positions)
+        permitted, loss_today = self._daily_allowed(self.mode, equity)
+        if not permitted:
+            storage.audit('warning', f'Daily loss guard latched: {loss_today:.2f}%; protective exits remain active.')
+            return
+        with self.lock:
+            self.risk_block = None
+        count = 0
+        for candidate in candidates:
+            _score, _volume, symbol, observed_price, atr, candle = candidate[:6]
+            signal_close = candidate[6] if len(candidate) > 6 else observed_price
+            if count >= 2 or not self._orders_allowed():
+                break
+            positions = self._active_positions(self.mode)
+            tradable = [p for p in positions if not self._is_dust(p, catalogue.get(p['symbol']), self.last_prices[p['symbol']])]
+            if len(tradable) >= self.cfg['max_positions'] or any(p['symbol'] == symbol for p in positions):
+                continue
+            if not self._marks_fresh(positions) or not self._fresh(symbol):
+                with self.lock:
+                    self.risk_block = 'Portfolio or candidate price became stale; entries blocked'
+                break
+            key = self._key(f'last_entry.{self.mode}.{symbol}')
+            if storage.get_meta(key) == str(candle):
+                continue
+            primary_tf = HORIZONS[self.cfg['time_horizon']][0]
+            if storage.get_meta(self._key(f'last_exit.{self.mode}.{symbol}.{primary_tf}')) == str(candle):
+                continue
+            # Re-read a candidate immediately before reserving funds. A scan of
+            # many coins can otherwise place an entry using an old quote.
+            price, volume, spread = self._observe_ticker(symbol, self.data.ticker(symbol), for_buy=True)
+            if (volume < self.cfg['min_quote_volume'] or spread is None
+                    or spread > self.cfg['max_spread_pct']
+                    or not entry_price_ok(price, signal_close, atr, observed_price=observed_price)):
+                continue
+            cash = self._cash(self.mode)
+            equity = self._equity(self.mode, cash, positions)
+            fraction = stop_fraction(atr, price, rapid=self.cfg['time_horizon'] == 'rapid')
+            budget, available_risk, loss_fraction = self._entry_budget(symbol, positions, cash, equity, fraction)
+            if budget < 12:
+                if available_risk < 12 * loss_fraction:
+                    with self.lock:
+                        self.risk_block = 'Aggregate protective-stop risk cap reached'
+                continue
+            if self._buy(symbol, budget, price, fraction, entry_candle=candle):
+                count += 1
+            if self.mode == 'live' and self.live_halted:
+                break
+
+    def _acquire_analysis(self, *, research=False):
+        with self.lock:
+            if research and (self.running or (self.thread and self.thread.is_alive())):
+                raise ValueError('Stop the bot before downloading a research backtest so protective monitoring can continue')
+            if self.control_busy or not self.scan_lock.acquire(blocking=False):
+                raise ValueError('Wait for the active scan or account operation to finish')
+
+    def history(self, symbol: str, tf: str = '1h') -> list[dict]:
+        if tf not in TIMEFRAME_SECONDS:
+            raise ValueError('Invalid chart timeframe')
+        with self.lock:
+            active = self.running or (self.thread and self.thread.is_alive())
+            if active:
+                # Never wait for the public-client network lock from the UI.
+                # Cached frames are immutable; MarketData replaces cache entries.
+                saved = self.data.cache.get((symbol, tf, 180)) or self.data.cache.get((symbol, tf, 175))
+                wall, monotonic = time.time(), time.monotonic()
+                if (not saved or not saved[2] <= wall < saved[0]
+                        or monotonic >= saved[3]):
+                    raise ValueError('Waiting for a cached chart from the active scan; stop the bot to download another timeframe')
+                frame = saved[1].copy()
+        if active:
+            return self._history_rows(frame)
+        self._acquire_analysis(research=True)
+        try:
+            catalogue = self._fetch_markets()
+            if not self._spot(symbol, catalogue.get(symbol)):
+                raise ValueError('Pair is not an allowed active spot market')
+            frame = self.data.candles(symbol, tf, limit=180)
+            return self._history_rows(frame)
+        finally:
+            self.scan_lock.release()
+
+    @staticmethod
+    def _history_rows(frame) -> list[dict]:
+        result = []
+        for row in frame.to_dict('records'):
+            point = {'t': int(row['timestamp'])}
+            for key in ('open', 'high', 'low', 'close', 'ema20', 'ema50', 'volume'):
+                value = float(row[key])
+                point[key] = value if math.isfinite(value) else None
+            result.append(point)
+        return result
+
+    def research_backtest(self, symbol: str, tf: str = '1h') -> dict:
+        higher_tf = {'1m': '5m', '5m': '1h', '1h': '4h', '4h': '1d', '1d': '1w'}.get(tf)
+        if higher_tf is None:
+            raise ValueError('Backtests support 1m, 5m, 1h, 4h, and 1d timeframes')
+        self._acquire_analysis(research=True)
+        try:
+            catalogue = self._fetch_markets()
+            if not self._spot(symbol, catalogue.get(symbol)):
+                raise ValueError('Pair is not an allowed active spot market')
+            cutoff = int(time.time() * 1000)
+            rows = self.data.read('fetch_ohlcv', symbol, tf, limit=900)
+            higher = self.data.read('fetch_ohlcv', symbol, higher_tf, limit=900)
+            return research_report(rows, dict(self.cfg), timeframe=tf, higher_rows=higher,
+                                   higher_timeframe=higher_tf, now_ms=cutoff)
+        finally:
+            self.scan_lock.release()
+
+    def snapshot(self) -> dict:
+        """Only local state and cached balances. Polling never contacts an exchange."""
+        with self.lock:
+            mode, exchange = self.mode, self.exchange_name
+            positions = self._active_positions(mode)
+            paper_cash = self._cash('paper')
+            if mode == 'paper':
+                cash = paper_cash
+            elif self.latest_balance is not None and self.balance_updated_at is not None:
+                cash = float(self.latest_balance['free'].get('USDT', 0))
+            else:
+                cash = None
+            equity = self._equity(mode, cash, positions) if cash is not None else None
+            liquidation_factor = (1 - self.cfg['slippage_pct'] / 100) * (1 - self.cfg['fee_pct'] / 100)
+            detailed = []
+            for position in positions:
+                symbol = position['symbol']
+                mark = self.last_prices.get(symbol)
+                age = self._price_age(symbol)
+                dust = bool(self._fresh(symbol) and self._is_dust(
+                    position, getattr(self.public, 'markets', {}).get(symbol), mark))
+                detailed.append({**position, 'mark': mark, 'mark_stale': not self._fresh(symbol),
+                                 'price_basis': 'bid', 'dust': dust, 'exit_untradable': dust,
+                                 'price_age_seconds': round(age, 1) if age is not None else None,
+                                 'unrealized': round(position['qty'] * mark * liquidation_factor - position['cost'], 2) if mark is not None else None})
+            realized = storage.rows("SELECT COALESCE(SUM(realized),0) AS value FROM trades WHERE exchange=? AND mode=? AND side='SELL'",
+                                    (exchange, mode))[0]['value']
+            unresolved = storage.unresolved_orders()
+            return {'running': self.running,
+                    'control_busy': self.control_busy, 'manual_order_active': self._manual_order_active,
+                    'manual_order_context': self.manual_order_context,
+                    'settings_health': storage.settings_health(),
+                    'stopping': bool(self.stopping or (self.running and self.stop_event.is_set())),
+                    'mode': mode, 'exchange': exchange,
+                    'connected': self.private is not None,
+                    'credentials_stored': bool(self.api_key and self.api_secret),
+                    'credential_source': self.credential_source,
+                    'live_halted': self.live_halted, 'last_scan': self.last_scan,
+                    'last_successful_scan': self.last_successful_scan, 'error': self.last_error,
+                    'last_monitor': self.last_monitor, 'last_successful_monitor': self.last_successful_monitor,
+                    'monitor_error': self.monitor_error,
+                    'risk_block': self.risk_block, 'paper_cash': round(paper_cash, 2),
+                    'cash': round(cash, 2) if cash is not None else None,
+                    'equity': round(equity, 2) if equity is not None else None,
+                    'valuation_price_basis': 'bid',
+                    'valuation_stale': not self._marks_fresh(positions),
+                    'realized': round(realized, 2), 'positions': detailed,
+                    'markets': [dict(row) for row in self.market_rows], 'config': dict(self.cfg),
+                    'balance_updated_at': self.balance_updated_at,
+                    'price_age_seconds': {symbol: round(self._price_age(symbol), 1)
+                                          for symbol in self.last_price_times},
+                    'metrics': dict(self.data.metrics.copy()),
+                    'unresolved_orders': len(unresolved), 'legacy_live_records': storage.legacy_live_records(),
+                    'trades': storage.rows('SELECT * FROM trades WHERE exchange=? AND mode=? ORDER BY id DESC LIMIT 70',
+                                           (exchange, mode)),
+                    'audit': storage.rows('SELECT * FROM audit ORDER BY id DESC LIMIT 55')}

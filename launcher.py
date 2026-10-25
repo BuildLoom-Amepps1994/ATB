@@ -154,12 +154,19 @@ def main() -> int:
             print('=' * 58)
             if os.environ.get('CRYPTOPILOT_NO_BROWSER') != '1':
                 threading.Thread(target=open_when_ready, args=(url, CSRF, stop_browser), daemon=True).start()
-            config = uvicorn.Config(app, host='127.0.0.1', port=port, log_level='warning', access_log=False)
+            # Nothing proxies this loopback server; forwarded-for headers from
+            # a local client must not rewrite the peer address it is judged by.
+            config = uvicorn.Config(app, host='127.0.0.1', port=port, log_level='warning',
+                                    access_log=False, proxy_headers=False)
             uvicorn.Server(config).run(sockets=[listener])
         return 0
     except (AlreadyRunning, ValueError) as exc:
         print(str(exc))
         return 1
+    except KeyboardInterrupt:
+        # Ctrl+C before the server owns the signal handler is a normal exit.
+        print('Stopped.')
+        return 0
     finally:
         stop_browser.set()
         if listener is not None:

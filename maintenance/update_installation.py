@@ -325,14 +325,19 @@ def update_installation(root: str | Path, source: str | Path, *, replace_local_c
             raise UpdateError('This source needs a different dependency/runtime bundle. Build and use a new Windows installer.')
         proposed = _inventory(source, compile_sources=True)
         if actual == proposed:
+            if actual != previous['app_files']:
+                # Local edits that already match this source are now the
+                # recorded state, so the next update needs no override.
+                _write_json(root / 'installation.json',
+                            {**previous, 'app_files': proposed, 'updated_at': datetime.now(timezone.utc).isoformat()})
             return {'updated': False, 'files': len(proposed), 'backup': None, 'changed_files': []}
         staging = root / ('.update-' + uuid.uuid4().hex)
         backup = root / 'backups' / ('update-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex)
         _plain_path(backup)
         staged_app = staging / 'app'
-        staged_app.mkdir(parents=True)
         committed = False
         try:
+            staged_app.mkdir(parents=True)
             for name, digest in proposed.items():
                 data = _read_file(source / name)
                 if hashlib.sha256(data).hexdigest() != digest:
@@ -368,11 +373,15 @@ def update_installation(root: str | Path, source: str | Path, *, replace_local_c
             raise UpdateError('The source update could not be completed. The previous app was retained or restored; inspect backups if recovery was interrupted.') from exc
         finally:
             # Keep staging if a recovery marker remains; it is recovery evidence.
-            if not (root / JOURNAL).exists():
+            if not (root / JOURNAL).exists() and staging.exists():
                 try:
                     _clean_staging(root, staging)
                 except OSError:
-                    if not committed:
+                    # Leftover staging is harmless; it must not replace the
+                    # real error (or the success) with a cleanup failure.
+                    if committed:
+                        pass
+                    elif sys.exc_info()[0] is None:
                         raise
 
 

@@ -67,7 +67,7 @@ def main():
     installed.mkdir();data.mkdir()
     shutil.copytree(args.runtime,installed/'runtime')
     app=installed/'app';app.mkdir()
-    for name in ('app.py','trader.py','strategy.py','storage.py','credentials.py','market_data.py','launcher.py','recovery.py','requirements-lock.txt'):
+    for name in ('app.py','trader.py','strategy.py','storage.py','credentials.py','market_data.py','launcher.py','recovery.py','updater.py','requirements-lock.txt'):
         shutil.copy2(root/name,app/name)
     shutil.copytree(root/'static',app/'static')
     shutil.copytree(root/'maintenance',installed/'maintenance',ignore=shutil.ignore_patterns('__pycache__','*.pyc'))

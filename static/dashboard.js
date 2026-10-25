@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml} = CryptoPilotUI;
+const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary} = CryptoPilotUI;
 let state = null, online = false, chartSymbol = 'BTC/USDT', chartTF = '1h', chartData = [], btData = [];
 let lastSuccess = 0, pollTimer = null, modalFocus = null;
 let orderDraft = null, orderFocus = null;
@@ -266,8 +266,39 @@ $('downloadResearch').onclick = () => {
   link.href = url; link.download = 'CryptoPilot-research-' + researchResult.symbol.replace(/[^A-Za-z0-9_-]/g, '-') + '-' + researchResult.timeframe + '.json';
   document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
+let updateStatus = null;
+function showUpdate(status) {
+  updateStatus = status;
+  $('appVersion').textContent = 'CryptoPilot ' + (status?.current_version || '');
+  const summary = updateSummary(status);
+  $('updateBanner').hidden = !summary;
+  if (!summary) return;
+  $('updateText').textContent = summary.text;
+  $('installUpdate').hidden = !summary.install;
+  $('updateNotes').href = status.release_page;
+}
+async function checkUpdates(force) {
+  try {
+    const status = await api(force ? '/update/check' : '/update', force ? 'POST' : 'GET', force ? {force: true} : undefined, {timeoutMs: 30000});
+    showUpdate(status);
+    if (force) toast(status.error ? status.error : status.available ? 'CryptoPilot ' + status.latest_version + ' is available.' : 'CryptoPilot is up to date.', !!status.error);
+  } catch (error) { if (force) toast(error.message, true); }
+}
+$('checkUpdates').onclick = () => checkUpdates(true);
+$('installUpdate').onclick = async () => {
+  if (busy.has('update')) return;
+  if (state?.running || state?.manual_order_active) { toast('Stop the bot and wait for any order to finish before updating.', true); return; }
+  if (!confirm('Download and install CryptoPilot ' + updateStatus.latest_version + '? CryptoPilot will close, update and reopen. Automatic stops are inactive until it is running again.')) return;
+  busy.add('update'); $('installUpdate').disabled = true;
+  showUpdate({...updateStatus, phase: 'downloading'});
+  try {
+    await api('/update/install', 'POST', undefined, {timeoutMs: 600000});
+    showUpdate({...updateStatus, phase: 'installing'});
+  } catch (error) { toast(error.message, true); showUpdate({...updateStatus, phase: 'idle'}); }
+  finally { busy.delete('update'); $('installUpdate').disabled = false; }
+};
 window.addEventListener('resize', draw);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { clearTimeout(pollTimer); poll(); } });
-connectionStatus(); draw(); poll();
+connectionStatus(); draw(); poll(); checkUpdates(false);
 
 

@@ -29,6 +29,7 @@ const root = require('node:path').resolve(__dirname, '..');
    data.positions=body.side==='buy'||partial?[{symbol:body.symbol,qty:partial ? .4 : 1,entry_price:25,mark:25,stop:24,target:27,unrealized:0}]:[];
    return route.fulfill({json:{status:partial?'partial':'filled',remaining_quantity:partial ? .4 : 0,mode:data.mode,side:body.side,symbol:body.symbol}});
   }
+  if(url.pathname==='/api/update')return route.fulfill({json:{current_version:'1.4.0',latest_version:'1.5.0',available:true,can_install:true,installed:true,phase:'idle',release_page:'https://github.com/BuildLoom-Amepps1994/ATB/releases/tag/v1.5.0',notes:'<img src=x onerror=alert(1)>'}});
   return route.fulfill({json:{ok:true}});
  });
  await page.goto('http://127.0.0.1:8765/');
@@ -38,6 +39,11 @@ const root = require('node:path').resolve(__dirname, '..');
  await page.waitForFunction(()=>document.getElementById('chartStatus').textContent.includes('100 completed'));
  assert.equal(await page.locator('#connectionBanner').isVisible(),false);
  assert.equal(await page.locator('#markets img').count(),0);
+ await page.waitForFunction(()=>!document.getElementById('updateBanner').hidden);
+ assert.match(await page.locator('#updateText').textContent(),/1\.5\.0 is available \(you have 1\.4\.0\)/);
+ assert.equal(await page.locator('#installUpdate').isVisible(),true);
+ assert.equal(await page.locator('#updateBanner img').count(),0);
+ assert.equal(await page.locator('#appVersion').textContent(),'CryptoPilot 1.4.0');
  await page.selectOption('#btSymbol','ETH/USDT');
  await page.click('#backtestBtn');
  await page.waitForFunction(()=>document.getElementById('backtestResults').textContent.includes('ETH/USDT'));
@@ -150,7 +156,7 @@ const root = require('node:path').resolve(__dirname, '..');
 
  assert.deepEqual(errors,[]);
  assert.deepEqual(mutations,['/api/backtest','/api/order','/api/order','/api/order','/api/order','/api/order','/api/order']);
- console.log('PASS: CSP boot, charts, escaping, backtests, modal keyboard, fake paper/live sequential orders, exact confirmations, duplicate-click guard, emergency stop during submit, stale/running controls; 0 page errors; desktop/mobile layouts. All HTTP routes intercepted; no real trading actions.');
+ console.log('PASS: CSP boot, update banner, charts, escaping, backtests, modal keyboard, fake paper/live sequential orders, exact confirmations, duplicate-click guard, emergency stop during submit, stale/running controls; 0 page errors; desktop/mobile layouts. All HTTP routes intercepted; no real trading actions.');
  } finally {await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});
 

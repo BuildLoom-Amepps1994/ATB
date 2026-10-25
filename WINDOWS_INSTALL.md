@@ -1,6 +1,6 @@
 # Installable, editable CryptoPilot for Windows
 
-Run **CryptoPilot-Setup-1.3.0.exe**. It installs for your Windows user without administrator access, includes its Python runtime, and adds Start menu entries. A desktop shortcut is optional. Setup does not start the application or trading. Existing installations, including a custom folder such as `D:\CryptoPilot`, can be upgraded in place while closed.
+Download **CryptoPilot-Setup-X.Y.Z.exe** from the [latest release](https://github.com/BuildLoom-Amepps1994/ATB/releases/latest) and run it. It installs for your Windows user without administrator access, includes its Python runtime, and adds Start menu entries. A desktop shortcut is optional. Setup does not start the application or trading. Existing installations, including a custom folder such as `D:\CryptoPilot`, can be upgraded in place while closed.
 
 Version 1.2 fixes the missing TLS trust-policy file in the prior runtime, keeps certificate/hostname checks enabled, and removes unnecessary TLS initialization from dashboard browser startup. `runtime\CryptoPilotRuntime.exe --check-runtime` verifies TLS configuration offline without opening the app or reading credentials.
 
@@ -61,6 +61,16 @@ Direct installed edits are detected. If the app folder differs from its installa
 Interrupted replacements retain a recovery record. The next launcher/update restores the previous source before continuing. If recovery fails, preserve the installation/backups and review the error; do not delete portfolio data to fix an installation problem. A source update is a locked, staged replacement with recovery, not a guarantee against every disk/power failure.
 
 Ordinary Python/dashboard changes do not require reinstalling the runtime. Changes to Python itself, native libraries or the dependency lock require a rebuilt installer. New application modules can be added directly under `app`; the conservative source updater currently packages the eight existing core modules plus dashboard assets.
+
+## In-app updates
+
+From 1.4.0 the dashboard checks this project's [GitHub Releases](https://github.com/BuildLoom-Amepps1994/ATB/releases) when it opens (at most every six hours, or with **Check for updates** in the footer). When a newer version is published, a banner offers **Install update**. Stop the bot first. CryptoPilot then downloads the new Setup, checks its size and SHA-256 against the values GitHub published for that release (a mismatch deletes the file and nothing runs), starts Setup and closes itself. Setup waits for the app to exit, installs over the same folder with a backup of the old editable source, and reopens CryptoPilot in a new browser tab. Trading is never started by an update, and automatic stops are inactive until you start the bot again.
+
+The checksum proves the file is the one published on the release page; it is not a code signature, so Windows may still show an unknown-publisher prompt. Set `CRYPTOPILOT_NO_UPDATE_CHECK=1` to turn the check off. If an update fails, Setup's log is in `%LOCALAPPDATA%\CryptoPilot\updates\setup.log`.
+
+## Publish a release (maintainers)
+
+The **Windows installer** GitHub Actions workflow builds Setup on a Windows runner, runs the test suite and both Windows smoke tests, and uploads the installer as a workflow artifact for every pull request. To publish an update, bump `APP_VERSION` in `updater.py` and `AppVersion` in `installer/CryptoPilot.iss`, merge, then push a matching tag (for example `git tag v1.4.1 && git push origin v1.4.1`). The workflow refuses a tag that does not match `APP_VERSION`, and publishes `CryptoPilot-Setup-X.Y.Z.exe` plus its `.sha256` as a GitHub Release, which installed copies then offer as an update.
 
 ## Upgrade and uninstall
 

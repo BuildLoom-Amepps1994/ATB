@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 
 MODULES = (
     'app.py', 'credentials.py', 'launcher.py', 'market_data.py',
-    'recovery.py', 'storage.py', 'strategy.py', 'trader.py',
+    'recovery.py', 'storage.py', 'strategy.py', 'trader.py', 'updater.py',
 )
 METADATA_FILES = ('requirements-lock.txt',)
 REQUIRED_ASSETS = ('static/index.html', 'static/dashboard.js', 'static/dashboard-core.js')

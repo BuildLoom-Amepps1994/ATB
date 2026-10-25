@@ -112,5 +112,6 @@ Double-click `BUILD_WINDOWS_EXE.bat` to create an isolated build environment and
 | `static/` | Dashboard, charts and connection handling |
 | `launcher.py` | Profile lock, exclusive port and browser startup |
 | `recovery.py` | Offline recovery report and the confirmed `--clear-halt` reset |
+| `updater.py` | App version, GitHub Releases update check, verified installer download |
 
 Engineering references: [CCXT manual](https://docs.ccxt.com/docs/manual), [keyring security](https://keyring.readthedocs.io/en/stable/#security-considerations), [MEXC spot API](https://www.mexc.com/api-docs/spot-v3/introduction), [Kraken API](https://docs.kraken.com/api/).

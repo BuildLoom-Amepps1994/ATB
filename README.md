@@ -16,15 +16,15 @@ For the **installable, editable version**, run `CryptoPilot-Setup-1.3.0.exe`. It
 
 The earlier portable release remains available: extract the entire `CryptoPilot-Windows` ZIP and open `CryptoPilot\CryptoPilot.exe`. Keep the whole folder together. The console must remain open while monitoring runs.
 
-For source, install **64-bit Python 3.12** (the tested version), extract the source ZIP, and double-click `START_WINDOWS.bat`. First launch downloads dependencies; subsequent launches skip installation when the dependency fingerprint is unchanged. The dashboard opens at **http://127.0.0.1:8765**. Click **Scan now** for analysis, or **Start bot** for automated paper trading.
+For source, install **64-bit Python 3.14** from python.org (3.12 and 3.13 still work but no longer receive regular Windows installers; 3.15 is not supported yet because pinned dependencies have no prebuilt Windows packages for it), extract the source ZIP, and double-click `START_WINDOWS.bat`. First launch downloads dependencies; subsequent launches skip installation when the dependency fingerprint is unchanged. The dashboard opens at **http://127.0.0.1:8765**. Click **Scan now** for analysis, or **Start bot** for automated paper trading.
 
 ```powershell
-py -3.12 -m venv .venv
+py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 .\.venv\Scripts\python.exe launcher.py
 ```
 
-`requirements-lock.txt` pins the verified Windows/Python 3.12 runtime. Version pins do not provide hash verification or a vulnerability audit. Other OS/Python combinations are unverified; `requirements.txt` gives broader dependency ranges for development. Do not expose the loopback service through a proxy or tunnel.
+`requirements-lock.txt` pins the Windows runtime for Python 3.12 to 3.14 (resolved 2026-10-25; the test suite passed on each version, but no Windows installation or build has been re-run with these pins yet). Version pins do not provide hash verification or a vulnerability audit. Other OS/Python combinations are unverified; `requirements.txt` gives broader dependency ranges for development. Do not expose the loopback service through a proxy or tunnel.
 
 Only one launcher may use a data folder at a time. A busy port produces a clear error. Optional settings:
 
@@ -93,7 +93,7 @@ Signals execute at the following open. Candle stop/target fills model adverse ga
 node --test tests/test_dashboard.js
 ```
 
-Optional browser regression checks require Playwright and Chromium/Edge: `node tests/test_dashboard_browser.cjs` (`CRYPTOPILOT_BROWSER_CHANNEL=msedge` selects Edge). Those tests intercept all app routes, use fake state, and submit no trading requests.
+The dashboard tests need Node.js 22 or newer (24 LTS recommended; 26 becomes LTS on 2026-10-28; Node 18 and 20 are end of life). Optional browser regression checks require Playwright 1.64 or newer, which needs Windows 11 or Server 2019+, and Chromium/Edge: `node tests/test_dashboard_browser.cjs` (`CRYPTOPILOT_BROWSER_CHANNEL=msedge` selects Edge). Those tests intercept all app routes, use fake state, and submit no trading requests.
 
 Double-click `BUILD_WINDOWS_EXE.bat` to create an isolated build environment and run the checked-in `CryptoPilot.spec`. It produces `dist\CryptoPilot\CryptoPilot.exe`; distribute the entire `CryptoPilot` folder. The console remains visible for shutdown and troubleshooting. Windows builds are unsigned; no signing certificate or installer is included. See `VALIDATION.md` for the actual completed checks and remaining caveats.
 

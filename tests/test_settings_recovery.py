@@ -1,5 +1,6 @@
 """Settings corruption and legacy reset regressions; temporary local files only."""
 import json
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import sys
@@ -113,7 +114,7 @@ def test_live_activation_blocks_before_credentials_when_settings_need_review(eng
 @pytest.mark.parametrize('existing_v2', [False, True])
 def test_paper_reset_does_not_resurrect_legacy_risk_metadata(profile, existing_v2):
     storage.save_settings(storage.DEFAULTS)
-    with sqlite3.connect(storage.DB_PATH) as db:
+    with closing(sqlite3.connect(storage.DB_PATH)) as db, db:
         db.execute('CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
         db.executemany('INSERT INTO meta VALUES (?,?)', [
             ('baseline.paper.2026-10-23', '50000'), ('breached.paper.2026-10-23', '1'),

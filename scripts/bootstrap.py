@@ -8,11 +8,29 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# The lock files are resolved for these interpreters. 3.15 is excluded until every
+# pinned dependency ships prebuilt Windows packages for it.
+OLDEST_PYTHON = (3, 12)
+NEWEST_PYTHON = (3, 14)
+RECOMMENDED_PYTHON = '3.14'
+
+
+def supported_python(version: tuple[int, int]) -> str | None:
+    """Return the reason a Python version cannot run the pinned dependencies, or None."""
+    if version < OLDEST_PYTHON:
+        return (f'CryptoPilot requires Python {OLDEST_PYTHON[0]}.{OLDEST_PYTHON[1]} or newer. '
+                f'Python {RECOMMENDED_PYTHON} is recommended.')
+    if version > NEWEST_PYTHON:
+        return (f'CryptoPilot does not support Python {version[0]}.{version[1]} yet: its pinned '
+                f'dependencies have no prebuilt packages for it. Install Python {RECOMMENDED_PYTHON}, '
+                f'delete this environment ({sys.prefix}) and run again.')
+    return None
 
 
 def main() -> int:
-    if sys.version_info < (3, 11):
-        print('CryptoPilot requires Python 3.11 or newer. Python 3.12 is recommended.')
+    problem = supported_python(tuple(sys.version_info[:2]))
+    if problem:
+        print(problem)
         return 1
     build = '--build' in sys.argv[1:]
     runtime = ROOT / 'requirements-lock.txt'

@@ -1,5 +1,6 @@
 """Recovery reporting is offline, read-only and does not clear live safeguards."""
 import json
+from contextlib import closing
 import sqlite3
 import sys
 import uuid
@@ -82,14 +83,14 @@ def test_recovery_refuses_active_instance(recovery_data):
 def test_recovery_does_not_create_or_migrate_database(tmp_path):
     assert recovery.report(tmp_path)['database_exists'] is False
     assert not (tmp_path / 'portfolio.sqlite3').exists()
-    with sqlite3.connect(tmp_path / 'portfolio.sqlite3') as connection:
+    with closing(sqlite3.connect(tmp_path / 'portfolio.sqlite3')) as connection, connection:
         connection.executescript("CREATE TABLE positions(mode TEXT,symbol TEXT); INSERT INTO positions VALUES ('live','BTC/USDT');")
     old_bytes = (tmp_path / 'portfolio.sqlite3').read_bytes()
     result = recovery.report(tmp_path)
     assert result['schema_version'] == 0
     assert result['legacy_live_record_count'] == 1
     assert (tmp_path / 'portfolio.sqlite3').read_bytes() == old_bytes
-    with sqlite3.connect(tmp_path / 'portfolio.sqlite3') as connection:
+    with closing(sqlite3.connect(tmp_path / 'portfolio.sqlite3')) as connection:
         assert [row[1] for row in connection.execute('PRAGMA table_info(positions)')] == ['mode', 'symbol']
 
 

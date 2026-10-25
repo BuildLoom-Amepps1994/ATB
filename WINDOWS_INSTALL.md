@@ -70,7 +70,7 @@ Uninstall through Windows Apps or the Start menu. Runtime files and shortcuts ar
 
 ## Build the installer from source
 
-Install 64-bit Python **3.12** and [Inno Setup 6 or 7](https://jrsoftware.org/isdl.php). Double-click **BUILD_WINDOWS_INSTALLER.bat**. If necessary, set `INNO_SETUP_COMPILER` to `ISCC.exe`'s full path. The script creates an isolated build environment, builds the dependency runtime with `CryptoPilotEditable.spec`, assembles a new stage and compiles Setup into `dist\installer`.
+Install 64-bit Python **3.14** (the python.org installer or `py install 3.14` with the Python install manager; 3.12 or 3.13 also works; 3.15 is not supported yet) and [Inno Setup 6 or 7](https://jrsoftware.org/isdl.php). Double-click **BUILD_WINDOWS_INSTALLER.bat**. If necessary, set `INNO_SETUP_COMPILER` to `ISCC.exe`'s full path. The script creates an isolated build environment, builds the dependency runtime with `CryptoPilotEditable.spec`, assembles a new stage and compiles Setup into `dist\installer`.
 
 The dependency runtime is built separately from the editable source. Existing staging folders are retained rather than silently overwritten. Build requirements are version-pinned; pins do not authenticate update authors or provide a vulnerability audit. The delivered Setup and runtime are unsigned, so Windows may display an unknown-publisher warning.
 

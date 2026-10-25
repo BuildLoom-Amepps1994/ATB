@@ -1,5 +1,5 @@
 'use strict';
-// Run with Node 18+: node --test tests/test_dashboard.js. No exchange/network access.
+// Run with Node 22+ (24 LTS recommended): node --test tests/test_dashboard.js. No exchange/network access.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml} = require('../static/dashboard-core.js');

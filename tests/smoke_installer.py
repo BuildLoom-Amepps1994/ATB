@@ -5,6 +5,7 @@ Never uses the normal installation, credential store or portfolio. No scans/orde
 """
 from __future__ import annotations
 import argparse
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -88,7 +89,7 @@ def main():
     def assert_data():
         assert (data/'sentinel.txt').read_bytes()==b'keep test portfolio data'
         assert json.loads((data/'settings.json').read_text())['scan_seconds']==240
-        with sqlite3.connect(data/'portfolio.sqlite3') as db:
+        with closing(sqlite3.connect(data/'portfolio.sqlite3')) as db:
             assert float(db.execute("SELECT value FROM meta WHERE key='paper_cash.mexc'").fetchone()[0])==4321
 
     install()
@@ -105,7 +106,7 @@ def main():
         assert b'requestJson' in get('/static/dashboard-core.js')
     finally:
         stop(child)
-    with sqlite3.connect(data/'portfolio.sqlite3') as db:
+    with closing(sqlite3.connect(data/'portfolio.sqlite3')) as db, db:
         db.execute("UPDATE meta SET value='4321' WHERE key='paper_cash.mexc'")
     add_marker(installation/'app','direct-edit-A')
     add_marker(source,'source-update-B')

@@ -15,8 +15,10 @@ import ccxt
 import credentials
 import storage
 from market_data import MarketData
-from strategy import entry_price_ok, entry_signal, regime_signal, research_report, stop_fraction
+from strategy import entry_price_ok, entry_signal, regime_signal, research_report, setup_quality, stop_fraction
 
+
+MARKET_SYMBOL = 'BTC/USDT'
 
 KNOWN_MEMES = {'DOGE', 'SHIB', 'PEPE', 'BONK', 'FLOKI', 'WIF', 'BRETT', 'POPCAT',
                'MOG', 'TURBO', 'FARTCOIN', 'PNUT', 'BOME', 'PENGU', 'NEIRO', 'BABYDOGE'}
@@ -53,7 +55,8 @@ class TradingEngine:
         self.cfg = storage.settings()
         self.exchange_name = self.cfg['exchange']
         self.public = self._new_exchange(self.exchange_name)
-        self.data = MarketData(self.public, wait=self._retry_wait)
+        self.data = MarketData(self.public, wait=self._retry_wait,
+                               concurrency=self._public_concurrency(self.public))
         self.markets_loaded_at = 0.0
         self._halt_pending = None
         self.private = self.api_key = self.api_secret = None
@@ -91,6 +94,18 @@ class TradingEngine:
         if key and secret:
             options.update({'apiKey': key, 'secret': secret})
         return getattr(ccxt, name)(options)
+
+    @staticmethod
+    def _public_concurrency(client) -> int:
+        """Overlap candle downloads only where the rate limit, not latency, is slack.
+
+        MEXC paces public requests 50 ms apart, so several round trips can
+        overlap. Kraken's one-per-second pacing is the bottleneck by itself.
+        """
+        rate_limit = getattr(client, 'rateLimit', None)
+        if isinstance(rate_limit, bool) or not isinstance(rate_limit, (int, float)) or not 0 < rate_limit <= 100:
+            return 1
+        return 4
 
     def _key(self, name: str) -> str:
         return storage.scope_key(name, self.exchange_name)
@@ -284,7 +299,8 @@ class TradingEngine:
                 # Constructor/adapter failures cannot leave an old authenticated
                 # client paired with a new exchange ledger scope.
                 candidate_public = self._new_exchange(revised['exchange'])
-                candidate_data = MarketData(candidate_public, wait=self._retry_wait)
+                candidate_data = MarketData(candidate_public, wait=self._retry_wait,
+                                            concurrency=self._public_concurrency(candidate_public))
             storage.save_settings(revised)
             self.cfg = revised
             if changed_exchange:
@@ -362,7 +378,10 @@ class TradingEngine:
                 if time.monotonic() >= next_scan and not self.stop_event.is_set():
                     self.scan_once(allow_orders=True, exited_symbols=exited)
                     # Never catch up with a burst of scans after a slow API.
-                    next_scan = time.monotonic() + float(self.cfg['scan_seconds'])
+                    # A signal candle is assessed moments after it closes
+                    # rather than up to a whole scan interval later.
+                    next_scan = time.monotonic() + min(float(self.cfg['scan_seconds']),
+                                                       self._seconds_to_next_close())
                 delay = max(.05, min(next_scan, self._next_monitor) - time.monotonic())
                 if self.stop_event.wait(delay):
                     break
@@ -371,6 +390,18 @@ class TradingEngine:
         finally:
             with self.lock:
                 self.running = self.stopping = False
+
+    CLOSE_GRACE_SECONDS = 5.0
+
+    def _seconds_to_next_close(self) -> float:
+        """Seconds until the next primary candle close plus a short grace.
+
+        The grace outlasts the completed-candle cache expiry (two seconds
+        after a close), so the scan downloads the newly closed candle.
+        """
+        duration = TIMEFRAME_SECONDS[HORIZONS[self.cfg['time_horizon']][0]]
+        exchange_now = time.time() - self._clock_offset()
+        return duration - exchange_now % duration + self.CLOSE_GRACE_SECONDS
 
     def _orders_allowed(self) -> bool:
         return bool((self.running or self._manual_order_active) and not self.stop_event.is_set()
@@ -1021,13 +1052,15 @@ class TradingEngine:
                 continue
             highest = max(float(position['highest']), price)
             stop = max(float(position['stop']), highest - 2.5 * atr) if finite_positive(atr) else float(position['stop'])
-            try:
-                with storage.connection() as db:
-                    db.execute('UPDATE positions SET highest=?,stop=? WHERE exchange=? AND mode=? AND symbol=?',
-                               (highest, stop, self.exchange_name, self.mode, symbol))
-            except Exception as exc:
-                self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
-                return
+            # An unchanged level needs no durable (fsync) write on every poll.
+            if highest != float(position['highest']) or stop != float(position['stop']):
+                try:
+                    with storage.connection() as db:
+                        db.execute('UPDATE positions SET highest=?,stop=? WHERE exchange=? AND mode=? AND symbol=?',
+                                   (highest, stop, self.exchange_name, self.mode, symbol))
+                except Exception as exc:
+                    self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
+                    return
             if (self._orders_allowed() and not self._is_dust(
                     position, self._catalogue().get(symbol), price)):
                 if price <= stop:
@@ -1059,6 +1092,7 @@ class TradingEngine:
         with self.lock:
             self.last_scan, self.last_error = now(), None
         assessments, candidates = [], []
+        market_state = {}
         # Exits the worker's last protective poll performed stay excluded here.
         exited_symbols = set(exited_symbols or ())
         successful_assessments = 0
@@ -1080,6 +1114,14 @@ class TradingEngine:
             except Exception:
                 tickers = {}
             catalogue = self._catalogue()
+            tradable = [symbol for symbol in symbols if self._spot(symbol, catalogue.get(symbol))]
+            wanted = [(symbol, primary_tf, 175) for symbol in tradable]
+            wanted += [(symbol, higher_tf, 85) for symbol in tradable]
+            if self.cfg.get('market_filters', True) and self._spot(MARKET_SYMBOL, catalogue.get(MARKET_SYMBOL)):
+                wanted.append((MARKET_SYMBOL, higher_tf, 85))
+            # Background downloads overlap round trips; the loop below still
+            # runs each symbol's protective checks before using its candles.
+            self.data.prefetch(wanted)
             for symbol in symbols:
                 if allow_orders and self.stop_event.is_set():
                     break
@@ -1116,10 +1158,14 @@ class TradingEngine:
                         exited_symbols.add(symbol)
                     # HTF data gates entries only. Stops and trend exits above
                     # remain independent of a higher-timeframe API failure.
+                    filters = self.cfg.get('market_filters', True)
                     try:
                         higher = self.data.candles(symbol, higher_tf, limit=85)
                         regime_ok = regime_signal(higher)
-                        signal, reason, score = entry_signal(last, regime_ok=regime_ok, rapid=horizon == 'rapid')
+                        market_ok = (self._market_regime(higher_tf, market_state)
+                                     if filters and symbol != MARKET_SYMBOL else None)
+                        signal, reason, score = entry_signal(last, regime_ok=regime_ok, rapid=horizon == 'rapid',
+                                                             market_ok=market_ok, filters=filters)
                     except Exception as exc:
                         regime_ok, signal, score = False, False, 0
                         reason = f'Higher-timeframe data unavailable: {type(exc).__name__}'
@@ -1136,13 +1182,18 @@ class TradingEngine:
                     candidate = bool(signal and liquid and spread_ok and close_enough
                                      and self._fresh(symbol) and symbol not in exited_symbols)
                     if candidate:
-                        candidates.append((score, volume, symbol, price, atr, int(last['timestamp']), signal_close))
+                        # Every candidate passed all checks; rank by setup quality, then turnover.
+                        candidates.append((setup_quality(last), volume, symbol, price, atr, int(last['timestamp']), signal_close))
                     rsi = float(last['rsi'])
                     assessments.append({'symbol': symbol, 'price': price, 'bid': self.last_prices[symbol],
                                         'ask': self.last_asks.get(symbol), 'price_basis': 'ask' if symbol in self.last_asks else 'bid',
                                         'score': score, 'volume': volume,
                                         'spread': round(spread, 3) if spread is not None else None,
                                         'rsi': round(rsi, 1) if math.isfinite(rsi) else None,
+                                        'trend_efficiency': (round(float(last['efficiency']), 2)
+                                                             if math.isfinite(float(last.get('efficiency', math.nan))) else None),
+                                        'market': ('unavailable' if 'error' in market_state else 'uptrend'
+                                                   if market_state.get('ok') else 'weak' if market_state else None),
                                         'atr_pct': round(atr / price * 100, 2),
                                         'regime': 'uptrend' if regime_ok else 'weak',
                                         'kind': 'MEME' if is_meme(symbol) else 'CORE' if symbol.split('/')[0] in ('BTC', 'ETH') else 'ALT',
@@ -1175,6 +1226,22 @@ class TradingEngine:
             return assessments
         finally:
             self.scan_lock.release()
+
+    def _market_regime(self, higher_tf: str, state: dict) -> bool:
+        """BTC's confirmation-timeframe trend, read once per scan.
+
+        Altcoin breakouts rarely hold against a falling BTC. Missing or
+        failing BTC data blocks altcoin entries; exits never depend on it.
+        """
+        if 'ok' not in state:
+            state['ok'] = False
+            try:
+                if not self._spot(MARKET_SYMBOL, self._catalogue().get(MARKET_SYMBOL)):
+                    raise ValueError('BTC/USDT is not an active spot market')
+                state['ok'] = regime_signal(self.data.candles(MARKET_SYMBOL, higher_tf, limit=85))
+            except Exception as exc:
+                state['error'] = type(exc).__name__
+        return state['ok']
 
     def _portfolio_risk(self, positions: list[dict]) -> float:
         proceeds_factor = (1 - self.cfg['fee_pct'] / 100) * (1 - self.cfg['slippage_pct'] / 100)
@@ -1482,8 +1549,11 @@ class TradingEngine:
             cutoff = int(time.time() * 1000)
             rows = self.data.read('fetch_ohlcv', symbol, tf, limit=900)
             higher = self.data.read('fetch_ohlcv', symbol, higher_tf, limit=900)
+            # The live BTC gate is replayed from BTC's own confirmation candles.
+            market = (self.data.read('fetch_ohlcv', MARKET_SYMBOL, higher_tf, limit=900)
+                      if self.cfg.get('market_filters', True) and symbol != MARKET_SYMBOL else None)
             return research_report(rows, dict(self.cfg), timeframe=tf, higher_rows=higher,
-                                   higher_timeframe=higher_tf, now_ms=cutoff)
+                                   higher_timeframe=higher_tf, now_ms=cutoff, market_rows=market)
         finally:
             self.scan_lock.release()
 

@@ -8,6 +8,7 @@ import re
 import time
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 
@@ -57,46 +58,70 @@ def frame_from_ohlcv(rows: list[list[float]], drop_open_candle: bool = True, *,
         return pd.DataFrame(columns=OHLCV_COLUMNS)
     if any(not isinstance(row, (list, tuple)) or len(row) != 6 for row in rows):
         raise ValueError('Every OHLCV candle must contain exactly six values')
-    df = pd.DataFrame(rows, columns=OHLCV_COLUMNS)
-    for column in OHLCV_COLUMNS:
-        df[column] = pd.to_numeric(df[column], errors='coerce')
-    if df.isna().any().any() or not all(
-            math.isfinite(float(value)) for value in df.to_numpy().flat):
+    try:
+        values = np.array(rows, dtype=float)
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError('OHLCV candles must contain finite numeric values') from None
+    if not np.isfinite(values).all():
         raise ValueError('OHLCV candles must contain finite numeric values')
-    if ((df['timestamp'] <= 0) | (df['timestamp'] % 1 != 0)
-            | (df['timestamp'] > 9_007_199_254_740_991)).any():
+    stamps, prices, volume = values[:, 0], values[:, 1:5], values[:, 5]
+    if ((stamps <= 0) | (stamps % 1 != 0) | (stamps > 9_007_199_254_740_991)).any():
         raise ValueError('Candle timestamps must be positive integer milliseconds')
-    if (df[['open', 'high', 'low', 'close']] <= 0).any().any() or (df['volume'] < 0).any():
+    if (prices <= 0).any() or (volume < 0).any():
         raise ValueError('Candle prices must be positive and volume nonnegative')
-    if ((df['high'] < df[['open', 'close', 'low']].max(axis=1))
-            | (df['low'] > df[['open', 'close', 'high']].min(axis=1))).any():
+    opens, highs, lows, closes = prices.T
+    if ((highs < np.maximum(np.maximum(opens, closes), lows))
+            | (lows > np.minimum(np.minimum(opens, closes), highs))).any():
         raise ValueError('Candle high/low contradict its open or close')
-    df = df.drop_duplicates()
-    if df['timestamp'].duplicated().any():
+    # Sorted exact-duplicate removal; any remaining shared timestamp conflicts.
+    values = np.unique(values, axis=0)
+    if (np.diff(values[:, 0]) == 0).any():
         raise ValueError('Conflicting candles share a timestamp')
-    df['timestamp'] = df['timestamp'].astype('int64')
-    df = df.sort_values('timestamp').reset_index(drop=True)
     if drop_open_candle:
         if duration is None:
-            df = df.iloc[:-1]
+            values = values[:-1]
         else:
             cutoff = int(time.time() * 1000) if now_ms is None else now_ms
             if (isinstance(cutoff, bool) or not isinstance(cutoff, (int, float))
                     or not math.isfinite(float(cutoff)) or cutoff < 0):
                 raise ValueError('Candle completion time must be finite milliseconds')
-            df = df[df['timestamp'] + duration <= cutoff]
-    return df.reset_index(drop=True)
+            values = values[values[:, 0] + duration <= cutoff]
+    frame = {'timestamp': values[:, 0].astype('int64')}
+    frame.update((name, values[:, i]) for i, name in enumerate(OHLCV_COLUMNS[1:], 1))
+    return pd.DataFrame(frame)
 
 
-def _bounded_ewm(values: pd.Series, alpha: float, minimum: int, window: int) -> pd.Series:
+def _shift(values: np.ndarray, periods: int) -> np.ndarray:
+    result = np.full(len(values), np.nan)
+    if periods < len(values):
+        result[periods:] = values[:len(values) - periods]
+    return result
+
+
+def _bounded_ewm(values: np.ndarray, alpha: float, minimum: int, window: int) -> np.ndarray:
     """Equivalent to restarting adjust=False EWM on each trailing window."""
     if minimum > window:
-        return pd.Series(float('nan'), index=values.index)
-    full = values.ewm(alpha=alpha, adjust=False, min_periods=1).mean()
-    preceding = full.shift(window)
-    bounded = full + (1 - alpha) ** window * (values.shift(window - 1) - preceding)
-    bounded = bounded.where(preceding.notna(), full)
-    return bounded.where(values.rolling(window, min_periods=1).count() >= minimum)
+        return np.full(len(values), np.nan)
+    # The recursion itself stays in pandas' compiled EWM for identical rounding.
+    full = pd.Series(values).ewm(alpha=alpha, adjust=False, min_periods=1).mean().to_numpy()
+    preceding = _shift(full, window)
+    bounded = full + (1 - alpha) ** window * (_shift(values, window - 1) - preceding)
+    bounded = np.where(np.isnan(preceding), full, bounded)
+    present = np.cumsum(~np.isnan(values))
+    count = present - _shift(present, window)
+    count = np.where(np.isnan(count), present, count)
+    return np.where(count >= minimum, bounded, np.nan)
+
+
+def _trailing(values: np.ndarray, length: int, reducer) -> np.ndarray:
+    """Exact fixed-length trailing reduction; incomplete windows are NaN."""
+    result = np.full(len(values), np.nan)
+    if len(values) >= length:
+        result[length - 1:] = reducer(np.lib.stride_tricks.sliding_window_view(values, length), axis=1)
+    return result
+
+
+EFFICIENCY_PERIOD = 20
 
 
 def indicators(df: pd.DataFrame, *, window: int = PRIMARY_WINDOW) -> pd.DataFrame:
@@ -110,36 +135,55 @@ def indicators(df: pd.DataFrame, *, window: int = PRIMARY_WINDOW) -> pd.DataFram
         return df.copy()
     if isinstance(window, bool) or not isinstance(window, int) or window < 50:
         raise ValueError('Indicator window must contain at least 50 candles')
-    x = df.copy()
+    close = df['close'].to_numpy(dtype=float)
+    high, low = df['high'].to_numpy(dtype=float), df['low'].to_numpy(dtype=float)
+    volume = df['volume'].to_numpy(dtype=float)
+    columns = dict(df.items())
     for period in (20, 50, 100):
-        x[f'ema{period}'] = _bounded_ewm(x['close'], 2 / (period + 1), period, window)
-    change = x['close'].diff()
+        columns[f'ema{period}'] = _bounded_ewm(close, 2 / (period + 1), period, window)
+    change = close - _shift(close, 1)
     # A fresh window has no change for its oldest candle; use W-1 changes.
-    gain = _bounded_ewm(change.clip(lower=0), 1 / 14, 14, window - 1)
-    loss = _bounded_ewm(-change.clip(upper=0), 1 / 14, 14, window - 1)
-    rs = gain / loss.replace(0, float('nan'))
-    x['rsi'] = 100 - (100 / (1 + rs))
-    x.loc[(loss == 0) & (gain > 0), 'rsi'] = 100
-    x.loc[(gain == 0) & (loss > 0), 'rsi'] = 0
-    x.loc[(gain == 0) & (loss == 0), 'rsi'] = 50
-    prev_close = x['close'].shift(1)
-    tr = pd.concat([(x['high'] - x['low']), (x['high'] - prev_close).abs(),
-                    (x['low'] - prev_close).abs()], axis=1).max(axis=1)
-    x['atr'] = _bounded_ewm(tr, 1 / 14, 14, window)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        gain = _bounded_ewm(np.where(np.isnan(change), np.nan, np.maximum(change, 0)), 1 / 14, 14, window - 1)
+        loss = _bounded_ewm(np.where(np.isnan(change), np.nan, -np.minimum(change, 0)), 1 / 14, 14, window - 1)
+        rsi = 100 - (100 / (1 + gain / np.where(loss == 0, np.nan, loss)))
+    rsi[(loss == 0) & (gain > 0)] = 100
+    rsi[(gain == 0) & (loss > 0)] = 0
+    rsi[(gain == 0) & (loss == 0)] = 50
+    columns['rsi'] = rsi
+    prev_close = _shift(close, 1)
+    tr = np.fmax(np.fmax(high - low, np.abs(high - prev_close)), np.abs(low - prev_close))
+    atr = _bounded_ewm(tr, 1 / 14, 14, window)
     # At the oldest window row, no preceding close exists; its true range is H-L.
-    first_range_correction = ((x['high'] - x['low'] - tr).shift(window - 1)
-                              * (1 - 1 / 14) ** (window - 1)).fillna(0)
-    x['atr'] += first_range_correction
-    x['vol_avg20'] = x['volume'].rolling(20).mean()
-    x['prior_high20'] = x['high'].shift(1).rolling(20).max()
-    return x
+    correction = _shift(high - low - tr, window - 1) * (1 - 1 / 14) ** (window - 1)
+    columns['atr'] = atr + np.nan_to_num(correction, nan=0.0)
+    columns['vol_avg20'] = pd.Series(volume).rolling(20).mean().to_numpy()
+    columns['prior_high20'] = _trailing(_shift(high, 1), 20, np.max)
+    # Kaufman efficiency: net move over the summed path of the last 20 changes.
+    path = _trailing(np.abs(change), EFFICIENCY_PERIOD, np.sum)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        efficiency = np.abs(close - _shift(close, EFFICIENCY_PERIOD)) / path
+    columns['efficiency'] = np.where(path == 0, 0.0, efficiency)
+    return pd.DataFrame(columns, index=df.index)
 
 
-def entry_signal(last: pd.Series, regime_ok: bool = True, *, rapid: bool = False) -> tuple[bool, str, int]:
+MIN_EFFICIENCY = .3
+
+
+def entry_signal(last, regime_ok: bool = True, *, rapid: bool = False,
+                 market_ok: bool | None = None, filters: bool = True) -> tuple[bool, str, int]:
+    """Completed-candle breakout rules; every check must pass.
+
+    With ``filters`` the 20-candle trend efficiency must show a directional
+    move rather than noise (a random walk averages about 0.22). ``market_ok``
+    is the BTC higher-timeframe trend for altcoins; None means not applied.
+    Both can only block an entry, never size or place one.
+    """
+    keys = ['close', 'volume', 'ema20', 'ema50', 'rsi', 'atr', 'vol_avg20', 'prior_high20']
+    if filters:
+        keys.append('efficiency')
     try:
-        values = {key: float(last[key]) for key in
-                  ('close', 'volume', 'ema20', 'ema50', 'rsi', 'atr',
-                   'vol_avg20', 'prior_high20')}
+        values = {key: float(last[key]) for key in keys}
     except (TypeError, ValueError, KeyError):
         return False, 'Insufficient indicators', 0
     if not all(math.isfinite(value) for value in values.values()) or any(
@@ -156,10 +200,32 @@ def entry_signal(last: pd.Series, regime_ok: bool = True, *, rapid: bool = False
               values['volume'] >= values['vol_avg20'] * 0.65,
               volatility_ok,
               bool(regime_ok)]
-    score = int(sum(checks) / len(checks) * 100)
     reasons = ['trend', 'RSI', 'breakout', 'volume', 'volatility', 'higher-timeframe trend']
+    if filters:
+        checks.append(values['efficiency'] >= MIN_EFFICIENCY)
+        reasons.append('choppy market')
+    if market_ok is not None:
+        checks.append(bool(market_ok))
+        reasons.append('BTC market trend')
+    score = int(sum(checks) / len(checks) * 100)
     failed = [name for name, accepted in zip(reasons, checks) if not accepted]
     return all(checks), 'BUY setup' if all(checks) else 'Waiting: ' + ', '.join(failed), score
+
+
+def setup_quality(last) -> float:
+    """Rank qualifying setups: cleaner trends with stronger volume come first.
+
+    Only orders candidates that already passed every entry check; capped so
+    one volume spike cannot dominate. Unknown inputs rank last.
+    """
+    try:
+        efficiency = float(last['efficiency'])
+        relative_volume = float(last['volume']) / float(last['vol_avg20'])
+    except (TypeError, ValueError, KeyError, ZeroDivisionError):
+        return 0.0
+    if not (math.isfinite(efficiency) and math.isfinite(relative_volume)):
+        return 0.0
+    return round(max(0.0, min(1.0, efficiency)) * max(0.0, min(3.0, relative_volume)), 6)
 
 
 def regime_signal(higher: pd.DataFrame) -> bool:
@@ -219,12 +285,14 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
              higher_timeframe: str | None = None,
              now_ms: int | None = None,
              start_ms: int | None = None,
-             end_ms: int | None = None) -> dict[str, Any]:
+             end_ms: int | None = None,
+             market_rows: list[list[float]] | None = None) -> dict[str, Any]:
     """Simulate next-open signals and conservative stop/target candle fills.
 
     A trailing stop is updated only after testing the existing stop for the bar.
     Ambiguous stop-and-target candles take the stop. Spread, order-book depth,
-    exchange rounding and portfolio-wide limits are not modeled.
+    exchange rounding and portfolio-wide limits are not modeled. ``market_rows``
+    are BTC candles on the confirmation timeframe for the live market gate.
     """
     x = indicators(frame_from_ohlcv(rows, timeframe=timeframe, now_ms=now_ms))
     if len(x) < 125:
@@ -252,6 +320,18 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
         regimes = ((x['close'] > x['ema100']) & (x['ema50'] > x['ema100'])).tolist()
         covered = [False] * len(x)
         regime_mode = 'primary_ema_proxy'
+    filters = settings.get('market_filters', True)
+    if not isinstance(filters, bool):
+        raise ValueError('market_filters must be true or false')
+    market = None
+    if market_rows is not None and filters:
+        if higher_rows is None:
+            raise ValueError('The BTC market gate requires the confirmation timeframe')
+        market_frame = frame_from_ohlcv(market_rows, timeframe=higher_timeframe, now_ms=now_ms)
+        if len(market_frame) < 65:
+            raise ValueError('At least 65 completed BTC confirmation candles are required')
+        _contiguous_interval(market_frame, higher_duration)
+        market = _historical_regimes(x, market_frame, duration, higher_duration)
     parameters = {}
     for key, default, allow_zero in (('fee_pct', 0.1, True), ('slippage_pct', 0.2, True),
                                       ('risk_pct', 0.65, False), ('max_position_pct', 8.0, False)):
@@ -315,7 +395,12 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
             exited = qty == 0
         if qty == 0 and not exited:
             signal_args = {'rapid': True} if rapid else {}
-            buy, _, _ = entry_signal(pd.Series(previous), regime_ok=regimes[i - 1], **signal_args)
+            filter_args = dict(signal_args)
+            if not filters:
+                filter_args['filters'] = False
+            if market is not None:
+                filter_args['market_ok'] = market[i - 1]
+            buy, _, _ = entry_signal(previous, regime_ok=regimes[i - 1], **filter_args)
             if buy and entry_price_ok(market_open, float(previous['close']), float(previous['atr'])):
                 fraction = stop_fraction(float(previous['atr']), float(previous['close']), **signal_args)
                 loss_fraction = 1 - (1 - fraction) * (1 - slip) * (1 - fee) / (1 + fee)
@@ -407,6 +492,9 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
                         'risk_pct': parameters['risk_pct'] * 100,
                         'max_position_pct': parameters['max_position_pct'] * 100,
                         'regime_mode': regime_mode, 'higher_timeframe': higher_timeframe,
+                        'entry_filters': {'trend_efficiency_min': MIN_EFFICIENCY if filters else None,
+                                          'btc_market_gate': ('exact_completed_higher_timeframe' if market is not None
+                                                              else 'not_modeled' if filters else 'disabled')},
                         'equity_basis': 'estimated net liquidation including exit fee/slippage'},
         'warning': warning,
     }
@@ -441,7 +529,8 @@ def research_report(rows: list[list[float]], settings: dict[str, Any], *,
                     timeframe: str | None = None,
                     higher_rows: list[list[float]] | None = None,
                     higher_timeframe: str | None = None,
-                    now_ms: int | None = None) -> dict[str, Any]:
+                    now_ms: int | None = None,
+                    market_rows: list[list[float]] | None = None) -> dict[str, Any]:
     """Fixed-parameter chronological diagnostics; no search, tuning or forecast.
 
     The existing full-window result remains at the top level. Development and
@@ -452,10 +541,12 @@ def research_report(rows: list[list[float]], settings: dict[str, Any], *,
     """
     cutoff = int(time.time() * 1000) if now_ms is None else now_ms
     options = {'timeframe': timeframe, 'higher_rows': higher_rows,
-               'higher_timeframe': higher_timeframe, 'now_ms': cutoff}
+               'higher_timeframe': higher_timeframe, 'now_ms': cutoff,
+               'market_rows': market_rows}
     base = backtest(rows, settings, **options)
     frame = frame_from_ohlcv(rows, timeframe=timeframe, now_ms=cutoff)
     higher = frame_from_ohlcv(higher_rows, timeframe=higher_timeframe, now_ms=cutoff) if higher_rows is not None else None
+    market = frame_from_ohlcv(market_rows, timeframe=higher_timeframe, now_ms=cutoff) if market_rows is not None else None
     count = base['coverage']['evaluation_candles']
     split_index = 116 + max(1, min(count - 1, int(count * .70)))
     split_time = int(frame.iloc[split_index]['timestamp'])
@@ -473,10 +564,12 @@ def research_report(rows: list[list[float]], settings: dict[str, Any], *,
         'split_fraction': .70, 'split_ms': split_time,
         'primary_timeframe': timeframe, 'higher_timeframe': higher_timeframe,
         'parameters': {key: base['assumptions'][key] for key in
-                       ('fee_pct', 'slippage_pct', 'risk_pct', 'max_position_pct', 'risk_profile')},
+                       ('fee_pct', 'slippage_pct', 'risk_pct', 'max_position_pct', 'risk_profile',
+                        'entry_filters')},
         'indicator_policy': {'primary_window': PRIMARY_WINDOW, 'higher_window': HIGHER_WINDOW},
         'data_fingerprints': {'primary_sha256': _candle_fingerprint(frame),
-                              'higher_sha256': _candle_fingerprint(higher) if higher is not None else None},
+                              'higher_sha256': _candle_fingerprint(higher) if higher is not None else None,
+                              'market_sha256': _candle_fingerprint(market) if market is not None else None},
         'development': _diagnostic_summary(development), 'holdout': _diagnostic_summary(holdout),
         'double_cost': stress_summary,
         'notes': ['The chronological split uses fixed known rules, with no parameter selection or tuning; it is not independent prospective validation.',

@@ -59,6 +59,7 @@ def test_worker_monitors_between_full_strategy_scan_deadlines(engine, monkeypatc
     monkeypatch.setattr(trader.time, 'monotonic', lambda: clock[0])
     monkeypatch.setattr(engine, '_monitor_if_due', monitor)
     monkeypatch.setattr(engine, 'scan_once', lambda **kw: scans.append(clock[0]))
+    monkeypatch.setattr(engine, '_seconds_to_next_close', lambda: 3600.0)
     engine.stop_event, engine.running = Timer(), True
     engine.cfg['scan_seconds'] = 180
     engine._loop()

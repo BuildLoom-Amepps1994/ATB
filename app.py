@@ -18,11 +18,13 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 import credentials
 import storage
+import updater
 from market_data import DataUnavailable
 from trader import TradingEngine
 
 engine = TradingEngine()
 CSRF = secrets.token_urlsafe(32)
+updates = updater.Updater(download_dir=storage.DATA_DIR / 'updates')
 # __file__ follows the editable installed module as well as the standalone bundle.
 STATIC = Path(__file__).resolve().parent / 'static'
 
@@ -38,6 +40,8 @@ app = FastAPI(title='CryptoPilot Local', docs_url=None, redoc_url=None, openapi_
 # then refuse to run the dashboard. Static types never depend on the registry.
 mimetypes.add_type('text/javascript', '.js')
 mimetypes.add_type('text/css', '.css')
+# The launcher sets this to a callable that stops the server, so an update can exit cleanly.
+app.state.request_exit = None
 app.mount('/static', StaticFiles(directory=str(STATIC)), name='static')
 
 
@@ -263,3 +267,38 @@ def run_backtest(req: ChartQuery):
             raise storage.ConfigValidationError('Backtest timeframe must be 1m, 5m, 1h, 4h or 1d.')
         return engine.research_backtest(req.symbol.upper(), req.timeframe)
     return ensure_ok(work)
+
+
+class UpdateCheck(StrictModel):
+    force: bool = False
+
+
+def _update_action(action):
+    try:
+        return action()
+    except updater.UpdateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except OSError as exc:
+        _record_failure(exc)
+        raise HTTPException(status_code=502, detail='The update could not be downloaded or started. Check local activity.') from None
+
+
+@app.get('/api/update')
+def update_status():
+    return _update_action(lambda: updates.check())
+
+
+@app.post('/api/update/check')
+def update_check(req: UpdateCheck):
+    return _update_action(lambda: updates.check(force=req.force))
+
+
+@app.post('/api/update/install')
+def update_install():
+    def work():
+        def idle():
+            return not (engine.running or engine.stopping or engine.control_busy or engine._manual_order_active)
+        result = updates.install(idle, app.state.request_exit)
+        storage.audit('info', f"Installing CryptoPilot {result['version']}. The app will close and reopen.")
+        return result
+    return _update_action(work)

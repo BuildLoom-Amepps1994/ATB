@@ -39,7 +39,7 @@ def main():
     (data/'settings.json').write_text(json.dumps({'exchange':'mexc','scan_seconds':240}))
     (data/'sentinel.txt').write_bytes(b'keep test portfolio data')
     env = dict(os.environ,CRYPTOPILOT_DATA_DIR=str(data),CRYPTOPILOT_NO_BROWSER='1',
-               CRYPTOPILOT_PORT='18767',PYTHON_KEYRING_BACKEND='keyring.backends.null.Keyring')
+               CRYPTOPILOT_PORT='18767',CRYPTOPILOT_NO_UPDATE_CHECK='1',PYTHON_KEYRING_BACKEND='keyring.backends.null.Keyring')
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     base = 'http://127.0.0.1:18767'
     creation = subprocess.CREATE_NO_WINDOW
@@ -149,6 +149,20 @@ def main():
             assert exc.code==404
     finally:
         stop(child)
+    # In-app update path: Setup starts while the app runs and waits for it to exit.
+    child = start()
+    waiting = subprocess.Popen([str(setup),'/TESTINSTALL=1','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
+                                '/NOICONS','/TASKS=','/WAITLOCK=90',f'/DIR={installation}',
+                                f'/LOG={scratch}/waiting-setup.log'],env=env,creationflags=creation)
+    try:
+        time.sleep(3)
+        assert waiting.poll() is None, 'Setup did not wait for the running app'
+    finally:
+        stop(child)
+    assert waiting.wait(timeout=180)==0, f'Waiting Setup failed; {scratch}/waiting-setup.log'
+    assert_data()
+    child = start()
+    stop(child)
     uninstaller = next(installation.glob('unins*.exe'))
     result = run([uninstaller,'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',f'/LOG={scratch}/uninstall.log'])
     assert result.returncode==0,result.stdout+result.stderr
@@ -164,7 +178,8 @@ def main():
                        'direct installed Python edit applied on restart','running app blocks source update and Setup',
                        'local edits require explicit replacement','source update applies without executable change',
                        'backup contains prior edits','Setup upgrade preserves prior source backup',
-                       'portfolio/settings survive update and upgrade','uninstall preserves source/backups/data'],
+                       'portfolio/settings survive update and upgrade',
+                       'Setup started by the in-app updater waits for the app to exit','uninstall preserves source/backups/data'],
               'live_orders':0,'exchange_requests':0,'credential_backend':'disabled'}
     (scratch/'result.json').write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result,indent=2))

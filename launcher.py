@@ -158,7 +158,9 @@ def main() -> int:
             # a local client must not rewrite the peer address it is judged by.
             config = uvicorn.Config(app, host='127.0.0.1', port=port, log_level='warning',
                                     access_log=False, proxy_headers=False)
-            uvicorn.Server(config).run(sockets=[listener])
+            server = uvicorn.Server(config)
+            app.state.request_exit = lambda: setattr(server, 'should_exit', True)
+            server.run(sockets=[listener])
         return 0
     except (AlreadyRunning, ValueError) as exc:
         print(str(exc))

@@ -99,7 +99,17 @@
       + '<p>Fixed rules · chronological 70/30 split · each period starts with simulated cash. These checks do not establish an independent profitable edge.</p>'
       + [...new Set(notes)].map(note => `<p>${escapeHtml(note)}</p>`).join('');
   }
-  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml};
+  // What the update banner says, given /api/update. null hides the banner.
+  function updateSummary(status) {
+    if (!status || status.disabled) return null;
+    const latest = String(status.latest_version || ''), current = String(status.current_version || '');
+    if (status.phase === 'downloading') return {text: `Downloading and verifying CryptoPilot ${latest}…`, install: false};
+    if (status.phase === 'installing') return {text: `Installing CryptoPilot ${latest}. This window will stop responding; CryptoPilot reopens in a new tab when Setup finishes.`, install: false};
+    if (!status.available) return null;
+    if (status.can_install) return {text: `CryptoPilot ${latest} is available (you have ${current}). Stop the bot, then install: the app closes, updates and reopens. Portfolio, settings and saved keys are kept.`, install: true};
+    return {text: `CryptoPilot ${latest} is available (you have ${current}). Download the installer from the releases page.`, install: false};
+  }
+  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CryptoPilotUI = api;
 })(typeof window === 'undefined' ? globalThis : window);

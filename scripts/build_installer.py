@@ -6,6 +6,7 @@ executes a compiler implicitly. All subprocess arguments are passed without a sh
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -19,18 +20,29 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_APP = {
     'app.py', 'launcher.py', 'trader.py', 'strategy.py', 'storage.py',
-    'credentials.py', 'market_data.py', 'recovery.py', 'requirements-lock.txt',
+    'credentials.py', 'market_data.py', 'recovery.py', 'updater.py', 'requirements-lock.txt',
     'static/index.html', 'static/dashboard.js', 'static/dashboard-core.js',
 }
+
+
+def app_version(source: Path = ROOT) -> str:
+    """Read updater.APP_VERSION without importing application code."""
+    tree = ast.parse((source / 'updater.py').read_text(encoding='utf-8'))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, 'id', None) == 'APP_VERSION' for t in node.targets):
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                return node.value.value
+    raise ValueError('updater.py does not define APP_VERSION.')
 
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def assemble_stage(runtime: Path, stage: Path, version: str = '1.3.0', source: Path = ROOT) -> Path:
+def assemble_stage(runtime: Path, stage: Path, version: str | None = None, source: Path = ROOT) -> Path:
     """Create a new source-only app payload beside an existing runtime bundle."""
     runtime, stage, source = runtime.resolve(), stage.resolve(), source.resolve()
+    version = version or app_version(source)
     if stage.exists():
         raise ValueError('Use a new staging folder; existing builds are never overwritten.')
     safe_tree(runtime)
@@ -154,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.runtime_dir is not None:
-            assemble_stage(args.runtime_dir,args.stage,args.version or '1.3.0')
+            assemble_stage(args.runtime_dir,args.stage,args.version)
         result = compile_installer(args.stage, args.output, find_iscc(args.iscc), args.version)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f'Installer build failed: {exc}\n')

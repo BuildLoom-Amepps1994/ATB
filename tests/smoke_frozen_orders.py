@@ -39,14 +39,14 @@ class FakeExchange:
         return [[end-(limit-i)*step,100,101,99,100,10000] for i in range(limit)]
     def cost_to_precision(self,s,cost): return str(round(cost,2))
     def amount_to_precision(self,s,qty): return str(round(qty,9))
-    def create_market_buy_order_with_cost(self,s,cost):
+    def create_market_buy_order_with_cost(self,s,cost,params=None):
         assert cost*1.001<=self.balance['USDT']+.00001
         self.balance['USDT']-=cost*1.001
         qty=cost/100
         self.balance['BTC']+=qty
         self.orders.append('BUY')
         return {'id':str(len(self.orders)),'status':'closed','filled':qty,'cost':cost,'average':100,'fee':{'currency':'USDT','cost':cost*.001}}
-    def create_order(self,s,kind,side,qty):
+    def create_order(self,s,kind,side,qty,price=None,params=None):
         assert kind=='market' and side=='sell' and qty<=self.balance['BTC']+1e-12
         self.balance['BTC']-=qty
         self.balance['USDT']+=qty*100*.999
@@ -67,7 +67,7 @@ def main():
     installed.mkdir();data.mkdir()
     shutil.copytree(args.runtime,installed/'runtime')
     app=installed/'app';app.mkdir()
-    for name in ('app.py','trader.py','strategy.py','storage.py','credentials.py','market_data.py','launcher.py','recovery.py','requirements-lock.txt'):
+    for name in ('app.py','trader.py','strategy.py','storage.py','credentials.py','market_data.py','launcher.py','recovery.py','updater.py','requirements-lock.txt'):
         shutil.copy2(root/name,app/name)
     shutil.copytree(root/'static',app/'static')
     shutil.copytree(root/'maintenance',installed/'maintenance',ignore=shutil.ignore_patterns('__pycache__','*.pyc'))

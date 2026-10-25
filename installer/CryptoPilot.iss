@@ -6,7 +6,7 @@
   #define OutputDir "..\dist\installer"
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.3.0"
+  #define AppVersion "1.4.0"
 #endif
 
 [Setup]
@@ -90,6 +90,19 @@ function TestInstall: Boolean;
 begin
   { This switch tests the final installer without modifying real shortcuts or registration. }
   Result := ExpandConstant('{param:TESTINSTALL|0}') = '1';
+end;
+
+function WaitLockSeconds: Integer;
+begin
+  { The in-app updater starts Setup, then exits; Setup waits for it to release the lock. }
+  Result := StrToIntDef(ExpandConstant('{param:WAITLOCK|0}'), 0);
+  if Result < 0 then Result := 0;
+  if Result > 600 then Result := 600;
+end;
+
+function RelaunchAfterSetup: Boolean;
+begin
+  Result := (ExpandConstant('{param:RELAUNCH|0}') = '1') and not TestInstall;
 end;
 
 function GetStageRoot(Param: String): String;
@@ -226,7 +239,7 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  Suffix: Integer;
+  Suffix, Waited: Integer;
 begin
   Result := DestinationError;
   if Result <> '' then exit;
@@ -234,7 +247,14 @@ begin
     Result := 'The installation folder contains a symbolic link or junction. Choose a regular local folder.';
     exit;
   end;
-  if not AcquireInstallLock then begin
+  Waited := 0;
+  while (not AcquireInstallLock) and (Waited < WaitLockSeconds * 2) do begin
+    Sleep(500);
+    Waited := Waited + 1;
+  end;
+  { Give the exiting runtime a moment to unmap its executable before files are replaced. }
+  if HasInstallLock and (Waited > 0) then Sleep(3000);
+  if not HasInstallLock then begin
     Result := 'CryptoPilot or an update is running. Stop trading, close its console, and try again. Setup will not stop it for you.';
     exit;
   end;
@@ -321,8 +341,20 @@ begin
 end;
 
 procedure DeinitializeSetup;
+var
+  Runtime: String;
+  ExitCode: Integer;
 begin
   ReleaseInstallLock;
+  { Reopen CryptoPilot after an in-app update, whether or not Setup succeeded. It never starts trading. }
+  if RelaunchAfterSetup then
+    try
+      Runtime := ExpandConstant('{app}\runtime\CryptoPilotRuntime.exe');
+      if FileExists(Runtime) then
+        Exec(Runtime, '--app-dir "' + ExpandConstant('{app}\app') + '"', ExpandConstant('{app}'),
+          SW_SHOWNORMAL, ewNoWait, ExitCode);
+    except
+    end;
 end;
 
 function InitializeUninstall: Boolean;

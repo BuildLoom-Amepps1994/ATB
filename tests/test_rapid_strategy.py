@@ -15,7 +15,7 @@ def test_minute_timeframes_exclude_forming_candle():
 
 def test_rapid_signal_accepts_lower_volatility_but_keeps_strict_breakout():
     row = pd.Series(dict(close=100.,volume=1000,ema20=99.99,ema50=99.9,rsi=60.,
-                         atr=.05,vol_avg20=1000,prior_high20=100.005))
+                         atr=.05,vol_avg20=1000,prior_high20=100.005,efficiency=.5))
     assert strategy.entry_signal(row,rapid=True)[0]
     assert not strategy.entry_signal(row)[0]
     row['prior_high20']=100.2
@@ -24,7 +24,7 @@ def test_rapid_signal_accepts_lower_volatility_but_keeps_strict_breakout():
 
 def test_rapid_requires_confirmation_and_limits_overbought():
     row = pd.Series(dict(close=100.,volume=1000,ema20=99.99,ema50=99.9,rsi=60.,
-                         atr=.05,vol_avg20=1000,prior_high20=100.005))
+                         atr=.05,vol_avg20=1000,prior_high20=100.005,efficiency=.5))
     assert not strategy.entry_signal(row,regime_ok=False,rapid=True)[0]
     row['rsi']=75
     assert not strategy.entry_signal(row,rapid=True)[0]

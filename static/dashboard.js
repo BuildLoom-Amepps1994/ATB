@@ -65,13 +65,13 @@ async function action(name, path, data, message, configRefresh = false) {
   }
 }
 function readSettings() {
-  return {exchange: $('exchange').value, watchlist: $('symbols').value.split(/[\s,;]+/).map(x => x.trim().toUpperCase()).filter(Boolean), auto_discovery: $('autoDiscovery').checked, time_horizon: $('timeHorizon').value, scan_seconds: +$('scanSeconds').value, protective_poll_seconds: +$('protectiveSeconds').value, risk_pct: +$('riskPct').value, max_position_pct: +$('maxPositionPct').value, max_exposure_pct: +$('maxExposurePct').value, max_portfolio_risk_pct: +$('maxPortfolioRisk').value, data_max_age_seconds: +$('dataMaxAge').value, max_positions: +$('maxPositions').value, max_meme_position_pct: +$('maxMemePosition').value, max_meme_exposure_pct: +$('maxMemeExposure').value, daily_loss_limit_pct: +$('dailyLossPct').value, min_quote_volume: +$('minVolume').value};
+  return {exchange: $('exchange').value, watchlist: $('symbols').value.split(/[\s,;]+/).map(x => x.trim().toUpperCase()).filter(Boolean), auto_discovery: $('autoDiscovery').checked, market_filters: $('marketFilters').checked, time_horizon: $('timeHorizon').value, scan_seconds: +$('scanSeconds').value, protective_poll_seconds: +$('protectiveSeconds').value, risk_pct: +$('riskPct').value, max_position_pct: +$('maxPositionPct').value, max_exposure_pct: +$('maxExposurePct').value, max_portfolio_risk_pct: +$('maxPortfolioRisk').value, data_max_age_seconds: +$('dataMaxAge').value, max_positions: +$('maxPositions').value, max_meme_position_pct: +$('maxMemePosition').value, max_meme_exposure_pct: +$('maxMemeExposure').value, daily_loss_limit_pct: +$('dailyLossPct').value, min_quote_volume: +$('minVolume').value};
 }
 function syncExchangeGuide() { $('apiGuide').href = $('exchange').value === 'mexc' ? 'https://www.mexc.com/user/openapi' : 'https://www.kraken.com/u/security/api'; }
 function fillSettings(c) {
   const fields = {exchange: 'exchange', time_horizon: 'timeHorizon', scan_seconds: 'scanSeconds', protective_poll_seconds: 'protectiveSeconds', risk_pct: 'riskPct', max_position_pct: 'maxPositionPct', max_exposure_pct: 'maxExposurePct', max_portfolio_risk_pct: 'maxPortfolioRisk', data_max_age_seconds: 'dataMaxAge', max_positions: 'maxPositions', max_meme_position_pct: 'maxMemePosition', max_meme_exposure_pct: 'maxMemeExposure', daily_loss_limit_pct: 'dailyLossPct', min_quote_volume: 'minVolume'};
   for (const [key, id] of Object.entries(fields)) $(id).value = c[key];
-  $('symbols').value = c.watchlist.join(', '); $('autoDiscovery').checked = c.auto_discovery; syncExchangeGuide();
+  $('symbols').value = c.watchlist.join(', '); $('autoDiscovery').checked = c.auto_discovery; $('marketFilters').checked = c.market_filters !== false; syncExchangeGuide();
 }
 function render(s) {
   $('settingsRecovery').hidden = !s.settings_health?.review_required;

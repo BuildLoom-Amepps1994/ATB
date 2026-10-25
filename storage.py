@@ -32,6 +32,7 @@ DEFAULTS = {
     'daily_loss_limit_pct': 3.0, 'fee_pct': 0.1, 'slippage_pct': 0.2,
     'paper_start_usdt': 10000.0, 'max_portfolio_risk_pct': 3.0,
     'data_max_age_seconds': 120, 'protective_poll_seconds': 5,
+    'market_filters': True,
 }
 BOUNDS = {
     'discovered_pairs': (0, 12), 'min_quote_volume': (1000000, 1000000000),
@@ -44,6 +45,9 @@ BOUNDS = {
     'max_portfolio_risk_pct': (0.5, 8), 'data_max_age_seconds': (30, 600),
     'protective_poll_seconds': (2, 60),
 }
+# Fields added after 1.3.0 whose default is the stricter choice. A saved
+# profile from before they existed adopts the default without a review latch.
+LATER_FIELDS = {'market_filters'}
 INTEGER_FIELDS = {'discovered_pairs', 'scan_seconds', 'max_positions', 'data_max_age_seconds', 'protective_poll_seconds'}
 
 
@@ -78,6 +82,8 @@ def validate_settings(data: dict, base: dict | None = None, allow_paper_start: b
             cfg[key] = int(value)
     if not isinstance(cfg['auto_discovery'], bool):
         raise ConfigValidationError('auto_discovery must be boolean.')
+    if not isinstance(cfg['market_filters'], bool):
+        raise ConfigValidationError('market_filters must be boolean.')
     if cfg['time_horizon'] not in ('rapid', 'balanced', 'swing', 'position'):
         raise ConfigValidationError('Invalid strategy horizon.')
     if cfg['max_position_pct'] > cfg['max_exposure_pct']:
@@ -137,7 +143,7 @@ def _read_settings_file(path: Path, *, require_complete: bool = False):
     try:
         if not isinstance(saved, dict):
             raise ConfigValidationError('Invalid saved settings.')
-        if require_complete and set(DEFAULTS) - set(saved):
+        if require_complete and set(DEFAULTS) - LATER_FIELDS - set(saved):
             raise ConfigValidationError('Previously validated settings are incomplete.')
         safe = validate_settings({k: v for k, v in saved.items() if k in DEFAULTS}, allow_paper_start=True)
         return safe, None, raw, exchange

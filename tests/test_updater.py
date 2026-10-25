@@ -11,7 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import updater  # noqa: E402
-from test_web_with_mock_exchange import webapp  # noqa: E402,F401
+from test_web_with_mock_exchange import webapp  # noqa: E402,F401,F811
 
 PAYLOAD = b'MZ fake installer bytes' * 100
 DIGEST = hashlib.sha256(PAYLOAD).hexdigest()
@@ -27,6 +27,12 @@ def release(version='9.9.9', digest=DIGEST, checksum=True, size=None, **extra):
         assets.append({'name': name + '.sha256', 'browser_download_url': prefix + name + '.sha256', 'size': 90})
     return {'tag_name': tag, 'draft': False, 'prerelease': False, 'assets': assets, 'body': 'Notes',
             'html_url': updater.RELEASES_PAGE + '/tag/' + tag, **extra}
+
+
+@pytest.fixture(autouse=True)
+def update_checks_enabled(monkeypatch):
+    # CI disables real update checks for the whole job; these tests use a fake server.
+    monkeypatch.delenv('CRYPTOPILOT_NO_UPDATE_CHECK', raising=False)
 
 
 class FakeServer:

@@ -97,7 +97,7 @@ jobs:
           setup.with_name(setup.name + '.sha256').write_text(f'{digest}  {setup.name}\n', encoding='ascii')
           print(digest, setup.name)
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: CryptoPilot-Setup-${{ steps.version.outputs.version }}
           path: |
@@ -107,7 +107,7 @@ jobs:
 
       - name: Keep smoke-test logs on failure
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: smoke-logs
           path: |

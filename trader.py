@@ -13,6 +13,8 @@ from typing import Any
 import ccxt
 
 import credentials
+import observability
+import risk
 import storage
 from market_data import MarketData
 from strategy import entry_price_ok, entry_signal, regime_signal, research_report, setup_quality, stop_fraction
@@ -81,7 +83,15 @@ class TradingEngine:
         self.discovered: list[str] = []
         self.risk_block = None
         self.live_halted = self._durable_live_block()
+        self.risk = risk.RiskGate(self)
+        self.metrics = observability.METRICS
+        self._last_authorization: risk.Authorization | None = None
+        # A simulated order has no exchange-side effect; a crash mid-paper-order
+        # leaves nothing to reconcile, so its intent is closed at startup.
+        storage.abandon_stale_paper_intents(self.exchange_name)
         self._restore_from_keyring()
+        observability.event('engine.start', mode=self.mode, exchange=self.exchange_name,
+                            live_halted=self.live_halted, kill_switch=self.risk.kill_switch()['engaged'])
 
     @staticmethod
     def _new_exchange(name: str, key: str = '', secret: str = ''):
@@ -636,6 +646,8 @@ class TradingEngine:
         if loss >= self.cfg['daily_loss_limit_pct']:
             storage.set_meta(breach_key, '1')
         allowed = storage.get_meta(breach_key) != '1'
+        # The same fresh valuation feeds the durable peak/drawdown stop.
+        self.risk.observe_equity(mode, equity)
         if not allowed:
             with self.lock:
                 self.risk_block = 'Daily loss limit reached; entries blocked until the next UTC day'
@@ -646,6 +658,8 @@ class TradingEngine:
             self.live_halted = True
             self.risk_block = self.last_error = description
             self.stop_event.set()
+        self.risk.record_failure('uncertain')
+        observability.event('execution.halt', level='error', description=description)
         # Persist independently of an order journal so an intent/ledger failure
         # cannot be bypassed by restarting the process.
         try:
@@ -665,6 +679,8 @@ class TradingEngine:
             with self.lock:
                 self.risk_block = self.last_error = description
                 self.stop_event.set()
+            self.risk.record_failure('ledger')
+            observability.event('ledger.failure', level='error', description=description)
 
     CONFIRM_DELAYS = (.25, .5, 1., 2., 3.)
 
@@ -725,15 +741,28 @@ class TradingEngine:
             return order
         return {**order, 'fees': fees}
 
-    def _submit(self, client, symbol: str, side: str, *, quantity=None, cost=None):
-        """Durable intent precedes exactly one submission; reads alone may repeat."""
+    def _submit(self, client, symbol: str, side: str, *, quantity=None, cost=None,
+                authorization: risk.Authorization | None = None, intended_price: float | None = None,
+                decision_id: str | None = None):
+        """Durable intent precedes exactly one submission; reads alone may repeat.
+
+        Nothing reaches the exchange without a fresh risk authorization issued
+        for this symbol and side; a caller that skips the gate is refused and
+        audited rather than trusted.
+        """
         intent = None
         create_returned = False
+        if authorization is None or not authorization.valid_for(symbol, side):
+            self.metrics.incr('risk.unauthorized_submit')
+            storage.audit('error', f'{side} {symbol} refused: no valid risk authorization for this order.')
+            observability.event('risk.unauthorized_submit', level='error', symbol=symbol, side=side)
+            return None, None
         try:
             if not self._orders_allowed():
                 return None, None
             intent = storage.create_order_intent(self.exchange_name, symbol, side,
-                                                  quantity=quantity, cost=cost)
+                                                  quantity=quantity, cost=cost, mode='live',
+                                                  intended_price=intended_price, decision_id=decision_id)
             # Kraken charges fees in the base asset by default, which the ledger
             # cannot value; fciq requests the quote (USDT) for both sides.
             params = {'oflags': 'fciq'} if self.exchange_name == 'kraken' else {}
@@ -748,7 +777,11 @@ class TradingEngine:
                 create_returned = True
             storage.update_order_intent(intent, 'submitted', order_id=self._order_id(order))
             order = self._confirm_filled(client, symbol, order)
-            storage.update_order_intent(intent, 'filled', order_id=self._order_id(order))
+            filled_quantity = finite_positive(order.get('filled'))
+            filled_cost = finite_positive(order.get('cost'))
+            filled_price = finite_positive(order.get('average')) or (filled_cost / filled_quantity if filled_quantity and filled_cost else None)
+            storage.update_order_intent(intent, 'filled', order_id=self._order_id(order),
+                                        filled_price=filled_price, filled_quantity=filled_quantity or None)
             try:
                 order = self._resolve_fees(client, symbol, order)
             except Exception:
@@ -762,10 +795,13 @@ class TradingEngine:
                              if isinstance(cls := getattr(ccxt, name, None), type))
             if intent and not create_returned and rejected and isinstance(exc, rejected):
                 try:
-                    storage.update_order_intent(intent, 'rejected')
+                    storage.update_order_intent(intent, 'rejected', note=type(exc).__name__)
                     with self.lock:
                         self.risk_block = f'{side} {symbol} rejected by the exchange: {type(exc).__name__}'
                     storage.audit('warning', self.risk_block)
+                    self.risk.record_failure('rejected')
+                    observability.event('execution.rejected', level='warning', symbol=symbol, side=side,
+                                        error=type(exc).__name__, intent_id=intent)
                     return None, None
                 except Exception:
                     pass
@@ -838,9 +874,42 @@ class TradingEngine:
         db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)',
                    (completion['scope'], json.dumps(record, allow_nan=False)))
 
+    def _authorize(self, symbol: str, side: str, kind: str, notional: float, price: float, *,
+                   positions: list[dict], cash: float | None, quantity: float | None = None,
+                   stop_fraction: float | None = None, signal_close: float | None = None,
+                   atr: float | None = None, spread: float | None = None, reason: str = '',
+                   decision_id: str | None = None) -> risk.Authorization:
+        """Build the request for the risk gate from the engine's current marks.
+
+        Every production caller observes a ticker immediately before pricing
+        an order, so a quote that has since gone stale is blocked. A caller
+        that priced the order itself without any observation (tests,
+        benchmarks) is judged on the price it supplied.
+        """
+        with self.lock:
+            observed = symbol in self.last_price_times
+            mode = self.mode
+        equity = self._equity(mode, cash, positions) if cash is not None else None
+        request = risk.OrderRequest(exchange=self.exchange_name, mode=mode, symbol=symbol, side=side, kind=kind,
+                                    notional=float(notional), price=float(price), quantity=quantity,
+                                    signal_close=signal_close, atr=atr, stop_fraction=stop_fraction,
+                                    quote_age_seconds=self._price_age(symbol), spread_pct=spread,
+                                    reason=reason, decision_id=decision_id)
+        with self.metrics.timer('risk.authorize_ms'):
+            authorization = self.risk.authorize(request, positions=positions, cash=cash, equity=equity,
+                                                marks_fresh=self._marks_fresh(positions),
+                                                symbol_fresh=self._fresh(symbol) if observed else bool(finite_positive(price)))
+        if not authorization.allowed:
+            storage.audit('warning', f'RISK BLOCK {side} {symbol}: {authorization.reason}')
+        with self.lock:
+            self._last_authorization = authorization
+        return authorization
+
     def _buy(self, symbol: str, budget: float, price: float, fraction: float, *,
              reason: str = 'Completed-candle momentum breakout', merge_dust: bool = False,
-             completion=None, entry_candle: int | None = None) -> bool:
+             completion=None, entry_candle: int | None = None, kind: str = 'entry',
+             signal_close: float | None = None, atr: float | None = None,
+             spread: float | None = None, decision_id: str | None = None) -> bool:
         existing = next((p for p in self._active_positions(self.mode) if p['symbol'] == symbol), None)
         if (not all(finite_positive(v) for v in (budget, price, fraction)) or fraction >= 1
                 or (existing and (not merge_dust or not self._is_dust(
@@ -849,7 +918,14 @@ class TradingEngine:
         mode, exchange = self.mode, self.exchange_name
         fee_rate, slip = self.cfg['fee_pct'] / 100, self.cfg['slippage_pct'] / 100
         intent = order_id = None
+        positions = self._active_positions(mode)
+        gate_fields = dict(stop_fraction=fraction, signal_close=signal_close, atr=atr, spread=spread,
+                           reason=reason, decision_id=decision_id)
         if mode == 'paper':
+            authorization = self._authorize(symbol, 'BUY', kind, budget, price, positions=positions,
+                                            cash=self._cash('paper'), **gate_fields)
+            if not authorization.allowed:
+                return False
             fill_price = price * (1 + slip)
             gross = budget / (1 + fee_rate)
             qty, fee, cost = gross / fill_price, gross * fee_rate, budget
@@ -877,9 +953,15 @@ class TradingEngine:
             maximum = finite_positive((limits.get('cost') or {}).get('max'))
             if not finite_positive(spend) or spend > budget or spend < minimum or (maximum and spend > maximum):
                 raise ValueError('Order cost does not meet exchange limits/precision')
-            if float(self._read_balance(client)['free'].get('USDT', 0)) < budget:
+            free_usdt = float(self._read_balance(client)['free'].get('USDT', 0))
+            if free_usdt < budget:
                 raise ValueError('Insufficient free USDT including the fee reserve')
-            intent, order = self._submit(client, symbol, 'BUY', cost=spend)
+            authorization = self._authorize(symbol, 'BUY', kind, budget, price, positions=positions,
+                                            cash=free_usdt, **gate_fields)
+            if not authorization.allowed:
+                return False
+            intent, order = self._submit(client, symbol, 'BUY', cost=spend, authorization=authorization,
+                                         intended_price=price, decision_id=decision_id)
             if order is None:
                 return False
             try:
@@ -947,7 +1029,13 @@ class TradingEngine:
             return False
         fee_rate = self.cfg['fee_pct'] / 100
         intent = order_id = None
+        kind = 'manual_exit' if completion is not None else 'exit'
+        positions = self._active_positions(mode)
         if mode == 'paper':
+            authorization = self._authorize(symbol, 'SELL', kind, tracked * market_price, market_price,
+                                            positions=positions, cash=None, quantity=tracked, reason=reason)
+            if not authorization.allowed:
+                return False
             filled = consumed = tracked
             fill_price = market_price * (1 - self.cfg['slippage_pct'] / 100)
             gross = filled * fill_price
@@ -984,7 +1072,12 @@ class TradingEngine:
                 self.risk_block = f'{symbol} remainder is below an exchange limit; retained in the ledger'
                 storage.audit('warning', self.risk_block)
                 return False
-            intent, order = self._submit(client, symbol, 'SELL', quantity=amount)
+            authorization = self._authorize(symbol, 'SELL', kind, amount * market_price, market_price,
+                                            positions=positions, cash=None, quantity=amount, reason=reason)
+            if not authorization.allowed:
+                return False
+            intent, order = self._submit(client, symbol, 'SELL', quantity=amount, authorization=authorization,
+                                         intended_price=market_price)
             if order is None:
                 return False
             try:
@@ -1378,7 +1471,8 @@ class TradingEngine:
                 completion = {'scope': scope, 'record': record, 'payload': payload, 'request_id': request_id}
                 filled = self._buy(symbol, amount, refreshed, fraction, reason='Explicit manual spot buy',
                                    merge_dust=position is not None, completion=completion,
-                                   entry_candle=int(primary.iloc[-1]['timestamp']))
+                                   entry_candle=int(primary.iloc[-1]['timestamp']), kind='manual_entry',
+                                   spread=spread)
             else:
                 if not self._orders_allowed():
                     raise error('Order preparation was stopped.')
@@ -1389,6 +1483,11 @@ class TradingEngine:
                     raise error('Order outcome requires manual reconciliation. Live trading is halted; do not retry this order.')
                 if self.risk_block and 'rejected by the exchange:' in self.risk_block:
                     raise error(self.risk_block + '. No order was accepted; correct the account or order settings before creating a new request.')
+                with self.lock:
+                    last = self._last_authorization
+                if (last is not None and not last.allowed and last.request.symbol == symbol
+                        and last.request.side == side and time.monotonic() - last.issued_at <= risk.AUTHORIZATION_TTL_SECONDS):
+                    raise error('Blocked by risk controls: ' + last.reason + '. No order was sent.')
                 raise error('The order was not completed. Review risk status, exchange limits and trade history before trying again.')
             completed = json.loads(storage.get_meta(scope))
             if completed.get('status') != 'filled' or completed.get('fingerprint') != fingerprint:
@@ -1478,7 +1577,8 @@ class TradingEngine:
                     with self.lock:
                         self.risk_block = 'Aggregate protective-stop risk cap reached'
                 continue
-            if self._buy(symbol, budget, price, fraction, entry_candle=candle):
+            if self._buy(symbol, budget, price, fraction, entry_candle=candle, kind='entry',
+                         signal_close=signal_close, atr=atr, spread=spread):
                 count += 1
             if self.mode == 'live' and self.live_halted:
                 break
@@ -1609,6 +1709,7 @@ class TradingEngine:
                     'price_age_seconds': {symbol: round(self._price_age(symbol), 1)
                                           for symbol in self.last_price_times},
                     'metrics': dict(self.data.metrics.copy()),
+                    'risk': self.risk.status(),
                     'unresolved_orders': len(unresolved), 'legacy_live_records': storage.legacy_live_records(),
                     'trades': storage.rows('SELECT * FROM trades WHERE exchange=? AND mode=? ORDER BY id DESC LIMIT 70',
                                            (exchange, mode)),

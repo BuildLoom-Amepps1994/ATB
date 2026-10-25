@@ -64,7 +64,7 @@ def test_recovery_report_excludes_secrets_and_preserves_database(recovery_data):
     original_db = storage.DB_PATH.read_bytes()
     original_config = storage.CONFIG_PATH.read_bytes()
     result = recovery.report(recovery_data)
-    assert result['schema_version'] == 2
+    assert result['schema_version'] == 3
     assert result['unresolved_order_count'] == 1
     assert result['unresolved_orders'][0]['intent_id'] == intent
     assert result['unresolved_orders'][0]['status'] == 'uncertain'
@@ -96,7 +96,7 @@ def test_recovery_does_not_create_or_migrate_database(tmp_path):
 
 def test_report_unknown_database_fields_are_not_echoed(recovery_data):
     with storage.connection() as connection:
-        connection.execute("INSERT INTO order_journal VALUES ('sensitive-id','sensitive-time','sensitive-time','sensitive-exchange','sensitive-symbol','sensitive-side',NULL,NULL,'sensitive-status','sensitive-order')")
+        connection.execute("INSERT INTO order_journal(intent_id,created_at,updated_at,exchange,symbol,side,quantity,cost,status,order_id) VALUES ('sensitive-id','sensitive-time','sensitive-time','sensitive-exchange','sensitive-symbol','sensitive-side',NULL,NULL,'sensitive-status','sensitive-order')")
     result = recovery.report(recovery_data)
     assert result['unresolved_order_count'] == 1
     assert 'sensitive-' not in json.dumps(result)
@@ -117,7 +117,7 @@ def test_cli_output_is_new_file_outside_data_folder(recovery_data, tmp_path, cap
     target = recovery_data.parent / (recovery_data.name + '-report.json')
     try:
         assert recovery.main(['--output', str(target)]) == 0
-        assert json.loads(target.read_text())['schema_version'] == 2
+        assert json.loads(target.read_text())['schema_version'] == 3
         capsys.readouterr()
         original = target.read_bytes()
         assert recovery.main(['--output', str(target)]) == 1

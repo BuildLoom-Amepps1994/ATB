@@ -12,6 +12,13 @@ def quote(bid=100, ask=100.01, last=100):
     return {'bid':bid,'ask':ask,'last':last,'timestamp':int(time.time()*1000),'quoteVolume':20000000}
 
 
+def seed_dust(engine, symbol='BTC/USDT'):
+    """Create a tracked remainder below the exchange minimum (orders need 12 USDT)."""
+    assert engine._buy(symbol, 20, 100, .04)
+    with storage.connection() as db:
+        db.execute('UPDATE positions SET qty=qty/20,cost=cost/20 WHERE symbol=?', (symbol,))
+
+
 def test_stale_last_trade_cannot_hide_a_stop_breach_at_the_bid(engine):
     assert engine._buy('BTC/USDT', 200, 100, .04)
     engine.public.fetch_ticker = lambda _: quote(bid=90, ask=91, last=100)
@@ -51,7 +58,7 @@ def test_invalid_quotes_never_fall_back_to_last_trade_and_invalidate_old_marks(e
 
 
 def test_subminimum_owned_dust_does_not_block_other_coins_or_use_a_position_slot(engine):
-    assert engine._buy('BTC/USDT',1,100,.04)
+    seed_dust(engine)
     original = engine._active_positions('paper')[0]
     engine.public.fetch_ticker = lambda symbol: quote(bid=90,ask=90.01) if symbol=='BTC/USDT' else quote()
     engine._observe_ticker('BTC/USDT',engine.public.fetch_ticker('BTC/USDT'))
@@ -73,7 +80,7 @@ def test_subminimum_owned_dust_does_not_block_other_coins_or_use_a_position_slot
 
 
 def test_stale_small_holdings_still_block_new_risk(engine):
-    assert engine._buy('BTC/USDT',1,100,.04)
+    seed_dust(engine)
     engine._observe_ticker('ETH/USDT',quote())
     engine.running = True
     engine._enter_candidates([(100,20000000,'ETH/USDT',100.01,5,123,100)])
@@ -82,7 +89,7 @@ def test_stale_small_holdings_still_block_new_risk(engine):
 
 
 def test_unknown_market_minimum_cannot_turn_a_stopped_position_into_ignored_dust(engine):
-    assert engine._buy('BTC/USDT',1,100,.04)
+    seed_dust(engine)
     engine.public.markets['BTC/USDT']['limits'] = {}
     engine._observe_ticker('BTC/USDT',quote(bid=90,ask=90.01))
     engine._observe_ticker('ETH/USDT',quote())

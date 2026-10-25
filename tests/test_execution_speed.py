@@ -233,7 +233,7 @@ def test_fast_monitor_trails_from_cached_atr_without_candle_download(engine, mon
 
 def test_fast_live_monitor_latches_intraday_loss_even_without_strategy_scan(engine):
     client = arm_fake_live(engine)
-    assert engine._buy('BTC/USDT', 200, 100, .5)
+    assert engine._buy('BTC/USDT', 200, 100, .04)
     engine._daily_allowed('live', 10000)
     client.fetch_balance = lambda *a: {'free': {'USDT': 9500, 'BTC': 1}}
     engine._monitor_if_due(force=True)

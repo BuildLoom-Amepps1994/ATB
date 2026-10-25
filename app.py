@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 import credentials
+import observability
 import storage
 import updater
 from market_data import DataUnavailable
@@ -247,6 +248,33 @@ def manual_order(req: ManualOrder):
 @app.post('/api/reset-paper')
 def reset_paper():
     return ensure_ok(lambda: (engine.reset_paper_portfolio(), {'ok': True})[1])
+
+
+class RiskAction(StrictModel):
+    action: str = Field(pattern='^(engage|release|clear_drawdown_stop)$')
+    confirmation: str = Field(default='', max_length=40)
+    allow_exits: bool = True
+    reason: str = Field(default='', max_length=200)
+
+
+@app.post('/api/risk')
+def risk_action(req: RiskAction):
+    """Kill switch and latch control. Engaging needs no confirmation and works while the bot runs."""
+    def work():
+        if req.action == 'engage':
+            return engine.risk.engage_kill_switch(req.reason or 'Operator kill switch', allow_exits=req.allow_exits)
+        if req.action == 'release':
+            return engine.risk.release_kill_switch(req.confirmation)
+        engine.risk.clear_drawdown_stop(engine.mode, req.confirmation)
+        return engine.risk.status()
+    return ensure_ok(work)
+
+
+@app.get('/api/metrics')
+def metrics():
+    """In-process telemetry: counters, gauges and p50/p95/p99 latencies. Local only."""
+    return ensure_ok(lambda: {'telemetry': observability.METRICS.snapshot(),
+                              'market_data': dict(engine.data.metrics), 'risk': engine.risk.status()})
 
 
 @app.get('/api/history')

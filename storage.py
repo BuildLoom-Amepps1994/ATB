@@ -33,6 +33,10 @@ DEFAULTS = {
     'paper_start_usdt': 10000.0, 'max_portfolio_risk_pct': 3.0,
     'data_max_age_seconds': 120, 'protective_poll_seconds': 5,
     'market_filters': True,
+    # Hard controls enforced by risk.RiskGate on every order path.
+    'max_order_notional_usdt': 1000.0, 'max_asset_notional_usdt': 2500.0,
+    'max_orders_per_minute': 6, 'daily_realized_loss_limit_pct': 3.0,
+    'max_drawdown_pct': 10.0, 'streaming_quotes': False,
 }
 BOUNDS = {
     'discovered_pairs': (0, 12), 'min_quote_volume': (1000000, 1000000000),
@@ -44,11 +48,17 @@ BOUNDS = {
     'slippage_pct': (0, 2.0), 'paper_start_usdt': (100, 100000000),
     'max_portfolio_risk_pct': (0.5, 8), 'data_max_age_seconds': (30, 600),
     'protective_poll_seconds': (2, 60),
+    'max_order_notional_usdt': (12, 10000000), 'max_asset_notional_usdt': (12, 10000000),
+    'max_orders_per_minute': (1, 60), 'daily_realized_loss_limit_pct': (0.5, 20.0),
+    'max_drawdown_pct': (1.0, 50.0),
 }
 # Fields added after 1.3.0 whose default is the stricter choice. A saved
 # profile from before they existed adopts the default without a review latch.
-LATER_FIELDS = {'market_filters'}
-INTEGER_FIELDS = {'discovered_pairs', 'scan_seconds', 'max_positions', 'data_max_age_seconds', 'protective_poll_seconds'}
+LATER_FIELDS = {'market_filters', 'max_order_notional_usdt', 'max_asset_notional_usdt',
+                'max_orders_per_minute', 'daily_realized_loss_limit_pct', 'max_drawdown_pct',
+                'streaming_quotes'}
+INTEGER_FIELDS = {'discovered_pairs', 'scan_seconds', 'max_positions', 'data_max_age_seconds',
+                  'protective_poll_seconds', 'max_orders_per_minute'}
 
 
 class ConfigValidationError(ValueError):
@@ -84,6 +94,10 @@ def validate_settings(data: dict, base: dict | None = None, allow_paper_start: b
         raise ConfigValidationError('auto_discovery must be boolean.')
     if not isinstance(cfg['market_filters'], bool):
         raise ConfigValidationError('market_filters must be boolean.')
+    if not isinstance(cfg['streaming_quotes'], bool):
+        raise ConfigValidationError('streaming_quotes must be boolean.')
+    if cfg['max_order_notional_usdt'] > cfg['max_asset_notional_usdt']:
+        raise ConfigValidationError('The per-order notional cap cannot exceed the per-asset notional cap.')
     if cfg['time_horizon'] not in ('rapid', 'balanced', 'swing', 'position'):
         raise ConfigValidationError('Invalid strategy horizon.')
     if cfg['max_position_pct'] > cfg['max_exposure_pct']:
@@ -378,7 +392,21 @@ def init_db():
             exchange TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
             quantity REAL, cost REAL, status TEXT NOT NULL, order_id TEXT)''')
         db.execute('CREATE INDEX IF NOT EXISTS orders_unresolved ON order_journal(status,exchange)')
-        db.execute('PRAGMA user_version=2')
+        # Order state machine fields (additive; old rows are live orders).
+        journal_columns = {r['name'] for r in db.execute('PRAGMA table_info(order_journal)')}
+        for column, definition in JOURNAL_COLUMNS:
+            if column not in journal_columns:
+                db.execute(f'ALTER TABLE order_journal ADD COLUMN {column} {definition}')
+        db.execute('CREATE INDEX IF NOT EXISTS orders_recent ON order_journal(exchange,mode,created_at)')
+        db.execute('PRAGMA user_version=3')
+
+
+JOURNAL_COLUMNS = (
+    ('mode', "TEXT NOT NULL DEFAULT 'live'"), ('client_order_id', 'TEXT'),
+    ('intended_price', 'REAL'), ('filled_price', 'REAL'), ('filled_quantity', 'REAL'),
+    ('decision_id', 'TEXT'), ('submitted_at', 'TEXT'), ('acked_at', 'TEXT'), ('final_at', 'TEXT'),
+    ('note', 'TEXT'),
+)
 
 
 def get_meta(name: str, default: str = '') -> str:
@@ -428,32 +456,66 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='milliseconds')
 
 
-def create_order_intent(exchange: str, symbol: str, side: str, quantity: float | None = None, cost: float | None = None) -> str:
+def create_order_intent(exchange: str, symbol: str, side: str, quantity: float | None = None, cost: float | None = None, *,
+                        mode: str = 'live', intended_price: float | None = None, decision_id: str | None = None) -> str:
+    """Durable intent; its id doubles as the exchange client order id."""
     scope_key('', exchange)
     if side not in ('BUY', 'SELL'):
         raise ValueError('Invalid order side.')
-    if any(value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0) for value in (quantity, cost)):
-        raise ValueError('Order quantities and costs must be finite and positive.')
+    if mode not in ('paper', 'live'):
+        raise ValueError('Invalid order mode.')
+    if any(value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0) for value in (quantity, cost, intended_price)):
+        raise ValueError('Order quantities, costs and prices must be finite and positive.')
     intent_id, timestamp = uuid.uuid4().hex, _now()
     with connection() as db:
-        db.execute('INSERT INTO order_journal VALUES (?,?,?,?,?,?,?,?,?,?)',
-                   (intent_id, timestamp, timestamp, exchange, symbol, side, quantity, cost, 'pending', None))
+        db.execute('INSERT INTO order_journal(intent_id,created_at,updated_at,exchange,symbol,side,quantity,cost,status,order_id,'
+                   'mode,client_order_id,intended_price,decision_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   (intent_id, timestamp, timestamp, exchange, symbol, side, quantity, cost, 'pending', None,
+                    mode, client_order_id(intent_id), intended_price, decision_id))
     return intent_id
 
 
+def client_order_id(intent_id: str) -> str:
+    """Exchange-visible idempotency key derived from the intent (32 hex chars)."""
+    return str(intent_id)[:32]
+
+
 RESOLVED_ORDER_STATUSES = ('accounted', 'rejected', 'reconciled')
+ORDER_STATUSES = ('pending', 'submitted', 'acked', 'uncertain', 'filled', *RESOLVED_ORDER_STATUSES)
+# Every legal order-journal transition. Resolved states are terminal except
+# that the recovery tool may still mark an exchange's rows reconciled.
+ORDER_TRANSITIONS = {
+    'pending': {'submitted', 'rejected', 'uncertain'},
+    'submitted': {'acked', 'filled', 'rejected', 'uncertain'},
+    'acked': {'filled', 'uncertain', 'rejected'},
+    'filled': {'accounted', 'uncertain'},
+    'uncertain': {'reconciled', 'filled', 'accounted'},
+    'accounted': set(), 'rejected': set(), 'reconciled': set(),
+}
+_JOURNAL_FIELDS = {'filled_price', 'filled_quantity', 'submitted_at', 'acked_at', 'final_at', 'note'}
 
 
-def update_order_intent(intent_id: str, status: str, order_id: str | None = None, db=None) -> None:
+def update_order_intent(intent_id: str, status: str, order_id: str | None = None, db=None, **fields) -> None:
     # 'reconciled' is only ever written by the offline recovery tool after a
     # person has compared the journal with the exchange's own order history.
-    if status not in ('pending', 'submitted', 'uncertain', 'filled', *RESOLVED_ORDER_STATUSES):
+    if status not in ORDER_STATUSES:
         raise ValueError('Invalid order journal status.')
+    if set(fields) - _JOURNAL_FIELDS:
+        raise ValueError('Unknown order journal field.')
+    stamps = {'submitted': 'submitted_at', 'acked': 'acked_at', 'filled': 'final_at', 'rejected': 'final_at',
+              'uncertain': 'final_at'}
+    if status in stamps and stamps[status] not in fields:
+        fields[stamps[status]] = _now()
+    extra_sql = ''.join(f',{name}=?' for name in fields)
+
     def update(connection):
-        cursor = connection.execute('UPDATE order_journal SET status=?,updated_at=?,order_id=COALESCE(?,order_id) WHERE intent_id=?',
-                                    (status, _now(), order_id, intent_id))
-        if cursor.rowcount != 1:
+        current = connection.execute('SELECT status FROM order_journal WHERE intent_id=?', (intent_id,)).fetchone()
+        if current is None:
             raise ValueError('Order intent does not exist.')
+        if status != current['status'] and status not in ORDER_TRANSITIONS[current['status']]:
+            raise ValueError(f'Illegal order state transition {current["status"]} -> {status}.')
+        connection.execute(f'UPDATE order_journal SET status=?,updated_at=?,order_id=COALESCE(?,order_id){extra_sql} WHERE intent_id=?',
+                           (status, _now(), order_id, *fields.values(), intent_id))
     if db is not None:
         update(db)
     else:
@@ -461,9 +523,28 @@ def update_order_intent(intent_id: str, status: str, order_id: str | None = None
             update(con)
 
 
+def order_intent(intent_id: str) -> dict | None:
+    found = rows('SELECT * FROM order_journal WHERE intent_id=?', (intent_id,))
+    return found[0] if found else None
+
+
 def unresolved_orders(exchange: str | None = None) -> list[dict]:
-    sql = "SELECT * FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled')"
+    """Live intents without a final accounted/rejected/reconciled state.
+
+    Paper intents never block live activation: a simulated order has no
+    exchange-side effect to reconcile.
+    """
+    sql = "SELECT * FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled') AND mode='live'"
     return rows(sql + (' AND exchange=?' if exchange else '') + ' ORDER BY created_at', (exchange,) if exchange else ())
+
+
+def abandon_stale_paper_intents(exchange: str) -> int:
+    """A paper intent left open by a crash is rejected at startup (no side effects)."""
+    with connection() as db:
+        cursor = db.execute("UPDATE order_journal SET status='rejected',updated_at=?,final_at=?,note='abandoned at startup' "
+                            "WHERE exchange=? AND mode='paper' AND status NOT IN ('accounted','rejected','reconciled')",
+                            (_now(), _now(), exchange))
+        return cursor.rowcount
 
 
 def legacy_live_records() -> int:
@@ -477,4 +558,5 @@ def reset_paper(exchange: str):
         db.execute("DELETE FROM positions WHERE mode='paper' AND exchange=?", (exchange,))
         db.execute("DELETE FROM trades WHERE mode='paper' AND exchange=?", (exchange,))
         db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (scope_key('paper_cash', exchange), str(paper_start)))
-        db.execute("DELETE FROM meta WHERE (key LIKE 'last_entry.paper.%' OR key LIKE 'last_exit.paper.%' OR key LIKE 'manual_request.paper.%' OR key LIKE 'baseline.paper.%' OR key LIKE 'breached.paper.%') AND key LIKE ?", ('%.' + exchange,))
+        db.execute("DELETE FROM meta WHERE (key LIKE 'last_entry.paper.%' OR key LIKE 'last_exit.paper.%' OR key LIKE 'manual_request.paper.%' OR key LIKE 'baseline.paper.%' OR key LIKE 'breached.paper.%' OR key LIKE 'peak_equity.paper.%' OR key LIKE 'drawdown_stop.paper.%') AND key LIKE ?", ('%.' + exchange,))
+        db.execute("DELETE FROM order_journal WHERE mode='paper' AND exchange=?", (exchange,))

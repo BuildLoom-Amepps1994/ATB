@@ -14,6 +14,8 @@ import ccxt
 
 import credentials
 import observability
+import orders
+import paper_exchange
 import risk
 import storage
 from market_data import MarketData
@@ -86,6 +88,8 @@ class TradingEngine:
         self.risk = risk.RiskGate(self)
         self.metrics = observability.METRICS
         self._last_authorization: risk.Authorization | None = None
+        self.paper = self._new_paper_exchange()
+        self.unresolved_probe: list[dict] = []
         # A simulated order has no exchange-side effect; a crash mid-paper-order
         # leaves nothing to reconcile, so its intent is closed at startup.
         storage.abandon_stale_paper_intents(self.exchange_name)
@@ -116,6 +120,28 @@ class TradingEngine:
         if isinstance(rate_limit, bool) or not isinstance(rate_limit, (int, float)) or not 0 < rate_limit <= 100:
             return 1
         return 4
+
+    def _new_paper_exchange(self):
+        """Simulated counterparty sharing the live submit/confirm/ledger path."""
+        return paper_exchange.PaperExchange(self.exchange_name, catalogue=self._catalogue,
+                                            settings=lambda: self.cfg, balances=self._paper_balances)
+
+    def _paper_balances(self) -> dict:
+        free = {'USDT': self._cash('paper')}
+        for position in self._active_positions('paper'):
+            base = position['symbol'].split('/')[0]
+            free[base] = free.get(base, 0.0) + float(position['qty'])
+        return free
+
+    def _may_execute(self) -> bool:
+        """Live orders need a running worker or an active manual ticket.
+
+        A simulated order from an idle engine has no counterparty, but a Stop
+        requested during activity ends paper orders too.
+        """
+        if self.mode == 'live':
+            return self._orders_allowed()
+        return not (self.stop_event.is_set() and (self.running or self._manual_order_active))
 
     def _key(self, name: str) -> str:
         return storage.scope_key(name, self.exchange_name)
@@ -234,9 +260,60 @@ class TradingEngine:
                 if saved and saved[0] != key:
                     storage.audit('warning', 'Different saved credentials remain in the operating-system credential manager and reload after a restart. Disconnect to remove them.')
             storage.audit('info', f'{self.exchange_name.upper()} spot account connected. Live trading still requires explicit opt-in.')
+            # Read-only: tell the operator what the exchange knows about any
+            # unresolved intent. Clearing a halt remains a confirmed manual step.
+            try:
+                self.probe_unresolved(client)
+            except Exception as exc:
+                storage.audit('warning', f'Unresolved-order probe unavailable: {type(exc).__name__}.')
         finally:
             with self.lock:
                 self.control_busy = False
+
+    def probe_unresolved(self, client=None) -> list[dict]:
+        """Ask the exchange, read-only, about each unresolved live intent.
+
+        Findings are audited and returned for the dashboard. The journal is
+        never changed here: reconciliation stays with the confirmed offline
+        procedure in recovery.py, so no outcome is ever guessed.
+        """
+        findings = []
+        pending = storage.unresolved_orders(self.exchange_name)
+        if not pending:
+            with self.lock:
+                self.unresolved_probe = []
+            return findings
+        client = client or self._ensure_private()
+        for intent in pending:
+            finding = {'intent_id': intent['intent_id'], 'symbol': intent['symbol'], 'side': intent['side'],
+                       'journal_status': intent['status'], 'exchange_status': None, 'filled': None, 'order_id': None}
+            try:
+                client_id = intent.get('client_order_id')
+                with self.private_lock:
+                    if intent.get('order_id'):
+                        found = client.fetch_order(intent['order_id'], intent['symbol'])
+                    elif client_id:
+                        found = orders.locate(client, intent['symbol'], client_id, since_ms=0)
+                    else:
+                        found = None
+                        finding['exchange_status'] = 'no client order id recorded (pre-upgrade intent)'
+                if isinstance(found, dict):
+                    summary = orders.fill_summary(found)
+                    finding.update({'exchange_status': found.get('status') or 'unknown', 'filled': summary['filled'],
+                                    'order_id': self._order_id(found)})
+                elif finding['exchange_status'] is None:
+                    finding['exchange_status'] = 'not found in open or recent orders'
+            except Exception as exc:
+                finding['exchange_status'] = f'lookup failed: {type(exc).__name__}'
+            findings.append(finding)
+            storage.audit('warning', f"Unresolved {intent['side']} {intent['symbol']} intent {intent['intent_id'][:8]}: "
+                                     f"exchange reports {finding['exchange_status']}"
+                                     + (f", filled {finding['filled']}" if finding['filled'] else '')
+                                     + '. Confirm against the exchange order history, then clear the halt with recovery.py.')
+        observability.event('execution.probe', findings=findings)
+        with self.lock:
+            self.unresolved_probe = findings
+        return findings
 
     def disconnect(self):
         with self.lock:
@@ -316,6 +393,7 @@ class TradingEngine:
             if changed_exchange:
                 self.exchange_name = revised['exchange']
                 self.public, self.data = candidate_public, candidate_data
+                self.paper = self._new_paper_exchange()
                 self.private = self.api_key = self.api_secret = None
                 self.credential_source = 'none'
                 self.latest_balance = self.balance_updated_at = None
@@ -684,27 +762,40 @@ class TradingEngine:
 
     CONFIRM_DELAYS = (.25, .5, 1., 2., 3.)
 
-    def _confirm_filled(self, client, symbol: str, order: dict) -> dict:
+    def _confirm_filled(self, client, symbol: str, order: dict, *, client_order_id: str | None = None) -> dict:
         """Poll until the accepted order reports a final state.
 
         The order already exists at the exchange, so a Stop request never
-        shortens this wait: an unread outcome would only become a halt.
+        shortens this wait: an unread outcome would only become a halt. An
+        acceptance that carried no exchange id is re-read by client order id.
+        A final state confirmed by a fresh read with no fill at all raises
+        :class:`orders.Unfilled`, which the caller records as a rejection.
         """
         last = len(self.CONFIRM_DELAYS) - 1
+        fetched = False
         for attempt, delay in enumerate(self.CONFIRM_DELAYS):
-            if isinstance(order, dict):
-                if (order.get('id') and order.get('status') in ('closed', 'canceled', 'cancelled', 'expired')
-                        and finite_positive(order.get('filled'))):
-                    return order  # A final partial fill is accounted, never silently erased.
-                if not order.get('id'):
-                    break
-                if attempt < last:
-                    time.sleep(delay)
-                    try:
-                        with self.private_lock:
-                            order = client.fetch_order(order['id'], symbol)
-                    except Exception:
-                        continue
+            if not isinstance(order, dict):
+                break
+            state = orders.classify(order)
+            if state == 'final_filled' and order.get('id'):
+                return order  # A final partial fill is accounted, never silently erased.
+            if state == 'final_empty' and fetched and order.get('id'):
+                raise orders.Unfilled(f'{symbol} order {order.get("id")} ended {order.get("status")} with no fill')
+            if attempt == last:
+                break
+            if state != 'final_empty':
+                time.sleep(delay)
+            try:
+                with self.private_lock:
+                    if order.get('id'):
+                        order = client.fetch_order(order['id'], symbol)
+                    elif client_order_id:
+                        order = orders.locate(client, symbol, client_order_id) or order
+                    else:
+                        break
+                fetched = True
+            except Exception:
+                continue
         raise RuntimeError('Order acceptance/final fill is uncertain; manual reconciliation is required')
 
     def _resolve_fees(self, client, symbol: str, order: dict) -> dict:
@@ -741,59 +832,123 @@ class TradingEngine:
             return order
         return {**order, 'fees': fees}
 
+    def _locate_after_ambiguity(self, client, symbol: str, client_order_id: str, exc: Exception):
+        """One read-only lookup by client order id after an ambiguous submit error.
+
+        Never resends. ``None`` means the exchange could not confirm the
+        order, which the caller must treat as uncertain, not as absent.
+        """
+        self.metrics.incr('execution.ambiguous_submit')
+        observability.event('execution.ambiguous', level='warning', symbol=symbol, error=type(exc).__name__)
+        found = None
+        for pause in (0.0, 1.0):
+            if pause:
+                time.sleep(pause)
+            try:
+                found = orders.locate(client, symbol, client_order_id)
+            except Exception as lookup_exc:
+                observability.event('execution.lookup_failed', level='warning', symbol=symbol,
+                                    error=type(lookup_exc).__name__)
+                return None
+            if found is not None:
+                break
+        if found is not None:
+            storage.audit('warning', f'{symbol}: the order request failed with {type(exc).__name__} but the exchange '
+                                     'reports the order under its client order id; continuing with the exchange record. '
+                                     'No order was resent.')
+            observability.event('execution.located', level='warning', symbol=symbol, order_id=self._order_id(found))
+            self.metrics.incr('execution.located_after_ambiguity')
+        return found
+
     def _submit(self, client, symbol: str, side: str, *, quantity=None, cost=None,
                 authorization: risk.Authorization | None = None, intended_price: float | None = None,
                 decision_id: str | None = None):
         """Durable intent precedes exactly one submission; reads alone may repeat.
 
-        Nothing reaches the exchange without a fresh risk authorization issued
-        for this symbol and side; a caller that skips the gate is refused and
-        audited rather than trusted.
+        Paper and live orders share this path; only ``client`` differs. Nothing
+        reaches the exchange without a fresh risk authorization issued for this
+        symbol and side; a caller that skips the gate is refused and audited.
+        The intent id doubles as the exchange client order id, so an ambiguous
+        transport error is resolved by a read-only lookup, never by resending.
         """
         intent = None
-        create_returned = False
+        accepted = False   # the counterparty is known to hold the order
+        mode = self.mode
         if authorization is None or not authorization.valid_for(symbol, side):
             self.metrics.incr('risk.unauthorized_submit')
             storage.audit('error', f'{side} {symbol} refused: no valid risk authorization for this order.')
             observability.event('risk.unauthorized_submit', level='error', symbol=symbol, side=side)
             return None, None
+        started = time.perf_counter()
         try:
-            if not self._orders_allowed():
+            if not self._may_execute():
                 return None, None
-            intent = storage.create_order_intent(self.exchange_name, symbol, side,
-                                                  quantity=quantity, cost=cost, mode='live',
-                                                  intended_price=intended_price, decision_id=decision_id)
-            # Kraken charges fees in the base asset by default, which the ledger
-            # cannot value; fciq requests the quote (USDT) for both sides.
-            params = {'oflags': 'fciq'} if self.exchange_name == 'kraken' else {}
-            with self.private_lock:
-                if not self._orders_allowed():
-                    storage.update_order_intent(intent, 'rejected')
-                    return None, None
-                if side == 'BUY':
-                    order = client.create_market_buy_order_with_cost(symbol, cost, params)
-                else:
-                    order = client.create_order(symbol, 'market', 'sell', quantity, None, params)
-                create_returned = True
-            storage.update_order_intent(intent, 'submitted', order_id=self._order_id(order))
-            order = self._confirm_filled(client, symbol, order)
-            filled_quantity = finite_positive(order.get('filled'))
-            filled_cost = finite_positive(order.get('cost'))
-            filled_price = finite_positive(order.get('average')) or (filled_cost / filled_quantity if filled_quantity and filled_cost else None)
-            storage.update_order_intent(intent, 'filled', order_id=self._order_id(order),
-                                        filled_price=filled_price, filled_quantity=filled_quantity or None)
+            intent = storage.create_order_intent(self.exchange_name, symbol, side, quantity=quantity, cost=cost,
+                                                  mode=mode, intended_price=intended_price, decision_id=decision_id)
+            client_id = storage.client_order_id(intent)
+            if client is self.paper:
+                params = {'clientOrderId': client_id, 'reference_price': intended_price}
+            else:
+                params = orders.order_params(self.exchange_name, client_id)
+            with observability.bind(intent_id=intent, decision_id=decision_id, mode=mode):
+                with self.private_lock:
+                    if not self._may_execute():
+                        storage.update_order_intent(intent, 'rejected', note='stopped before submission')
+                        return None, None
+                    # The request leaves now; a crash after this point may have an order at the exchange.
+                    storage.update_order_intent(intent, 'pending', submitted_at=storage._now())
+                    sent = time.perf_counter()
+                    try:
+                        if side == 'BUY':
+                            order = client.create_market_buy_order_with_cost(symbol, cost, params)
+                        else:
+                            order = client.create_order(symbol, 'market', 'sell', quantity, None, params)
+                        accepted = True
+                    except Exception as exc:
+                        if isinstance(exc, orders.definite_rejections()):
+                            raise
+                        located = self._locate_after_ambiguity(client, symbol, client_id, exc)
+                        if located is None:
+                            raise
+                        order, accepted = located, True
+                ack_ms = (time.perf_counter() - sent) * 1000
+                self.metrics.observe('execution.submit_to_ack_ms', ack_ms)
+                order_id = self._order_id(order)
+                storage.update_order_intent(intent, 'acked' if order_id else 'submitted', order_id=order_id)
+                order = self._confirm_filled(client, symbol, order, client_order_id=client_id)
+                summary = orders.fill_summary(order)
+                storage.update_order_intent(intent, 'filled', order_id=self._order_id(order),
+                                            filled_price=summary['average'], filled_quantity=summary['filled'])
+                total_ms = (time.perf_counter() - started) * 1000
+                self.metrics.observe('execution.ack_to_final_ms', total_ms - ack_ms)
+                self.metrics.observe('execution.submit_total_ms', total_ms)
+                observability.event('execution.filled', symbol=symbol, side=side, order_id=self._order_id(order),
+                                    filled=summary['filled'], average=summary['average'],
+                                    slippage_bps=orders.slippage_bps(intended_price, summary['average'], side),
+                                    submit_to_ack_ms=ack_ms, total_ms=total_ms)
+                try:
+                    order = self._resolve_fees(client, symbol, order)
+                except Exception:
+                    pass  # A fee read is optional; the fill itself is confirmed.
+                return intent, order
+        except orders.Unfilled as exc:
+            # A fresh read confirmed a final state with zero fill: nothing changed hands.
             try:
-                order = self._resolve_fees(client, symbol, order)
+                storage.update_order_intent(intent, 'rejected', note='final state without any fill')
+                with self.lock:
+                    self.risk_block = f'{side} {symbol} ended without a fill: {exc}'
+                storage.audit('warning', self.risk_block)
+                self.risk.record_failure('unfilled')
+                observability.event('execution.unfilled', level='warning', symbol=symbol, side=side)
+                return None, None
             except Exception:
-                pass  # A fee read is optional; the fill itself is confirmed.
-            return intent, order
+                pass
+            self._ledger_failure(f'{side} {symbol}: unfilled order could not be journaled; review required')
+            return None, None
         except Exception as exc:
             # A documented exchange rejection confirms no order was accepted.
             # Transport errors and unrecognized responses always remain uncertain.
-            rejected = tuple(cls for name in ('InsufficientFunds', 'InvalidOrder', 'AuthenticationError',
-                                              'PermissionDenied', 'BadSymbol', 'BadRequest', 'NotSupported')
-                             if isinstance(cls := getattr(ccxt, name, None), type))
-            if intent and not create_returned and rejected and isinstance(exc, rejected):
+            if intent and not accepted and isinstance(exc, orders.definite_rejections()):
                 try:
                     storage.update_order_intent(intent, 'rejected', note=type(exc).__name__)
                     with self.lock:
@@ -807,10 +962,10 @@ class TradingEngine:
                     pass
             if intent:
                 try:
-                    storage.update_order_intent(intent, 'uncertain')
+                    storage.update_order_intent(intent, 'uncertain', note=type(exc).__name__)
                 except Exception:
                     pass
-            self._halt_uncertain(f'{side} {symbol}: {type(exc).__name__}; order or journal outcome requires review')
+            self._ledger_failure(f'{side} {symbol}: {type(exc).__name__}; order or journal outcome requires review')
             return None, None
 
     def _fill_details(self, order: dict, symbol: str) -> tuple[float, float, float, float, float, float]:
@@ -926,9 +1081,23 @@ class TradingEngine:
                                             cash=self._cash('paper'), **gate_fields)
             if not authorization.allowed:
                 return False
-            fill_price = price * (1 + slip)
-            gross = budget / (1 + fee_rate)
-            qty, fee, cost = gross / fill_price, gross * fee_rate, budget
+            # The simulated counterparty fills the fee-exclusive amount at the
+            # observed ask plus slippage; the same submit/confirm/journal path
+            # as live runs, only the client differs.
+            intent, order = self._submit(self.paper, symbol, 'BUY', cost=budget / (1 + fee_rate),
+                                         authorization=authorization, intended_price=price, decision_id=decision_id)
+            if order is None:
+                return False
+            try:
+                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                qty = filled - base_fee
+                # A cost-bounded simulated buy spends exactly its budget; a
+                # partial simulated fill (failure injection) spends what filled.
+                cost = budget if abs(gross + quote_fee - budget) <= budget * 1e-9 else gross + quote_fee
+                order_id = self._order_id(order)
+            except Exception as exc:
+                self._ledger_failure(f'PAPER BUY {symbol}: {type(exc).__name__}; simulated fill accounting requires review')
+                return False
         else:
             if self.live_halted or self._durable_live_block():
                 self._halt_uncertain('Live execution blocked by unresolved order/account state')
@@ -1036,10 +1205,19 @@ class TradingEngine:
                                             positions=positions, cash=None, quantity=tracked, reason=reason)
             if not authorization.allowed:
                 return False
-            filled = consumed = tracked
-            fill_price = market_price * (1 - self.cfg['slippage_pct'] / 100)
-            gross = filled * fill_price
-            quote_fee = fee = gross * fee_rate
+            intent, order = self._submit(self.paper, symbol, 'SELL', quantity=tracked,
+                                         authorization=authorization, intended_price=market_price)
+            if order is None:
+                return False
+            try:
+                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                consumed = filled + base_fee
+                if consumed > tracked * (1 + 1e-10):
+                    raise ValueError('Simulated fill would consume untracked holdings')
+                order_id = self._order_id(order)
+            except Exception as exc:
+                self._ledger_failure(f'PAPER SELL {symbol}: {type(exc).__name__}; simulated fill accounting requires review')
+                return False
         else:
             if self.live_halted or self._durable_live_block():
                 self._halt_uncertain('Live exit blocked by unresolved order/account state')
@@ -1710,7 +1888,8 @@ class TradingEngine:
                                           for symbol in self.last_price_times},
                     'metrics': dict(self.data.metrics.copy()),
                     'risk': self.risk.status(),
-                    'unresolved_orders': len(unresolved), 'legacy_live_records': storage.legacy_live_records(),
+                    'unresolved_orders': len(unresolved), 'unresolved_probe': list(self.unresolved_probe),
+                    'legacy_live_records': storage.legacy_live_records(),
                     'trades': storage.rows('SELECT * FROM trades WHERE exchange=? AND mode=? ORDER BY id DESC LIMIT 70',
                                            (exchange, mode)),
                     'audit': storage.rows('SELECT * FROM audit ORDER BY id DESC LIMIT 55')}

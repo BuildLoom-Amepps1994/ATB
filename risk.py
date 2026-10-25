@@ -267,12 +267,7 @@ class RiskGate:
         halted = bool(mode == 'live' and (self.engine.live_halted or self.engine._durable_live_block()))
         check('mode_scope', request.exchange == self.engine.exchange_name and mode == self.engine.mode,
               'Request belongs to another exchange or trading mode')
-        # Live orders need a running worker or an active manual ticket. A paper
-        # order from an idle engine (tests, benchmarks) has no counterparty,
-        # but a Stop requested during activity still ends paper orders too.
-        stopping = self.engine.stop_event.is_set() and (self.engine.running or self.engine._manual_order_active)
-        check('orders_allowed', self.engine._orders_allowed() if mode == 'live' else not stopping,
-              'Engine is stopped or stopping')
+        check('orders_allowed', self.engine._may_execute(), 'Engine is stopped or stopping')
         check('live_halt', not halted, 'Live execution is halted pending manual reconciliation')
         check('symbol_quote_fresh', symbol_fresh, f'No fresh quote for {request.symbol}',
               age_seconds=request.quote_age_seconds, limit_seconds=cfg['data_max_age_seconds'])

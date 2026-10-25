@@ -485,7 +485,7 @@ ORDER_STATUSES = ('pending', 'submitted', 'acked', 'uncertain', 'filled', *RESOL
 # Every legal order-journal transition. Resolved states are terminal except
 # that the recovery tool may still mark an exchange's rows reconciled.
 ORDER_TRANSITIONS = {
-    'pending': {'submitted', 'rejected', 'uncertain'},
+    'pending': {'submitted', 'acked', 'rejected', 'uncertain'},
     'submitted': {'acked', 'filled', 'rejected', 'uncertain'},
     'acked': {'filled', 'uncertain', 'rejected'},
     'filled': {'accounted', 'uncertain'},

@@ -4,21 +4,25 @@ cd /d "%~dp0"
 if exist ".build-venv\Scripts\python.exe" goto buildinstall
 if exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -m venv .build-venv
-) else (
-  where py >NUL 2>NUL
+  goto created
+)
+where py >NUL 2>NUL
+if errorlevel 1 (
+  python -m venv .build-venv
+  goto created
+)
+rem Prefer the newest supported Python; scripts\bootstrap.py rejects anything outside 3.12-3.14.
+for %%v in (3.14 3.13 3.12) do (
+  py -%%v -c "import sys" >NUL 2>NUL
   if not errorlevel 1 (
-    py -3.12 -c "import sys" >NUL 2>NUL
-    if not errorlevel 1 (
-      py -3.12 -m venv .build-venv
-    ) else (
-      py -3 -m venv .build-venv
-    )
-  ) else (
-    python -m venv .build-venv
+    py -%%v -m venv .build-venv
+    goto created
   )
 )
+py -3 -m venv .build-venv
+:created
 if errorlevel 1 (
-  echo Could not create the build environment. Install Python 3.12, then run again.
+  echo Could not create the build environment. Install 64-bit Python 3.14, then run again.
   pause
   exit /b 1
 )

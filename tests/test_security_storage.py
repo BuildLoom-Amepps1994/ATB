@@ -1,5 +1,6 @@
 """Offline boundary, migration and crash-consistency tests; no OS secrets used."""
 import importlib.util
+from contextlib import closing
 import json
 import re
 import sqlite3
@@ -186,7 +187,7 @@ def test_order_journal_survives_connections_and_atomic_ledger_failure(db):
 
 def test_legacy_migration_preserves_rows_and_quarantines_live(isolated_paths):
     storage.save_settings({**storage.DEFAULTS, 'exchange': 'kraken'})
-    with sqlite3.connect(storage.DB_PATH) as connection:
+    with closing(sqlite3.connect(storage.DB_PATH)) as connection, connection:
         connection.executescript('''
             CREATE TABLE positions(mode TEXT,symbol TEXT,qty REAL,entry_price REAL,cost REAL,highest REAL,stop REAL,target REAL,opened_at TEXT,PRIMARY KEY(mode,symbol));
             INSERT INTO positions VALUES ('paper','BTC/USDT',1,100,100,100,95,110,'2026-10-01');
@@ -215,7 +216,7 @@ def test_legacy_migration_preserves_rows_and_quarantines_live(isolated_paths):
 
 
 def test_schema_migration_rename_is_rolled_back_on_failure(isolated_paths, monkeypatch):
-    with sqlite3.connect(storage.DB_PATH) as connection:
+    with closing(sqlite3.connect(storage.DB_PATH)) as connection, connection:
         connection.executescript('''
             CREATE TABLE positions(mode TEXT,symbol TEXT,qty REAL,entry_price REAL,cost REAL,highest REAL,stop REAL,target REAL,opened_at TEXT,PRIMARY KEY(mode,symbol));
             INSERT INTO positions VALUES ('paper','BTC/USDT',1,100,100,100,95,110,'2026-10-01');
@@ -225,7 +226,7 @@ def test_schema_migration_rename_is_rolled_back_on_failure(isolated_paths, monke
     monkeypatch.setattr(storage, '_create_positions', fail_after_rename)
     with pytest.raises(RuntimeError):
         storage.init_db()
-    with sqlite3.connect(storage.DB_PATH) as connection:
+    with closing(sqlite3.connect(storage.DB_PATH)) as connection:
         assert connection.execute('SELECT COUNT(*) FROM positions').fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='positions_v1'").fetchone()[0] == 0
 

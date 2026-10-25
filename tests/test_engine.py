@@ -242,8 +242,12 @@ def test_aggregate_meme_caps_and_total_exposure(engine):
     symbols = ['DOGE/USDT','PEPE/USDT','SHIB/USDT','BONK/USDT','FLOKI/USDT']
     engine.last_prices.update({s:100 for s in symbols})
     engine.price_times.update({s:time.time() for s in symbols})
-    engine._enter_candidates([(100,20000000,s,100,1,123) for s in symbols])
+    # Each pass opens at most two positions; the caps must bind across passes.
+    for _ in range(3):
+        engine._enter_candidates([(100,20000000,s,100,1,123) for s in symbols])
     positions = engine._active_positions('paper')
-    assert sum(p['qty']*100 for p in positions) <= 1000+1e-6
+    exposure = sum(p['qty']*100 for p in positions)
+    assert 990 <= exposure <= 1000+1e-6
     assert all(p['cost']<=300+1e-6 for p in positions)
-    assert len(positions)<=engine.cfg['max_positions']
+    assert len(positions) == 4 < engine.cfg['max_positions']
+    assert 'FLOKI/USDT' not in {p['symbol'] for p in positions}

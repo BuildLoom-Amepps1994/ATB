@@ -85,13 +85,33 @@ class MarketData:
     def markets(self):
         return self.read('load_markets')
 
+    def _clock_offset(self):
+        """Local-minus-exchange seconds, as CCXT measured it (MEXC); else zero."""
+        options = getattr(self.client, 'options', None)
+        difference = options.get('timeDifference') if isinstance(options, dict) else None
+        if isinstance(difference, bool) or not isinstance(difference, (int, float)) or not math.isfinite(difference):
+            return 0.0
+        return difference / 1000
+
+    def _received(self, ticker, received):
+        # Exchanges without ticker timestamps are aged from the response time.
+        if isinstance(ticker, dict):
+            ticker['_received_at'] = received
+        return ticker
+
     def ticker(self,symbol):
-        return self.read('fetch_ticker',symbol)
+        result = self.read('fetch_ticker',symbol)
+        return self._received(result, self.clock())
 
     def tickers(self,symbols):
         if getattr(self.client,'has',{}).get('fetchTickers') is True:
             result = self.read('fetch_tickers',symbols)
-            return result if isinstance(result,dict) else {}
+            if not isinstance(result,dict):
+                return {}
+            received = self.clock()
+            for ticker in result.values():
+                self._received(ticker, received)
+            return result
         return {}
 
     def cached_candles(self, symbol, timeframe, limit=175):
@@ -114,18 +134,23 @@ class MarketData:
                     and self.monotonic() < saved[3]):
                 self.metrics['candle_cache_hits'] += 1
                 return saved[1].copy()
+            # Candle times are exchange time. The completion cut-off is taken
+            # before the request: a candle that closed while the response was
+            # in flight was still open when the exchange assembled it.
+            offset, duration = self._clock_offset(), SECONDS[timeframe]
+            cutoff = stamp - offset
             raw = self.read('fetch_ohlcv',symbol,timeframe,limit=limit)
-            stamp, duration = self.clock(), SECONDS[timeframe]
-            frame = frame_from_ohlcv(raw,timeframe=timeframe,now_ms=int(stamp*1000))
+            stamp = self.clock()
+            frame = frame_from_ohlcv(raw,timeframe=timeframe,now_ms=int(cutoff*1000))
             if frame.empty:
                 raise DataUnavailable('No completed candles')
             latest = float(frame.iloc[-1]['timestamp'])/1000
-            if stamp - latest - duration > duration + 90:
+            if stamp - offset - latest - duration > duration + 90:
                 raise DataUnavailable('Historical candles are stale')
             if len(frame)>1 and not frame['timestamp'].diff().iloc[1:].eq(duration*1000).all():
                 raise DataUnavailable('Historical candles contain missing periods')
             result = indicators(frame)
-            expires = max(stamp+1,latest+2*duration+2)
+            expires = max(stamp+1,latest+offset+2*duration+2)
             self.cache[key] = (expires,result,stamp,self.monotonic()+expires-stamp)
             if len(self.cache)>160:
                 self.cache.pop(next(iter(self.cache)))

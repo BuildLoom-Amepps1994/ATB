@@ -1,6 +1,7 @@
 """Loopback-only dashboard. Never return credentials or service exception text."""
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import mimetypes
@@ -17,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 import credentials
+import observability
 import storage
 import updater
 from market_data import DataUnavailable
@@ -33,6 +35,11 @@ STATIC = Path(__file__).resolve().parent / 'static'
 async def lifespan(application):
     yield
     engine.stop()
+    # Give an order that is being confirmed time to reach the ledger before
+    # the process ends; the journal covers anything that still does not.
+    if not await asyncio.to_thread(engine.wait_idle, 30.0):
+        storage.audit('error', 'Shutdown proceeded while an exchange operation was still in flight; '
+                               'inspect the order journal and exchange account before the next start.')
 
 
 app = FastAPI(title='CryptoPilot Local', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -247,6 +254,39 @@ def manual_order(req: ManualOrder):
 @app.post('/api/reset-paper')
 def reset_paper():
     return ensure_ok(lambda: (engine.reset_paper_portfolio(), {'ok': True})[1])
+
+
+class RiskAction(StrictModel):
+    action: str = Field(pattern='^(engage|release|clear_drawdown_stop)$')
+    confirmation: str = Field(default='', max_length=40)
+    allow_exits: bool = True
+    reason: str = Field(default='', max_length=200)
+
+
+@app.post('/api/risk')
+def risk_action(req: RiskAction):
+    """Kill switch and latch control. Engaging needs no confirmation and works while the bot runs."""
+    def work():
+        if req.action == 'engage':
+            return engine.risk.engage_kill_switch(req.reason or 'Operator kill switch', allow_exits=req.allow_exits)
+        if req.action == 'release':
+            return engine.risk.release_kill_switch(req.confirmation)
+        engine.risk.clear_drawdown_stop(engine.mode, req.confirmation)
+        return engine.risk.status()
+    return ensure_ok(work)
+
+
+@app.get('/api/decisions')
+def decisions(symbol: str | None = None, limit: int = 50):
+    """Recent decision records (entries, holds and abstentions with reasons). Local only."""
+    return ensure_ok(lambda: {'decisions': engine.decisions.recent(symbol.upper() if symbol else None, max(1, min(int(limit), 500)))})
+
+
+@app.get('/api/metrics')
+def metrics():
+    """In-process telemetry: counters, gauges and p50/p95/p99 latencies. Local only."""
+    return ensure_ok(lambda: {'telemetry': observability.METRICS.snapshot(),
+                              'market_data': dict(engine.data.metrics), 'risk': engine.risk.status()})
 
 
 @app.get('/api/history')

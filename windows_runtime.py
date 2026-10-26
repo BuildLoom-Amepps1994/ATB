@@ -20,6 +20,7 @@ from pathlib import Path
 REQUIRED_MODULES = frozenset({
     'launcher', 'app', 'credentials', 'storage', 'market_data', 'trader',
     'strategy', 'recovery', 'updater',
+    'decision', 'feed', 'observability', 'orders', 'paper_exchange', 'risk',
 })
 REQUIRED_ASSETS = ('index.html', 'dashboard.js', 'dashboard-core.js')
 

@@ -75,9 +75,14 @@ def test_kraken_orders_request_quote_currency_fees(engine):
     engine.update_config({'exchange': 'kraken'})
     client = arm_fake_live(engine)
     assert engine._buy('BTC/USDT', 800, 100, .04)
-    assert client.orders[-1][1][2] == {'oflags': 'fciq'}
+    params = client.orders[-1][1][2]
+    assert params['oflags'] == 'fciq' and len(params['clientOrderId']) == 32
     assert engine._sell(engine._active_positions('live')[0], 100, 'test')
-    assert client.orders[-1] == ('sell', ('BTC/USDT', 'market', 'sell', 1.0, None, {'oflags': 'fciq'}))
+    side, (symbol, kind, direction, amount, price, params) = client.orders[-1]
+    assert (side, symbol, kind, direction, amount, price) == ('sell', 'BTC/USDT', 'market', 'sell', 1.0, None)
+    assert params['oflags'] == 'fciq' and len(params['clientOrderId']) == 32
+    # The client order id is the journal intent, so an ambiguous submit can be looked up.
+    assert storage.rows('SELECT client_order_id FROM order_journal ORDER BY created_at')[-1]['client_order_id'] == params['clientOrderId']
 
 
 def test_mexc_orders_send_no_extra_flags_and_spot_balance_type(engine):
@@ -86,7 +91,7 @@ def test_mexc_orders_send_no_extra_flags_and_spot_balance_type(engine):
     original = client.fetch_balance
     client.fetch_balance = lambda params=None: seen.append(params) or original()
     assert engine._buy('BTC/USDT', 800, 100, .04)
-    assert client.orders[-1][1][2] == {}
+    assert set(client.orders[-1][1][2]) == {'clientOrderId'}   # no Kraken-only flags on MEXC
     assert seen and all(params == {'type': 'spot'} for params in seen)
     engine.running, engine.mode = False, 'paper'
     engine.update_config({'exchange': 'kraken'})

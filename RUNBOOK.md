@@ -1,0 +1,214 @@
+# CryptoPilot operations runbook
+
+This runbook covers the hardened engine: how to start and stop it safely, what
+each protection does, what to look at when something trips, and how to verify
+a change before trusting it. **Everything here assumes paper mode.** Live
+trading stays off until it is enabled deliberately with the phrase
+`ENABLE LIVE TRADING`, and nothing in this document asks you to do that.
+
+## 1. Safety posture at a glance
+
+| Layer | What it guarantees | Where it lives |
+|---|---|---|
+| Risk gate | Every order, automatic or manual, paper or live, needs a fresh authorization from one choke point. A blocked order is never sent. | `risk.py` (`RiskGate.authorize`), enforced in `trader.TradingEngine._submit` |
+| Kill switch | Blocks new orders instantly from the dashboard or `POST /api/risk`; optionally blocks exits too. Survives restarts. | `risk.py`, `storage` meta `kill_switch` |
+| Latches | Daily equity-loss guard, daily realised-loss stop and drawdown-from-peak stop block new entries until cleared with `RESUME TRADING`. | `risk.py` |
+| Breakers | Three order failures in ten minutes pause entries for thirty minutes; a rejection spike or adverse slippage beyond three times the assumption pauses entries. | `risk.py` |
+| Order state machine | Each order is a journaled intent: `pending → acked → filled → accounted`, or `rejected`, or `uncertain`. Illegal transitions are refused. | `storage.py`, `orders.py` |
+| Idempotency | Every order carries a client order id derived from its intent id. After an ambiguous submit the engine looks the order up by that id and never resends. | `orders.py`, `trader._submit` |
+| Fail closed | Stale quotes, an unreadable kill-switch record, missing marks on a held asset, or an unknown order outcome all block new orders. An uncertain live outcome halts live trading until reconciled. | `risk.py`, `trader.py`, `recovery.py` |
+| Decision records | Every scan writes one replayable record per symbol with all checks, the data timestamps and the reason for abstaining. | `decision.py`, `GET /api/decisions`, `logs/events.jsonl` |
+
+## 2. Start and stop
+
+**Start (paper).** Launch the app, confirm the header shows `PAPER` and the bot
+is stopped, review settings, then press **Start bot**. The engine runs
+protective checks every `protective_poll_seconds` and a strategy scan five
+seconds after each signal candle closes. With **Streaming quotes** on, the
+websocket feed starts with the bot and protective checks run every second
+while every held asset has a live stream quote.
+
+**Stop.** Press **Stop**. A stop never shortens the wait for an accepted
+order's final state; the UI shows *Stopping* until the worker finishes. The
+websocket feed stops with the bot.
+
+**Shut down the app.** Closing the window or stopping the service calls the
+same stop and then waits up to thirty seconds for an in-flight order to reach
+the ledger. If that wait expires, an `error` activity line says so: inspect the
+order journal (section 6) before the next start.
+
+**Restart.** The app always starts stopped and in paper mode. On start it:
+
+1. abandons any stale *paper* order intents (a simulated order has nothing to
+   reconcile);
+2. keeps every unresolved *live* intent and the durable halt flag;
+3. on **Connect**, runs a read-only probe that reports whether the exchange
+   knows each unresolved live order by its client order id. The probe never
+   changes the journal.
+
+## 3. Settings that matter for safety
+
+All of these are enforced by the risk gate, not only by the sizing code.
+Change them while the bot is stopped.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `max_order_notional_usdt` | 1000 | Hard cap per order. |
+| `max_asset_notional_usdt` | 2500 | Hard cap on cost held per asset, including the new order. Must be at least the per-order cap. |
+| `max_position_pct`, `max_exposure_pct`, `max_positions` | 8 %, 40 %, 5 | Position, exposure and count caps. |
+| `risk_pct`, `max_portfolio_risk_pct` | 0.65 %, 3 % | Per-trade loss budget and total open stop risk. |
+| `daily_loss_limit_pct` | 3 % | Equity-based daily guard; latches until the next UTC day. |
+| `daily_realized_loss_limit_pct` | 3 % | Sum of today's realised losses; latches until `RESUME TRADING`. |
+| `max_drawdown_pct` | 10 % | Equity drawdown from the tracked peak; latches until `RESUME TRADING`. |
+| `max_orders_per_minute` | 6 | Order-rate limit per exchange and mode (exits are allowed three times that). |
+| `data_max_age_seconds` | 120 | A quote older than this is stale; stale quotes block entries and fall back to REST for exits. |
+| `streaming_quotes` | off | Websocket best bid/ask while running. REST remains the fallback. |
+
+The minimum order is 12 USDT on both exchanges and is enforced as well.
+
+## 4. Kill switch, latches and breakers
+
+**Engage the kill switch** with the dashboard button or:
+
+```
+POST /api/risk  {"action": "engage", "reason": "operator", "allow_exits": true}
+```
+
+It takes effect immediately, including during a scan, and persists across
+restarts. With `allow_exits` true, protective exits continue; with it false,
+nothing is sent at all.
+
+**Release** needs the phrase:
+
+```
+POST /api/risk  {"action": "release", "confirmation": "RESUME TRADING"}
+```
+
+**Clear a drawdown stop** the same way with `"action": "clear_drawdown_stop"`.
+The daily equity guard clears itself at the next UTC day.
+
+Breakers open and close on their own; `GET /api/state` shows them under
+`risk.breakers_open` with seconds remaining, and `risk.last_block` names the
+most recent blocked check. Every block is also an activity line starting with
+`RISK BLOCK` and an event of kind `risk.blocked`.
+
+## 5. Streaming quotes
+
+Turn on **Streaming quotes** only after a paper soak with it off has run
+cleanly. What to watch:
+
+* `GET /api/state` → `feed.state` should be `live`; `last_message_age_s`
+  should stay well under `heartbeat_seconds`.
+* `feed.reconnects`, `feed.stalls` and `feed.out_of_order` should stay near
+  zero. A steadily rising `reconnects` means the connection is unstable; the
+  engine is already using REST in that case, so switch the setting off and
+  carry on.
+* `GET /api/metrics` → `feed.exchange_to_receipt_ms` (exchange publication to
+  local receipt, when the exchange stamps its messages) and
+  `feed.age_at_use_ms` (how old a stream quote was when the engine used it).
+
+Rules the engine applies: a stream quote is used only while the feed is
+healthy and the quote is under ten seconds old; if REST produced a newer
+quote, REST wins; turnover always comes from REST; and if any held asset
+lacks a fresh stream quote the protective check uses REST for that tick.
+
+## 6. Order journal and halts
+
+`order_journal` holds one row per intent with `mode`, `status`,
+`client_order_id`, `intended_price`, `filled_price`, `filled_quantity`,
+`decision_id`, `submitted_at`, `acked_at`, `final_at` and `note`.
+
+* `rejected` means the exchange refused the request before accepting
+  anything, or a fresh read confirmed a final state with zero fill. Nothing
+  is owed; the breaker counters note it.
+* `uncertain` means the engine could not establish the outcome. In live mode
+  this halts live trading durably. Do not restart it hoping it clears.
+
+To clear a live halt, with the app closed and after checking every listed
+order against the exchange's own order history:
+
+```
+python recovery.py                     # read-only report first
+python recovery.py --clear-halt mexc --confirm "I HAVE RECONCILED MEXC ORDERS"
+```
+
+The probe on **Connect** helps: for each unresolved intent it reports whether
+the exchange knows an order with that client order id and what state it is in.
+
+## 7. Logs, events, metrics and correlation
+
+* **Activity log** (dashboard and `audit` table): human-readable, redacted,
+  bounded.
+* **Event log** `logs/events.jsonl` (rotated, 5 MB × 3): one JSON object per
+  line with `ts`, `kind`, `level` and fields. Secrets and key-like strings are
+  redacted before writing. Event kinds: `engine.start`; `decision.entry`,
+  `decision.exit`; `execution.filled`, `execution.rejected`,
+  `execution.unfilled`, `execution.ambiguous`, `execution.located`,
+  `execution.lookup_failed`, `execution.halt`, `execution.probe`,
+  `execution.entry_error`; `risk.authorize`, `risk.blocked`, `risk.breaker`,
+  `risk.kill_switch`, `risk.drawdown_stop`, `risk.drawdown_stop_cleared`,
+  `risk.unauthorized_submit`; `feed.state`, `feed.connected`; `ledger.failure`.
+* **Correlation.** Every order path binds `intent_id`, `decision_id` and
+  `mode` into the event context, so one `grep` over the intent id gives the
+  decision, the authorization, the submit, the fill and the ledger update in
+  order. The same `decision_id` appears in `GET /api/decisions`, in the
+  dashboard row and in the journal.
+* **Metrics** `GET /api/metrics`: counters (`decision.enter`, `decision.abstain`,
+  `risk.blocked`, `feed.messages`, …), gauges and latency reservoirs with
+  p50/p95/p99 (`decision.quote_to_decision_ms`, `execution.submit_to_ack_ms`,
+  `execution.ack_to_final_ms`, `execution.submit_total_ms`, `monitor.cycle_ms`,
+  `feed.*_ms`). All local, loopback only.
+
+## 8. Verification procedure before trusting a build
+
+Run these on the machine that will trade. None of them places an order.
+
+1. **Tests.** `python -m pytest tests -q` and `node --test tests/test_dashboard.js`.
+   `python tests/smoke_frozen_orders.py --work <scratch folder>` stages exactly
+   the installer's file set and drives paper and simulated-live manual orders
+   through the launcher; add `--runtime <folder with CryptoPilotRuntime.exe>`
+   on Windows to run it inside the frozen runtime.
+2. **Replay check.** `python benchmarks/replay.py` must report zero mismatches.
+3. **Latency benchmark.** `python benchmarks/bench_latency.py --json out.json`
+   and compare with `benchmarks/results/`.
+4. **Paper soak, streaming off.** Start the bot in paper mode for at least a
+   few full candles of the chosen horizon. Check `GET /api/decisions` shows a
+   record per symbol per scan with sensible reasons, and that `risk.last_block`
+   explains every withheld entry.
+5. **Paper soak, streaming on.** Repeat with **Streaming quotes** on and watch
+   the feed counters in section 5.
+6. **Kill switch drill.** Engage during a running scan; confirm
+   `risk.kill_switch.engaged` is true, that `risk.blocked` events name the
+   kill switch and no `execution.filled` event follows, and release with the
+   phrase.
+7. **Exchange read-only connectivity** (optional, still paper): **Connect** with
+   a read-only key and confirm the probe reports no unresolved intents.
+
+Live enablement is a separate decision with its own confirmation phrase and
+is not part of this procedure.
+
+## 9. Rollback
+
+Each hardening step is one commit on the feature branch, so a rollback is a
+`git revert` of the commits you do not want, newest first. Data compatibility:
+
+* The database schema change is additive (new nullable columns on
+  `order_journal`, `PRAGMA user_version = 3`). An older build opens the same
+  file; it ignores the new columns. Stop the bot before downgrading so no paper
+  intent is left non-terminal, because older builds do not distinguish paper
+  journal rows from live ones.
+* New settings keys are optional and have defaults; an older build ignores
+  them without requiring a settings review.
+* The event log and the decision log are informational and can be deleted.
+
+## 10. Known limits
+
+* Stops and targets are still monitored by this process, not placed at the
+  exchange. Sleep, crashes and connectivity loss interrupt protection.
+* The websocket feed has been exercised only against a scripted fake client;
+  it has not yet been run against MEXC or Kraken from this environment.
+* Nothing here has been run against a real exchange account. The read-only
+  probe, the client-order-id lookups and the `fciq` fee flag follow the CCXT
+  4.5 adapters as documented and tested with fakes.
+* The confidence figure on a decision is a transparent ranking heuristic, not
+  a probability, and no profitability is implied by any of this.

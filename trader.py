@@ -13,6 +13,12 @@ from typing import Any
 import ccxt
 
 import credentials
+import decision
+import feed
+import observability
+import orders
+import paper_exchange
+import risk
 import storage
 from market_data import MarketData
 from strategy import entry_price_ok, entry_signal, regime_signal, research_report, setup_quality, stop_fraction
@@ -81,7 +87,19 @@ class TradingEngine:
         self.discovered: list[str] = []
         self.risk_block = None
         self.live_halted = self._durable_live_block()
+        self.risk = risk.RiskGate(self)
+        self.metrics = observability.METRICS
+        self._last_authorization: risk.Authorization | None = None
+        self.paper = self._new_paper_exchange()
+        self.unresolved_probe: list[dict] = []
+        self.decisions = decision.DecisionLog()
+        self.feed: feed.QuoteFeed | None = None
+        # A simulated order has no exchange-side effect; a crash mid-paper-order
+        # leaves nothing to reconcile, so its intent is closed at startup.
+        storage.abandon_stale_paper_intents(self.exchange_name)
         self._restore_from_keyring()
+        observability.event('engine.start', mode=self.mode, exchange=self.exchange_name,
+                            live_halted=self.live_halted, kill_switch=self.risk.kill_switch()['engaged'])
 
     @staticmethod
     def _new_exchange(name: str, key: str = '', secret: str = ''):
@@ -106,6 +124,28 @@ class TradingEngine:
         if isinstance(rate_limit, bool) or not isinstance(rate_limit, (int, float)) or not 0 < rate_limit <= 100:
             return 1
         return 4
+
+    def _new_paper_exchange(self):
+        """Simulated counterparty sharing the live submit/confirm/ledger path."""
+        return paper_exchange.PaperExchange(self.exchange_name, catalogue=self._catalogue,
+                                            settings=lambda: self.cfg, balances=self._paper_balances)
+
+    def _paper_balances(self) -> dict:
+        free = {'USDT': self._cash('paper')}
+        for position in self._active_positions('paper'):
+            base = position['symbol'].split('/')[0]
+            free[base] = free.get(base, 0.0) + float(position['qty'])
+        return free
+
+    def _may_execute(self) -> bool:
+        """Live orders need a running worker or an active manual ticket.
+
+        A simulated order from an idle engine has no counterparty, but a Stop
+        requested during activity ends paper orders too.
+        """
+        if self.mode == 'live':
+            return self._orders_allowed()
+        return not (self.stop_event.is_set() and (self.running or self._manual_order_active))
 
     def _key(self, name: str) -> str:
         return storage.scope_key(name, self.exchange_name)
@@ -224,9 +264,60 @@ class TradingEngine:
                 if saved and saved[0] != key:
                     storage.audit('warning', 'Different saved credentials remain in the operating-system credential manager and reload after a restart. Disconnect to remove them.')
             storage.audit('info', f'{self.exchange_name.upper()} spot account connected. Live trading still requires explicit opt-in.')
+            # Read-only: tell the operator what the exchange knows about any
+            # unresolved intent. Clearing a halt remains a confirmed manual step.
+            try:
+                self.probe_unresolved(client)
+            except Exception as exc:
+                storage.audit('warning', f'Unresolved-order probe unavailable: {type(exc).__name__}.')
         finally:
             with self.lock:
                 self.control_busy = False
+
+    def probe_unresolved(self, client=None) -> list[dict]:
+        """Ask the exchange, read-only, about each unresolved live intent.
+
+        Findings are audited and returned for the dashboard. The journal is
+        never changed here: reconciliation stays with the confirmed offline
+        procedure in recovery.py, so no outcome is ever guessed.
+        """
+        findings = []
+        pending = storage.unresolved_orders(self.exchange_name)
+        if not pending:
+            with self.lock:
+                self.unresolved_probe = []
+            return findings
+        client = client or self._ensure_private()
+        for intent in pending:
+            finding = {'intent_id': intent['intent_id'], 'symbol': intent['symbol'], 'side': intent['side'],
+                       'journal_status': intent['status'], 'exchange_status': None, 'filled': None, 'order_id': None}
+            try:
+                client_id = intent.get('client_order_id')
+                with self.private_lock:
+                    if intent.get('order_id'):
+                        found = client.fetch_order(intent['order_id'], intent['symbol'])
+                    elif client_id:
+                        found = orders.locate(client, intent['symbol'], client_id, since_ms=0)
+                    else:
+                        found = None
+                        finding['exchange_status'] = 'no client order id recorded (pre-upgrade intent)'
+                if isinstance(found, dict):
+                    summary = orders.fill_summary(found)
+                    finding.update({'exchange_status': found.get('status') or 'unknown', 'filled': summary['filled'],
+                                    'order_id': self._order_id(found)})
+                elif finding['exchange_status'] is None:
+                    finding['exchange_status'] = 'not found in open or recent orders'
+            except Exception as exc:
+                finding['exchange_status'] = f'lookup failed: {type(exc).__name__}'
+            findings.append(finding)
+            storage.audit('warning', f"Unresolved {intent['side']} {intent['symbol']} intent {intent['intent_id'][:8]}: "
+                                     f"exchange reports {finding['exchange_status']}"
+                                     + (f", filled {finding['filled']}" if finding['filled'] else '')
+                                     + '. Confirm against the exchange order history, then clear the halt with recovery.py.')
+        observability.event('execution.probe', findings=findings)
+        with self.lock:
+            self.unresolved_probe = findings
+        return findings
 
     def disconnect(self):
         with self.lock:
@@ -306,6 +397,8 @@ class TradingEngine:
             if changed_exchange:
                 self.exchange_name = revised['exchange']
                 self.public, self.data = candidate_public, candidate_data
+                self.paper = self._new_paper_exchange()
+                self._stop_feed()
                 self.private = self.api_key = self.api_secret = None
                 self.credential_source = 'none'
                 self.latest_balance = self.balance_updated_at = None
@@ -353,6 +446,7 @@ class TradingEngine:
                 self.stop_event.clear()
                 self.thread = threading.Thread(target=self._loop, daemon=True, name='TradingEngine')
                 self.thread.start()
+            self._start_feed()
             storage.audit('warning' if self.mode == 'live' else 'info', f'Bot started in {self.mode.upper()} mode.')
         finally:
             with self.lock:
@@ -369,6 +463,30 @@ class TradingEngine:
             storage.audit('info', 'Stop requested. Waiting for any in-flight exchange operation to finish.')
         if thread and thread is not threading.current_thread():
             thread.join(timeout=2)
+        self._stop_feed()
+
+    def wait_idle(self, timeout: float = 30.0) -> bool:
+        """Block until the worker and any manual order have finished, or ``timeout`` passes.
+
+        Used at process shutdown so an order that is being confirmed is
+        recorded before the interpreter exits. The durable journal still
+        covers a hard kill: an unconfirmed intent halts live trading at the
+        next start until it is reconciled.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        while True:
+            with self.lock:
+                worker = self.thread
+                busy = self._manual_order_active or bool(worker and worker.is_alive()
+                                                         and worker is not threading.current_thread())
+            if not busy:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
 
     def _loop(self):
         next_scan = 0.0
@@ -390,8 +508,75 @@ class TradingEngine:
         finally:
             with self.lock:
                 self.running = self.stopping = False
+            self._stop_feed()
 
     CLOSE_GRACE_SECONDS = 5.0
+    # A stream quote older than this is not used; REST takes over for that symbol.
+    STREAM_MAX_AGE_SECONDS = 10.0
+    # With every held asset streaming, protective checks run this often (no REST cost).
+    STREAM_MONITOR_SECONDS = 1.0
+
+    # ------------------------------------------------------------ quote feed
+    def _feed_symbols(self) -> list[str]:
+        held = [p['symbol'] for p in self._active_positions(self.mode)]
+        return list(dict.fromkeys(held + list(self.cfg['watchlist']) + list(self.discovered)))[:40]
+
+    def _start_feed(self) -> None:
+        """Start the websocket quote stream when the setting asks for it.
+
+        Failure to start is logged and leaves REST polling in charge; the
+        stream is an accelerator, never a dependency.
+        """
+        if not self.cfg.get('streaming_quotes'):
+            return
+        try:
+            if self.feed is None or self.feed.state in ('stopped', 'failed'):
+                self.feed = feed.QuoteFeed(self.exchange_name, self._feed_symbols(), metrics=self.metrics,
+                                           heartbeat_seconds=max(5.0, min(60.0, float(self.cfg['data_max_age_seconds']) / 4)))
+            self.feed.start()
+        except Exception as exc:
+            self.feed = None
+            storage.audit('warning', f'Streaming quotes unavailable ({type(exc).__name__}); REST polling remains in use.')
+
+    def _stop_feed(self) -> None:
+        current, self.feed = self.feed, None
+        if current is not None:
+            try:
+                current.stop(timeout=3)
+            except Exception:
+                pass
+
+    def _ticker_time(self, ticker) -> float | None:
+        raw = ticker.get('timestamp') if isinstance(ticker, dict) else None
+        if raw is not None and finite_positive(raw):
+            return finite_positive(raw) / 1000 + self._clock_offset()
+        received = finite_positive(ticker.get('_received_at')) if isinstance(ticker, dict) else 0.0
+        return received or None
+
+    def _quote(self, symbol: str, rest_ticker=None, *, need_volume: bool = False):
+        """The freshest executable quote: the stream while live and recent, else REST.
+
+        A REST ticker keeps its turnover and any newer timestamp; only bid,
+        ask and the quote time come from the stream, and only when the stream
+        is healthy and the quote is younger than ``STREAM_MAX_AGE_SECONDS``.
+        Turnover exists only on REST tickers, so a caller that needs it gets
+        a single REST read when no bulk snapshot was available.
+        """
+        current = self.feed
+        streamed = current.ticker(symbol, max_age=self.STREAM_MAX_AGE_SECONDS) if current is not None else None
+        if streamed is None:
+            return rest_ticker
+        if need_volume and not isinstance(rest_ticker, dict):
+            rest_ticker = self.data.ticker(symbol)
+        self.metrics.observe('feed.age_at_use_ms', max(0.0, time.time() - streamed['_received_at']) * 1000)
+        if isinstance(rest_ticker, dict):
+            rest_time, stream_time = self._ticker_time(rest_ticker), self._ticker_time(streamed)
+            if rest_time is not None and stream_time is not None and rest_time > stream_time:
+                return rest_ticker
+            merged = dict(rest_ticker)
+            merged.update({key: streamed[key] for key in ('bid', 'ask', 'timestamp', '_received_at', '_source')})
+            return merged
+        return streamed
 
     def _seconds_to_next_close(self) -> float:
         """Seconds until the next primary candle close plus a short grace.
@@ -423,16 +608,26 @@ class TradingEngine:
             self.last_monitor, self.monitor_error = now(), None
         if not positions:
             return exited
-        try:
-            tickers = self.data.tickers([p['symbol'] for p in positions])
-        except Exception:
+        started = time.monotonic()
+        held = [p['symbol'] for p in positions]
+        streamed = self.feed is not None and self.feed.covers(held, max_age=self.STREAM_MAX_AGE_SECONDS)
+        if streamed:
+            # Every held asset has a live stream quote: no REST round trip, and
+            # the protective check repeats every second instead of every poll.
+            interval = min(interval, self.STREAM_MONITOR_SECONDS)
             tickers = {}
+        else:
+            try:
+                tickers = self.data.quotes(held)
+            except Exception:
+                tickers = {}
+        self.metrics.incr('monitor.source.stream' if streamed else 'monitor.source.rest')
         for position in positions:
             if not self._orders_allowed():
                 break
             symbol = position['symbol']
             try:
-                ticker = tickers.get(symbol)
+                ticker = self._quote(symbol, tickers.get(symbol))
                 try:
                     price, _, _ = self._observe_ticker(symbol, ticker or self.data.ticker(symbol))
                 except ValueError:
@@ -454,6 +649,7 @@ class TradingEngine:
                 failures += 1
         # Finish-relative scheduling avoids hot loops on slow or failing reads.
         self._next_monitor = time.monotonic() + interval
+        self.metrics.observe('monitor.cycle_ms', (time.monotonic() - started) * 1000)
         with self.lock:
             if observed:
                 self.last_successful_monitor = now()
@@ -594,15 +790,29 @@ class TradingEngine:
         if (not timestamp or timestamp > observed + 30
                 or observed - timestamp > self.cfg['data_max_age_seconds']):
             invalid('Ticker timestamp is stale or invalid')
-        spread = 100 * (ask - bid) / ((ask + bid) / 2) if ask else None
         with self.lock:
-            self.last_prices[symbol] = bid
-            if ask:
-                self.last_asks[symbol] = ask
+            previous = self.last_price_times.get(symbol)
+            stored_bid, stored_ask = self.last_prices.get(symbol), self.last_asks.get(symbol)
+            # A bulk snapshot taken before a later observation (a protective
+            # poll or the stream) must not roll the mark back in time.
+            keep_stored = bool(previous is not None and timestamp < previous - self.QUOTE_REGRESSION_SECONDS
+                               and finite_positive(stored_bid) and (stored_ask or not for_buy))
+            if keep_stored:
+                bid, ask = stored_bid, stored_ask
             else:
-                self.last_asks.pop(symbol, None)
-            self.last_price_times[symbol] = timestamp
+                self.last_prices[symbol] = bid
+                if ask:
+                    self.last_asks[symbol] = ask
+                else:
+                    self.last_asks.pop(symbol, None)
+                self.last_price_times[symbol] = timestamp
+        if keep_stored:
+            self.metrics.incr('quotes.superseded')
+        spread = 100 * (ask - bid) / ((ask + bid) / 2) if ask else None
         return ask if for_buy else bid, finite_positive(ticker.get('quoteVolume')), spread
+
+    # A quote more than this much older than the one already held is a stale snapshot.
+    QUOTE_REGRESSION_SECONDS = 1.0
 
     def _clock_offset(self) -> float:
         """Seconds to add to an exchange timestamp to compare it with this PC's clock.
@@ -636,6 +846,8 @@ class TradingEngine:
         if loss >= self.cfg['daily_loss_limit_pct']:
             storage.set_meta(breach_key, '1')
         allowed = storage.get_meta(breach_key) != '1'
+        # The same fresh valuation feeds the durable peak/drawdown stop.
+        self.risk.observe_equity(mode, equity)
         if not allowed:
             with self.lock:
                 self.risk_block = 'Daily loss limit reached; entries blocked until the next UTC day'
@@ -646,6 +858,8 @@ class TradingEngine:
             self.live_halted = True
             self.risk_block = self.last_error = description
             self.stop_event.set()
+        self.risk.record_failure('uncertain')
+        observability.event('execution.halt', level='error', description=description)
         # Persist independently of an order journal so an intent/ledger failure
         # cannot be bypassed by restarting the process.
         try:
@@ -665,30 +879,45 @@ class TradingEngine:
             with self.lock:
                 self.risk_block = self.last_error = description
                 self.stop_event.set()
+            self.risk.record_failure('ledger')
+            observability.event('ledger.failure', level='error', description=description)
 
     CONFIRM_DELAYS = (.25, .5, 1., 2., 3.)
 
-    def _confirm_filled(self, client, symbol: str, order: dict) -> dict:
+    def _confirm_filled(self, client, symbol: str, order: dict, *, client_order_id: str | None = None) -> dict:
         """Poll until the accepted order reports a final state.
 
         The order already exists at the exchange, so a Stop request never
-        shortens this wait: an unread outcome would only become a halt.
+        shortens this wait: an unread outcome would only become a halt. An
+        acceptance that carried no exchange id is re-read by client order id.
+        A final state confirmed by a fresh read with no fill at all raises
+        :class:`orders.Unfilled`, which the caller records as a rejection.
         """
         last = len(self.CONFIRM_DELAYS) - 1
+        fetched = False
         for attempt, delay in enumerate(self.CONFIRM_DELAYS):
-            if isinstance(order, dict):
-                if (order.get('id') and order.get('status') in ('closed', 'canceled', 'cancelled', 'expired')
-                        and finite_positive(order.get('filled'))):
-                    return order  # A final partial fill is accounted, never silently erased.
-                if not order.get('id'):
-                    break
-                if attempt < last:
-                    time.sleep(delay)
-                    try:
-                        with self.private_lock:
-                            order = client.fetch_order(order['id'], symbol)
-                    except Exception:
-                        continue
+            if not isinstance(order, dict):
+                break
+            state = orders.classify(order)
+            if state == 'final_filled' and order.get('id'):
+                return order  # A final partial fill is accounted, never silently erased.
+            if state == 'final_empty' and fetched and order.get('id'):
+                raise orders.Unfilled(f'{symbol} order {order.get("id")} ended {order.get("status")} with no fill')
+            if attempt == last:
+                break
+            if state != 'final_empty':
+                time.sleep(delay)
+            try:
+                with self.private_lock:
+                    if order.get('id'):
+                        order = client.fetch_order(order['id'], symbol)
+                    elif client_order_id:
+                        order = orders.locate(client, symbol, client_order_id) or order
+                    else:
+                        break
+                fetched = True
+            except Exception:
+                continue
         raise RuntimeError('Order acceptance/final fill is uncertain; manual reconciliation is required')
 
     def _resolve_fees(self, client, symbol: str, order: dict) -> dict:
@@ -725,56 +954,140 @@ class TradingEngine:
             return order
         return {**order, 'fees': fees}
 
-    def _submit(self, client, symbol: str, side: str, *, quantity=None, cost=None):
-        """Durable intent precedes exactly one submission; reads alone may repeat."""
-        intent = None
-        create_returned = False
-        try:
-            if not self._orders_allowed():
-                return None, None
-            intent = storage.create_order_intent(self.exchange_name, symbol, side,
-                                                  quantity=quantity, cost=cost)
-            # Kraken charges fees in the base asset by default, which the ledger
-            # cannot value; fciq requests the quote (USDT) for both sides.
-            params = {'oflags': 'fciq'} if self.exchange_name == 'kraken' else {}
-            with self.private_lock:
-                if not self._orders_allowed():
-                    storage.update_order_intent(intent, 'rejected')
-                    return None, None
-                if side == 'BUY':
-                    order = client.create_market_buy_order_with_cost(symbol, cost, params)
-                else:
-                    order = client.create_order(symbol, 'market', 'sell', quantity, None, params)
-                create_returned = True
-            storage.update_order_intent(intent, 'submitted', order_id=self._order_id(order))
-            order = self._confirm_filled(client, symbol, order)
-            storage.update_order_intent(intent, 'filled', order_id=self._order_id(order))
+    def _locate_after_ambiguity(self, client, symbol: str, client_order_id: str, exc: Exception):
+        """One read-only lookup by client order id after an ambiguous submit error.
+
+        Never resends. ``None`` means the exchange could not confirm the
+        order, which the caller must treat as uncertain, not as absent.
+        """
+        self.metrics.incr('execution.ambiguous_submit')
+        observability.event('execution.ambiguous', level='warning', symbol=symbol, error=type(exc).__name__)
+        found = None
+        for pause in (0.0, 1.0):
+            if pause:
+                time.sleep(pause)
             try:
-                order = self._resolve_fees(client, symbol, order)
+                found = orders.locate(client, symbol, client_order_id)
+            except Exception as lookup_exc:
+                observability.event('execution.lookup_failed', level='warning', symbol=symbol,
+                                    error=type(lookup_exc).__name__)
+                return None
+            if found is not None:
+                break
+        if found is not None:
+            storage.audit('warning', f'{symbol}: the order request failed with {type(exc).__name__} but the exchange '
+                                     'reports the order under its client order id; continuing with the exchange record. '
+                                     'No order was resent.')
+            observability.event('execution.located', level='warning', symbol=symbol, order_id=self._order_id(found))
+            self.metrics.incr('execution.located_after_ambiguity')
+        return found
+
+    def _submit(self, client, symbol: str, side: str, *, quantity=None, cost=None,
+                authorization: risk.Authorization | None = None, intended_price: float | None = None,
+                decision_id: str | None = None):
+        """Durable intent precedes exactly one submission; reads alone may repeat.
+
+        Paper and live orders share this path; only ``client`` differs. Nothing
+        reaches the exchange without a fresh risk authorization issued for this
+        symbol and side; a caller that skips the gate is refused and audited.
+        The intent id doubles as the exchange client order id, so an ambiguous
+        transport error is resolved by a read-only lookup, never by resending.
+        """
+        intent = None
+        accepted = False   # the counterparty is known to hold the order
+        mode = self.mode
+        if authorization is None or not authorization.valid_for(symbol, side):
+            self.metrics.incr('risk.unauthorized_submit')
+            storage.audit('error', f'{side} {symbol} refused: no valid risk authorization for this order.')
+            observability.event('risk.unauthorized_submit', level='error', symbol=symbol, side=side)
+            return None, None
+        started = time.perf_counter()
+        try:
+            if not self._may_execute():
+                return None, None
+            intent = storage.create_order_intent(self.exchange_name, symbol, side, quantity=quantity, cost=cost,
+                                                  mode=mode, intended_price=intended_price, decision_id=decision_id)
+            client_id = storage.client_order_id(intent)
+            if client is self.paper:
+                params = {'clientOrderId': client_id, 'reference_price': intended_price}
+            else:
+                params = orders.order_params(self.exchange_name, client_id)
+            with observability.bind(intent_id=intent, decision_id=decision_id, mode=mode):
+                with self.private_lock:
+                    if not self._may_execute():
+                        storage.update_order_intent(intent, 'rejected', note='stopped before submission')
+                        return None, None
+                    # The request leaves now; a crash after this point may have an order at the exchange.
+                    storage.update_order_intent(intent, 'pending', submitted_at=storage._now())
+                    sent = time.perf_counter()
+                    try:
+                        if side == 'BUY':
+                            order = client.create_market_buy_order_with_cost(symbol, cost, params)
+                        else:
+                            order = client.create_order(symbol, 'market', 'sell', quantity, None, params)
+                        accepted = True
+                    except Exception as exc:
+                        if isinstance(exc, orders.definite_rejections()):
+                            raise
+                        located = self._locate_after_ambiguity(client, symbol, client_id, exc)
+                        if located is None:
+                            raise
+                        order, accepted = located, True
+                ack_ms = (time.perf_counter() - sent) * 1000
+                self.metrics.observe('execution.submit_to_ack_ms', ack_ms)
+                order_id = self._order_id(order)
+                storage.update_order_intent(intent, 'acked' if order_id else 'submitted', order_id=order_id)
+                order = self._confirm_filled(client, symbol, order, client_order_id=client_id)
+                summary = orders.fill_summary(order)
+                storage.update_order_intent(intent, 'filled', order_id=self._order_id(order),
+                                            filled_price=summary['average'], filled_quantity=summary['filled'])
+                total_ms = (time.perf_counter() - started) * 1000
+                self.metrics.observe('execution.ack_to_final_ms', total_ms - ack_ms)
+                self.metrics.observe('execution.submit_total_ms', total_ms)
+                observability.event('execution.filled', symbol=symbol, side=side, order_id=self._order_id(order),
+                                    filled=summary['filled'], average=summary['average'],
+                                    slippage_bps=orders.slippage_bps(intended_price, summary['average'], side),
+                                    submit_to_ack_ms=ack_ms, total_ms=total_ms)
+                try:
+                    order = self._resolve_fees(client, symbol, order)
+                except Exception:
+                    pass  # A fee read is optional; the fill itself is confirmed.
+                return intent, order
+        except orders.Unfilled as exc:
+            # A fresh read confirmed a final state with zero fill: nothing changed hands.
+            try:
+                storage.update_order_intent(intent, 'rejected', note='final state without any fill')
+                with self.lock:
+                    self.risk_block = f'{side} {symbol} ended without a fill: {exc}'
+                storage.audit('warning', self.risk_block)
+                self.risk.record_failure('unfilled')
+                observability.event('execution.unfilled', level='warning', symbol=symbol, side=side)
+                return None, None
             except Exception:
-                pass  # A fee read is optional; the fill itself is confirmed.
-            return intent, order
+                pass
+            self._ledger_failure(f'{side} {symbol}: unfilled order could not be journaled; review required')
+            return None, None
         except Exception as exc:
             # A documented exchange rejection confirms no order was accepted.
             # Transport errors and unrecognized responses always remain uncertain.
-            rejected = tuple(cls for name in ('InsufficientFunds', 'InvalidOrder', 'AuthenticationError',
-                                              'PermissionDenied', 'BadSymbol', 'BadRequest', 'NotSupported')
-                             if isinstance(cls := getattr(ccxt, name, None), type))
-            if intent and not create_returned and rejected and isinstance(exc, rejected):
+            if intent and not accepted and isinstance(exc, orders.definite_rejections()):
                 try:
-                    storage.update_order_intent(intent, 'rejected')
+                    storage.update_order_intent(intent, 'rejected', note=type(exc).__name__)
                     with self.lock:
                         self.risk_block = f'{side} {symbol} rejected by the exchange: {type(exc).__name__}'
                     storage.audit('warning', self.risk_block)
+                    self.risk.record_failure('rejected')
+                    observability.event('execution.rejected', level='warning', symbol=symbol, side=side,
+                                        error=type(exc).__name__, intent_id=intent)
                     return None, None
                 except Exception:
                     pass
             if intent:
                 try:
-                    storage.update_order_intent(intent, 'uncertain')
+                    storage.update_order_intent(intent, 'uncertain', note=type(exc).__name__)
                 except Exception:
                     pass
-            self._halt_uncertain(f'{side} {symbol}: {type(exc).__name__}; order or journal outcome requires review')
+            self._ledger_failure(f'{side} {symbol}: {type(exc).__name__}; order or journal outcome requires review')
             return None, None
 
     def _fill_details(self, order: dict, symbol: str) -> tuple[float, float, float, float, float, float]:
@@ -838,9 +1151,42 @@ class TradingEngine:
         db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)',
                    (completion['scope'], json.dumps(record, allow_nan=False)))
 
+    def _authorize(self, symbol: str, side: str, kind: str, notional: float, price: float, *,
+                   positions: list[dict], cash: float | None, quantity: float | None = None,
+                   stop_fraction: float | None = None, signal_close: float | None = None,
+                   atr: float | None = None, spread: float | None = None, reason: str = '',
+                   decision_id: str | None = None) -> risk.Authorization:
+        """Build the request for the risk gate from the engine's current marks.
+
+        Every production caller observes a ticker immediately before pricing
+        an order, so a quote that has since gone stale is blocked. A caller
+        that priced the order itself without any observation (tests,
+        benchmarks) is judged on the price it supplied.
+        """
+        with self.lock:
+            observed = symbol in self.last_price_times
+            mode = self.mode
+        equity = self._equity(mode, cash, positions) if cash is not None else None
+        request = risk.OrderRequest(exchange=self.exchange_name, mode=mode, symbol=symbol, side=side, kind=kind,
+                                    notional=float(notional), price=float(price), quantity=quantity,
+                                    signal_close=signal_close, atr=atr, stop_fraction=stop_fraction,
+                                    quote_age_seconds=self._price_age(symbol), spread_pct=spread,
+                                    reason=reason, decision_id=decision_id)
+        with self.metrics.timer('risk.authorize_ms'):
+            authorization = self.risk.authorize(request, positions=positions, cash=cash, equity=equity,
+                                                marks_fresh=self._marks_fresh(positions),
+                                                symbol_fresh=self._fresh(symbol) if observed else bool(finite_positive(price)))
+        if not authorization.allowed:
+            storage.audit('warning', f'RISK BLOCK {side} {symbol}: {authorization.reason}')
+        with self.lock:
+            self._last_authorization = authorization
+        return authorization
+
     def _buy(self, symbol: str, budget: float, price: float, fraction: float, *,
              reason: str = 'Completed-candle momentum breakout', merge_dust: bool = False,
-             completion=None, entry_candle: int | None = None) -> bool:
+             completion=None, entry_candle: int | None = None, kind: str = 'entry',
+             signal_close: float | None = None, atr: float | None = None,
+             spread: float | None = None, decision_id: str | None = None) -> bool:
         existing = next((p for p in self._active_positions(self.mode) if p['symbol'] == symbol), None)
         if (not all(finite_positive(v) for v in (budget, price, fraction)) or fraction >= 1
                 or (existing and (not merge_dust or not self._is_dust(
@@ -849,10 +1195,31 @@ class TradingEngine:
         mode, exchange = self.mode, self.exchange_name
         fee_rate, slip = self.cfg['fee_pct'] / 100, self.cfg['slippage_pct'] / 100
         intent = order_id = None
+        positions = self._active_positions(mode)
+        gate_fields = dict(stop_fraction=fraction, signal_close=signal_close, atr=atr, spread=spread,
+                           reason=reason, decision_id=decision_id)
         if mode == 'paper':
-            fill_price = price * (1 + slip)
-            gross = budget / (1 + fee_rate)
-            qty, fee, cost = gross / fill_price, gross * fee_rate, budget
+            authorization = self._authorize(symbol, 'BUY', kind, budget, price, positions=positions,
+                                            cash=self._cash('paper'), **gate_fields)
+            if not authorization.allowed:
+                return False
+            # The simulated counterparty fills the fee-exclusive amount at the
+            # observed ask plus slippage; the same submit/confirm/journal path
+            # as live runs, only the client differs.
+            intent, order = self._submit(self.paper, symbol, 'BUY', cost=budget / (1 + fee_rate),
+                                         authorization=authorization, intended_price=price, decision_id=decision_id)
+            if order is None:
+                return False
+            try:
+                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                qty = filled - base_fee
+                # A cost-bounded simulated buy spends exactly its budget; a
+                # partial simulated fill (failure injection) spends what filled.
+                cost = budget if abs(gross + quote_fee - budget) <= budget * 1e-9 else gross + quote_fee
+                order_id = self._order_id(order)
+            except Exception as exc:
+                self._ledger_failure(f'PAPER BUY {symbol}: {type(exc).__name__}; simulated fill accounting requires review')
+                return False
         else:
             if self.live_halted or self._durable_live_block():
                 self._halt_uncertain('Live execution blocked by unresolved order/account state')
@@ -877,9 +1244,15 @@ class TradingEngine:
             maximum = finite_positive((limits.get('cost') or {}).get('max'))
             if not finite_positive(spend) or spend > budget or spend < minimum or (maximum and spend > maximum):
                 raise ValueError('Order cost does not meet exchange limits/precision')
-            if float(self._read_balance(client)['free'].get('USDT', 0)) < budget:
+            free_usdt = float(self._read_balance(client)['free'].get('USDT', 0))
+            if free_usdt < budget:
                 raise ValueError('Insufficient free USDT including the fee reserve')
-            intent, order = self._submit(client, symbol, 'BUY', cost=spend)
+            authorization = self._authorize(symbol, 'BUY', kind, budget, price, positions=positions,
+                                            cash=free_usdt, **gate_fields)
+            if not authorization.allowed:
+                return False
+            intent, order = self._submit(client, symbol, 'BUY', cost=spend, authorization=authorization,
+                                         intended_price=price, decision_id=decision_id)
             if order is None:
                 return False
             try:
@@ -947,11 +1320,26 @@ class TradingEngine:
             return False
         fee_rate = self.cfg['fee_pct'] / 100
         intent = order_id = None
+        kind = 'manual_exit' if completion is not None else 'exit'
+        positions = self._active_positions(mode)
         if mode == 'paper':
-            filled = consumed = tracked
-            fill_price = market_price * (1 - self.cfg['slippage_pct'] / 100)
-            gross = filled * fill_price
-            quote_fee = fee = gross * fee_rate
+            authorization = self._authorize(symbol, 'SELL', kind, tracked * market_price, market_price,
+                                            positions=positions, cash=None, quantity=tracked, reason=reason)
+            if not authorization.allowed:
+                return False
+            intent, order = self._submit(self.paper, symbol, 'SELL', quantity=tracked,
+                                         authorization=authorization, intended_price=market_price)
+            if order is None:
+                return False
+            try:
+                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                consumed = filled + base_fee
+                if consumed > tracked * (1 + 1e-10):
+                    raise ValueError('Simulated fill would consume untracked holdings')
+                order_id = self._order_id(order)
+            except Exception as exc:
+                self._ledger_failure(f'PAPER SELL {symbol}: {type(exc).__name__}; simulated fill accounting requires review')
+                return False
         else:
             if self.live_halted or self._durable_live_block():
                 self._halt_uncertain('Live exit blocked by unresolved order/account state')
@@ -984,7 +1372,12 @@ class TradingEngine:
                 self.risk_block = f'{symbol} remainder is below an exchange limit; retained in the ledger'
                 storage.audit('warning', self.risk_block)
                 return False
-            intent, order = self._submit(client, symbol, 'SELL', quantity=amount)
+            authorization = self._authorize(symbol, 'SELL', kind, amount * market_price, market_price,
+                                            positions=positions, cash=None, quantity=amount, reason=reason)
+            if not authorization.allowed:
+                return False
+            intent, order = self._submit(client, symbol, 'SELL', quantity=amount, authorization=authorization,
+                                         intended_price=market_price)
             if order is None:
                 return False
             try:
@@ -1037,21 +1430,25 @@ class TradingEngine:
             return False
 
     def _protect_positions(self, symbol: str, price: float):
+        """Stored stop/target check at an observed bid; no trailing update here."""
         for position in self._active_positions(self.mode):
             if position['symbol'] == symbol:
-                if self._is_dust(position, self._catalogue().get(symbol), price):
-                    continue
-                if price <= position['stop']:
-                    self._sell(position, price, 'Stored stop / trailing stop (software monitored)')
-                elif price >= position['target']:
-                    self._sell(position, price, 'Stored profit target (software monitored)')
+                verdict = decision.evaluate_exit(position, price, dust=self._is_dust(
+                    position, self._catalogue().get(symbol), price))
+                if verdict['action'] == 'exit':
+                    observability.event('decision.exit', symbol=symbol, reason=verdict['reason'], price=price,
+                                        stop=float(position['stop']), target=float(position['target']),
+                                        highest=float(position['highest']), source='protective')
+                    self._sell(position, price, verdict['reason'])
 
     def _mark_positions(self, symbol: str, price: float, atr: float, trend_broken: bool):
         for position in self._active_positions(self.mode):
             if position['symbol'] != symbol:
                 continue
-            highest = max(float(position['highest']), price)
-            stop = max(float(position['stop']), highest - 2.5 * atr) if finite_positive(atr) else float(position['stop'])
+            verdict = decision.evaluate_exit(position, price, atr=atr if finite_positive(atr) else None,
+                                             trend_broken=trend_broken,
+                                             dust=self._is_dust(position, self._catalogue().get(symbol), price))
+            highest, stop = verdict['highest'], verdict['stop']
             # An unchanged level needs no durable (fsync) write on every poll.
             if highest != float(position['highest']) or stop != float(position['stop']):
                 try:
@@ -1061,12 +1458,10 @@ class TradingEngine:
                 except Exception as exc:
                     self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
                     return
-            if (self._orders_allowed() and not self._is_dust(
-                    position, self._catalogue().get(symbol), price)):
-                if price <= stop:
-                    self._sell(position, price, 'Updated trailing stop (software monitored)')
-                elif trend_broken:
-                    self._sell(position, price, 'Completed-candle trend reversal')
+            if verdict['action'] == 'exit' and self._orders_allowed():
+                observability.event('decision.exit', symbol=symbol, reason=verdict['reason'], price=price,
+                                    stop=stop, target=float(position['target']), highest=highest, source='scan')
+                self._sell(position, price, verdict['reason'])
 
     def scan_once(self, allow_orders: bool = False, exited_symbols=None):
         # Acquiring this while holding the state lock makes config/start checks
@@ -1109,6 +1504,8 @@ class TradingEngine:
                 held = [p['symbol'] for p in self._active_positions(self.mode)]
                 symbols = list(dict.fromkeys(held + self.cfg['watchlist']))
                 storage.audit('warning', f'Market catalogue refresh unavailable: {type(exc).__name__}.')
+            if self.feed is not None:
+                self.feed.set_symbols(symbols)
             try:
                 tickers = self.data.tickers(symbols)
             except Exception:
@@ -1132,7 +1529,7 @@ class TradingEngine:
                                         'status': 'Pair unavailable, inactive, or not an allowed spot market'})
                     continue
                 try:
-                    ticker = tickers.get(symbol)
+                    ticker = self._quote(symbol, tickers.get(symbol), need_volume=True)
                     try:
                         mark, volume, spread = self._observe_ticker(symbol, ticker or self.data.ticker(symbol))
                     except ValueError:
@@ -1159,31 +1556,44 @@ class TradingEngine:
                     # HTF data gates entries only. Stops and trend exits above
                     # remain independent of a higher-timeframe API failure.
                     filters = self.cfg.get('market_filters', True)
+                    higher_error = higher_candle_ts = None
+                    regime_ok, market_ok = False, None
                     try:
                         higher = self.data.candles(symbol, higher_tf, limit=85)
                         regime_ok = regime_signal(higher)
+                        higher_candle_ts = int(higher.iloc[-1]['timestamp']) if len(higher) else None
                         market_ok = (self._market_regime(higher_tf, market_state)
                                      if filters and symbol != MARKET_SYMBOL else None)
-                        signal, reason, score = entry_signal(last, regime_ok=regime_ok, rapid=horizon == 'rapid',
-                                                             market_ok=market_ok, filters=filters)
                     except Exception as exc:
-                        regime_ok, signal, score = False, False, 0
-                        reason = f'Higher-timeframe data unavailable: {type(exc).__name__}'
-                    liquid = volume >= self.cfg['min_quote_volume']
-                    spread_ok = spread is not None and spread <= self.cfg['max_spread_pct']
-                    if not liquid:
-                        reason = 'Low or unknown 24h quote volume'
-                    elif not spread_ok:
-                        reason = 'Wide or unknown bid-ask spread'
+                        higher_error = type(exc).__name__
+                    # One pure, replayable decision per symbol; the record keeps
+                    # every check, the data timestamps and the abstention reason.
+                    decided_at = time.time()
+                    with self.lock:
+                        quote_ts = self.last_price_times.get(symbol)
+                    held_now = any(p['symbol'] == symbol for p in self._active_positions(self.mode))
+                    verdict = decision.evaluate_entry(
+                        symbol=symbol, last=last, regime_ok=regime_ok, market_ok=market_ok, rapid=horizon == 'rapid',
+                        filters=filters, price=price, volume=volume, spread_pct=spread, quote_age_s=self._price_age(symbol),
+                        quote_ts=quote_ts, cfg=self.cfg, now=decided_at, held=held_now,
+                        exited_this_candle=symbol in exited_symbols, higher_candle_ts=higher_candle_ts,
+                        higher_error=higher_error, signal_fn=entry_signal, price_ok_fn=entry_price_ok,
+                        quality_fn=setup_quality)
+                    self.decisions.add(verdict)
+                    self.metrics.incr(f'decision.{verdict.action}')
+                    if quote_ts is not None:
+                        self.metrics.observe('decision.quote_to_decision_ms', max(0.0, (decided_at - quote_ts) * 1000))
+                    observability.event('decision.entry', decision_id=verdict.decision_id, symbol=symbol,
+                                        action=verdict.action, status=verdict.status, score=verdict.score,
+                                        confidence=verdict.confidence, reasons=list(verdict.reasons),
+                                        signal_candle_ts_ms=verdict.inputs['signal_candle_ts_ms'],
+                                        quote_age_s=verdict.inputs['quote_age_s'], record=verdict.as_dict())
+                    reason, score, candidate = verdict.status, verdict.score, verdict.action == 'enter'
                     signal_close = float(last['close'])
-                    close_enough = entry_price_ok(price, signal_close, atr)
-                    if signal and not close_enough:
-                        reason = 'Market price moved too far from the completed signal candle'
-                    candidate = bool(signal and liquid and spread_ok and close_enough
-                                     and self._fresh(symbol) and symbol not in exited_symbols)
                     if candidate:
                         # Every candidate passed all checks; rank by setup quality, then turnover.
-                        candidates.append((setup_quality(last), volume, symbol, price, atr, int(last['timestamp']), signal_close))
+                        candidates.append((verdict.proposal['quality'], volume, symbol, price, atr, int(last['timestamp']),
+                                           signal_close, verdict.decision_id))
                     rsi = float(last['rsi'])
                     assessments.append({'symbol': symbol, 'price': price, 'bid': self.last_prices[symbol],
                                         'ask': self.last_asks.get(symbol), 'price_basis': 'ask' if symbol in self.last_asks else 'bid',
@@ -1198,7 +1608,9 @@ class TradingEngine:
                                         'regime': 'uptrend' if regime_ok else 'weak',
                                         'kind': 'MEME' if is_meme(symbol) else 'CORE' if symbol.split('/')[0] in ('BTC', 'ETH') else 'ALT',
                                         'status': reason, 'candidate': candidate, 'timeframe': primary_tf,
-                                        'price_age_seconds': self._price_age(symbol)})
+                                        'price_age_seconds': self._price_age(symbol),
+                                        'decision_id': verdict.decision_id, 'decision': verdict.action,
+                                        'confidence': verdict.confidence, 'reasons': list(verdict.reasons)})
                     successful_assessments += 1
                 except Exception as exc:
                     with self.lock:
@@ -1378,7 +1790,8 @@ class TradingEngine:
                 completion = {'scope': scope, 'record': record, 'payload': payload, 'request_id': request_id}
                 filled = self._buy(symbol, amount, refreshed, fraction, reason='Explicit manual spot buy',
                                    merge_dust=position is not None, completion=completion,
-                                   entry_candle=int(primary.iloc[-1]['timestamp']))
+                                   entry_candle=int(primary.iloc[-1]['timestamp']), kind='manual_entry',
+                                   spread=spread)
             else:
                 if not self._orders_allowed():
                     raise error('Order preparation was stopped.')
@@ -1389,6 +1802,11 @@ class TradingEngine:
                     raise error('Order outcome requires manual reconciliation. Live trading is halted; do not retry this order.')
                 if self.risk_block and 'rejected by the exchange:' in self.risk_block:
                     raise error(self.risk_block + '. No order was accepted; correct the account or order settings before creating a new request.')
+                with self.lock:
+                    last = self._last_authorization
+                if (last is not None and not last.allowed and last.request.symbol == symbol
+                        and last.request.side == side and time.monotonic() - last.issued_at <= risk.AUTHORIZATION_TTL_SECONDS):
+                    raise error('Blocked by risk controls: ' + last.reason + '. No order was sent.')
                 raise error('The order was not completed. Review risk status, exchange limits and trade history before trying again.')
             completed = json.loads(storage.get_meta(scope))
             if completed.get('status') != 'filled' or completed.get('fingerprint') != fingerprint:
@@ -1442,6 +1860,7 @@ class TradingEngine:
         for candidate in candidates:
             _score, _volume, symbol, observed_price, atr, candle = candidate[:6]
             signal_close = candidate[6] if len(candidate) > 6 else observed_price
+            decision_id = candidate[7] if len(candidate) > 7 else None
             if count >= 2 or not self._orders_allowed():
                 break
             positions = self._active_positions(self.mode)
@@ -1478,7 +1897,23 @@ class TradingEngine:
                     with self.lock:
                         self.risk_block = 'Aggregate protective-stop risk cap reached'
                 continue
-            if self._buy(symbol, budget, price, fraction, entry_candle=candle):
+            try:
+                filled = self._buy(symbol, budget, price, fraction, entry_candle=candle, kind='entry',
+                                   signal_close=signal_close, atr=atr, spread=spread, decision_id=decision_id)
+            except Exception as exc:
+                # The order path records its own outcome; anything escaping it is
+                # unexpected. Paper continues with the next candidate, live stops
+                # the pass so no further order is prepared in an unknown state.
+                storage.audit('error', f'{symbol}: entry failed unexpectedly ({type(exc).__name__}); '
+                                       + ('remaining candidates skipped this scan.' if self.mode == 'live'
+                                          else 'continuing with the next candidate.'))
+                observability.event('execution.entry_error', level='error', symbol=symbol,
+                                    error=type(exc).__name__, decision_id=decision_id)
+                self.risk.record_failure('entry_error')
+                if self.mode == 'live':
+                    break
+                continue
+            if filled:
                 count += 1
             if self.mode == 'live' and self.live_halted:
                 break
@@ -1609,7 +2044,11 @@ class TradingEngine:
                     'price_age_seconds': {symbol: round(self._price_age(symbol), 1)
                                           for symbol in self.last_price_times},
                     'metrics': dict(self.data.metrics.copy()),
-                    'unresolved_orders': len(unresolved), 'legacy_live_records': storage.legacy_live_records(),
+                    'risk': self.risk.status(),
+                    'feed': self.feed.status() if self.feed is not None else {
+                        'state': 'off', 'enabled': bool(self.cfg.get('streaming_quotes'))},
+                    'unresolved_orders': len(unresolved), 'unresolved_probe': list(self.unresolved_probe),
+                    'legacy_live_records': storage.legacy_live_records(),
                     'trades': storage.rows('SELECT * FROM trades WHERE exchange=? AND mode=? ORDER BY id DESC LIMIT 70',
                                            (exchange, mode)),
                     'audit': storage.rows('SELECT * FROM audit ORDER BY id DESC LIMIT 55')}

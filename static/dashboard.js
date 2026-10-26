@@ -39,6 +39,11 @@ function updateControls() {
   $('exchange').disabled = !idle || s.mode === 'live' || pending;
   // A stale connection must not disable the user's ability to retry a stop.
   $('stopBtn').disabled = busy.has('stop') || (online && !s.running && !s.stopping && !s.control_busy && !busy.has('order'));
+  // The kill switch is always available while the service answers; it never waits for an idle engine.
+  const engaged = !!s.risk?.kill_switch?.engaged;
+  $('killBtn').disabled = !online || busy.has('risk');
+  $('killBtn').textContent = engaged ? '⛔ Release kill switch…' : '⛔ Kill switch';
+  $('killBtn').classList.toggle('selected', engaged);
   $('confirmLive').disabled = !idle || pending || settingsReview || !$('eligible').checked || $('liveConfirm').value !== 'ENABLE LIVE TRADING';
   const orderReady = idle && !pending && !(s.mode === 'live' && (!s.connected || s.live_halted));
   $('orderBuy').disabled = !orderReady || (s.mode === 'live' && settingsReview);
@@ -64,14 +69,20 @@ async function action(name, path, data, message, configRefresh = false) {
     await refresh(configRefresh && accepted, true); busy.delete(name); updateControls();
   }
 }
+function feedNote(f) {
+  if (!f || f.state === 'off') return f && f.enabled ? ' Streaming quotes start with the bot.' : '';
+  if (f.state === 'live') return ' Streaming quotes live (' + f.quoted + ' of ' + f.symbols + ' pairs, ' + f.messages + ' updates' + (f.reconnects ? ', ' + f.reconnects + ' reconnects' : '') + ').';
+  return ' Streaming quotes ' + f.state + (f.last_error ? ' (' + f.last_error + ')' : '') + '; REST polling in use.';
+}
+
 function readSettings() {
-  return {exchange: $('exchange').value, watchlist: $('symbols').value.split(/[\s,;]+/).map(x => x.trim().toUpperCase()).filter(Boolean), auto_discovery: $('autoDiscovery').checked, market_filters: $('marketFilters').checked, time_horizon: $('timeHorizon').value, scan_seconds: +$('scanSeconds').value, protective_poll_seconds: +$('protectiveSeconds').value, risk_pct: +$('riskPct').value, max_position_pct: +$('maxPositionPct').value, max_exposure_pct: +$('maxExposurePct').value, max_portfolio_risk_pct: +$('maxPortfolioRisk').value, data_max_age_seconds: +$('dataMaxAge').value, max_positions: +$('maxPositions').value, max_meme_position_pct: +$('maxMemePosition').value, max_meme_exposure_pct: +$('maxMemeExposure').value, daily_loss_limit_pct: +$('dailyLossPct').value, min_quote_volume: +$('minVolume').value};
+  return {exchange: $('exchange').value, watchlist: $('symbols').value.split(/[\s,;]+/).map(x => x.trim().toUpperCase()).filter(Boolean), auto_discovery: $('autoDiscovery').checked, market_filters: $('marketFilters').checked, streaming_quotes: $('streamingQuotes').checked, time_horizon: $('timeHorizon').value, scan_seconds: +$('scanSeconds').value, protective_poll_seconds: +$('protectiveSeconds').value, risk_pct: +$('riskPct').value, max_position_pct: +$('maxPositionPct').value, max_exposure_pct: +$('maxExposurePct').value, max_portfolio_risk_pct: +$('maxPortfolioRisk').value, data_max_age_seconds: +$('dataMaxAge').value, max_positions: +$('maxPositions').value, max_meme_position_pct: +$('maxMemePosition').value, max_meme_exposure_pct: +$('maxMemeExposure').value, daily_loss_limit_pct: +$('dailyLossPct').value, min_quote_volume: +$('minVolume').value, max_order_notional_usdt: +$('maxOrderNotional').value, max_asset_notional_usdt: +$('maxAssetNotional').value, max_orders_per_minute: +$('maxOrdersPerMinute').value, daily_realized_loss_limit_pct: +$('dailyRealizedLoss').value, max_drawdown_pct: +$('maxDrawdown').value};
 }
 function syncExchangeGuide() { $('apiGuide').href = $('exchange').value === 'mexc' ? 'https://www.mexc.com/user/openapi' : 'https://www.kraken.com/u/security/api'; }
 function fillSettings(c) {
-  const fields = {exchange: 'exchange', time_horizon: 'timeHorizon', scan_seconds: 'scanSeconds', protective_poll_seconds: 'protectiveSeconds', risk_pct: 'riskPct', max_position_pct: 'maxPositionPct', max_exposure_pct: 'maxExposurePct', max_portfolio_risk_pct: 'maxPortfolioRisk', data_max_age_seconds: 'dataMaxAge', max_positions: 'maxPositions', max_meme_position_pct: 'maxMemePosition', max_meme_exposure_pct: 'maxMemeExposure', daily_loss_limit_pct: 'dailyLossPct', min_quote_volume: 'minVolume'};
+  const fields = {exchange: 'exchange', time_horizon: 'timeHorizon', scan_seconds: 'scanSeconds', protective_poll_seconds: 'protectiveSeconds', risk_pct: 'riskPct', max_position_pct: 'maxPositionPct', max_exposure_pct: 'maxExposurePct', max_portfolio_risk_pct: 'maxPortfolioRisk', data_max_age_seconds: 'dataMaxAge', max_positions: 'maxPositions', max_meme_position_pct: 'maxMemePosition', max_meme_exposure_pct: 'maxMemeExposure', daily_loss_limit_pct: 'dailyLossPct', min_quote_volume: 'minVolume', max_order_notional_usdt: 'maxOrderNotional', max_asset_notional_usdt: 'maxAssetNotional', max_orders_per_minute: 'maxOrdersPerMinute', daily_realized_loss_limit_pct: 'dailyRealizedLoss', max_drawdown_pct: 'maxDrawdown'};
   for (const [key, id] of Object.entries(fields)) $(id).value = c[key];
-  $('symbols').value = c.watchlist.join(', '); $('autoDiscovery').checked = c.auto_discovery; $('marketFilters').checked = c.market_filters !== false; syncExchangeGuide();
+  $('symbols').value = c.watchlist.join(', '); $('autoDiscovery').checked = c.auto_discovery; $('marketFilters').checked = c.market_filters !== false; $('streamingQuotes').checked = c.streaming_quotes === true; syncExchangeGuide();
 }
 function render(s) {
   $('settingsRecovery').hidden = !s.settings_health?.review_required;
@@ -88,12 +99,12 @@ function render(s) {
   $('monitorStatus').textContent = !s.running ? 'Automatic stops are inactive while the bot is stopped.' : !s.positions.length ? 'No tracked positions need exit monitoring.'
     : 'Exit quote check target: every ' + (s.config.protective_poll_seconds || 5) + ' seconds. '
       + (s.last_successful_monitor ? 'Latest successful quote: ' + new Date(s.last_successful_monitor).toLocaleTimeString() + '. ' : 'Waiting for a successful held-position quote. ')
-      + 'Network requests and exchange limits can delay checks.';
+      + 'Network requests and exchange limits can delay checks.' + feedNote(s.feed);
   $('connectStatus').textContent = s.connected ? '● Verified (' + s.credential_source + ')' : s.credentials_stored ? '◌ Saved keys · not yet verified' : '○ Not connected';
   $('connectStatus').className = 'sub ' + (s.connected ? 'green' : '');
   const unresolved = Array.isArray(s.unresolved_orders) ? s.unresolved_orders.length : Number(s.unresolved_orders || 0);
   const legacy = Array.isArray(s.legacy_live_records) ? s.legacy_live_records.length > 0 : !!s.legacy_live_records;
-  const warnings = [s.live_halted ? 'Live trading halted. Review exchange orders and holdings before enabling live trading. Paper simulation remains available.' : '', s.valuation_stale ? 'Portfolio valuation uses stale or unavailable quotes; current exposure may differ.' : '', s.positions.length && !s.running ? 'Automatic exits are inactive while the bot is stopped. Start the bot to monitor software stops.' : '', s.monitor_error ? 'Exit quote monitoring reported a problem; review activity and exchange holdings.' : '', s.risk_block ? String(s.risk_block) : '', unresolved ? unresolved + ' unresolved order(s) require reconciliation.' : '', legacy ? 'Previous live records need manual exchange reconciliation.' : '', s.error ? 'Latest scan reported a problem; review activity.' : ''].filter(Boolean);
+  const warnings = [s.risk?.kill_switch?.engaged ? 'KILL SWITCH ENGAGED: new orders are blocked' + (s.risk.kill_switch.allow_exits ? '; protective exits continue.' : ' and exits are blocked too.') + ' Release it from the kill switch button when the situation is understood.' : '', s.risk?.drawdown_stop ? 'Drawdown stop latched: new entries are blocked until it is cleared with the phrase RESUME TRADING.' : '', s.live_halted ? 'Live trading halted. Review exchange orders and holdings before enabling live trading. Paper simulation remains available.' : '', s.valuation_stale ? 'Portfolio valuation uses stale or unavailable quotes; current exposure may differ.' : '', s.positions.length && !s.running ? 'Automatic exits are inactive while the bot is stopped. Start the bot to monitor software stops.' : '', s.monitor_error ? 'Exit quote monitoring reported a problem; review activity and exchange holdings.' : '', s.risk_block ? String(s.risk_block) : '', unresolved ? unresolved + ' unresolved order(s) require reconciliation.' : '', legacy ? 'Previous live records need manual exchange reconciliation.' : '', s.error ? 'Latest scan reported a problem; review activity.' : ''].filter(Boolean);
   $('riskStatus').hidden = warnings.length === 0; $('riskStatus').textContent = warnings.join(' ');
   $('modeNotice').textContent = s.mode === 'paper' ? 'PAPER simulation enabled. No real buy or sell orders will be sent.' + (s.live_halted ? ' Live trading remains halted pending manual reconciliation.' : '') : s.live_halted ? 'LIVE HALTED: Inspect exchange orders and holdings manually before enabling live trading.' : 'LIVE mode is armed. Start bot submits REAL SPOT orders automatically. Manual orders require a separate confirmation. The bot must be running for software stops.';
   $('orderMode').textContent = s.mode === 'live' ? 'REAL MONEY · live armed' : 'PAPER · simulated orders';
@@ -220,6 +231,19 @@ $('confirmOrder').onclick = () => {
 $('orderModal').addEventListener('keydown', event => trapModal(event, $('orderModal'), closeOrderModal));
 $('scanBtn').onclick = () => action('scan', '/scan'); $('startBtn').onclick = () => action('start', '/start'); $('stopBtn').onclick = () => action('stop', '/stop', undefined, 'Stop requested. Check running status before closing the program.');
 $('saveBtn').onclick = () => action('config', '/config', {settings: readSettings()}, 'Settings saved.', true);
+$('killBtn').onclick = () => {
+  const engaged = !!state?.risk?.kill_switch?.engaged;
+  if (!engaged) {
+    const choice = prompt('Engage the kill switch now? New orders stop immediately, even while the bot runs.\n\nPress OK to keep protective exits (stops and targets) running, or type ALL to block exits as well. Cancel aborts.', '');
+    if (choice === null) return;
+    const allowExits = choice.trim().toUpperCase() !== 'ALL';
+    action('risk', '/risk', {action: 'engage', allow_exits: allowExits, reason: 'Dashboard kill switch'}, allowExits ? 'Kill switch engaged. New orders are blocked; exits continue.' : 'Kill switch engaged. All orders, including exits, are blocked.');
+    return;
+  }
+  const phrase = prompt('Release the kill switch? Type exactly: RESUME TRADING');
+  if (phrase === null) return;
+  action('risk', '/risk', {action: 'release', confirmation: phrase}, 'Kill switch released.');
+};
 $('connectBtn').onclick = async () => {
   if (busy.has('connect')) return;
   const key = $('apiKey').value.trim(), secret = $('apiSecret').value.trim();

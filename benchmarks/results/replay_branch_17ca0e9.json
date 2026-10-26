@@ -1,0 +1,11 @@
+{
+  "symbols": 60,
+  "comparisons": 240,
+  "mismatches": [],
+  "actions": {
+    "enter": 6,
+    "abstain": 54
+  },
+  "elapsed_s": 0.532,
+  "decision_version": "entry-v1"
+}

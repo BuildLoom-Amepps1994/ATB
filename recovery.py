@@ -142,8 +142,10 @@ def _read_report(folder: Path) -> dict:
                 return report
             # Never print raw free-text reasons, arbitrary extra fields, API
             # account fingerprints, audit messages, settings or exchange order IDs.
-            report['unresolved_order_count'] = connection.execute("SELECT COUNT(*) FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled')").fetchone()[0]
-            orders = connection.execute("SELECT intent_id,created_at,exchange,symbol,side,status FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled') ORDER BY created_at LIMIT 1000")
+            # Paper intents (schema 3+) have no exchange-side effect and never block live trading.
+            live_only = " AND mode='live'" if 'mode' in columns else ''
+            report['unresolved_order_count'] = connection.execute("SELECT COUNT(*) FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled')" + live_only).fetchone()[0]
+            orders = connection.execute("SELECT intent_id,created_at,exchange,symbol,side,status FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled')" + live_only + " ORDER BY created_at LIMIT 1000")
             for row in orders:
                 report['unresolved_orders'].append({
                     'intent_id': row['intent_id'] if isinstance(row['intent_id'], str) and re.fullmatch('[0-9a-f]{32}', row['intent_id']) else None,
@@ -196,8 +198,10 @@ def clear_halt(folder: Path | None, exchange: str, confirmation: str) -> dict:
                 raise ValueError('The database schema is not one this tool can update.')
             timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
             placeholders = ','.join('?' * len(RESOLVED))
+            journal_columns = {row[1] for row in connection.execute('PRAGMA table_info(order_journal)')}
+            live_only = " AND mode='live'" if 'mode' in journal_columns else ''
             reconciled = connection.execute(
-                f'UPDATE order_journal SET status=?,updated_at=? WHERE exchange=? AND status NOT IN ({placeholders})',
+                f'UPDATE order_journal SET status=?,updated_at=? WHERE exchange=? AND status NOT IN ({placeholders})' + live_only,
                 ('reconciled', timestamp, exchange, *RESOLVED)).rowcount
             removed = connection.execute('DELETE FROM meta WHERE key=? AND value=?', ('live_halt.' + exchange, '1')).rowcount
             connection.execute('INSERT INTO audit(created_at,level,message) VALUES (?,?,?)',

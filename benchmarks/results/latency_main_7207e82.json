@@ -1,0 +1,104 @@
+{
+  "tree": "(checkout root)",
+  "revision": "7207e82",
+  "python": "3.13.17",
+  "has_new_modules": false,
+  "repeat": 40,
+  "decision_cpu": {
+    "indicators_plus_rule": {
+      "count": 40,
+      "p50_ms": 1.708,
+      "p95_ms": 1.778,
+      "p99_ms": 1.79,
+      "max_ms": 1.79,
+      "mean_ms": 1.705
+    },
+    "decision_record": "not available on this tree"
+  },
+  "scan_warm": {
+    "symbols": 8,
+    "rtt_ms": 150.0,
+    "scan": {
+      "count": 10,
+      "p50_ms": 169.269,
+      "p95_ms": 172.183,
+      "p99_ms": 172.183,
+      "max_ms": 172.183,
+      "mean_ms": 169.514
+    },
+    "requests_per_scan": 1.0,
+    "quote_to_decision_per_symbol": "not available on this tree"
+  },
+  "monitor_rest": [
+    {
+      "positions": 1,
+      "rtt_ms": 0.0,
+      "source": "rest",
+      "requests_per_tick": 1.0,
+      "count": 40,
+      "p50_ms": 1.565,
+      "p95_ms": 1.77,
+      "p99_ms": 3.593,
+      "max_ms": 3.593,
+      "mean_ms": 1.618
+    },
+    {
+      "positions": 5,
+      "rtt_ms": 0.0,
+      "source": "rest",
+      "requests_per_tick": 1.0,
+      "count": 40,
+      "p50_ms": 3.07,
+      "p95_ms": 3.312,
+      "p99_ms": 4.804,
+      "max_ms": 4.804,
+      "mean_ms": 3.111
+    },
+    {
+      "positions": 1,
+      "rtt_ms": 150.0,
+      "source": "rest",
+      "requests_per_tick": 1.0,
+      "count": 20,
+      "p50_ms": 152.234,
+      "p95_ms": 152.532,
+      "p99_ms": 155.029,
+      "max_ms": 155.029,
+      "mean_ms": 152.379
+    },
+    {
+      "positions": 5,
+      "rtt_ms": 150.0,
+      "source": "rest",
+      "requests_per_tick": 1.0,
+      "count": 20,
+      "p50_ms": 154.012,
+      "p95_ms": 154.979,
+      "p99_ms": 158.496,
+      "max_ms": 158.496,
+      "mean_ms": 154.27
+    }
+  ],
+  "monitor_stream": "not available on this tree",
+  "feed_ingest": {
+    "note": "not available on this tree"
+  },
+  "paper_order": {
+    "buy": {
+      "count": 40,
+      "p50_ms": 3.024,
+      "p95_ms": 3.368,
+      "p99_ms": 3.507,
+      "max_ms": 3.507,
+      "mean_ms": 3.075
+    },
+    "sell": {
+      "count": 40,
+      "p50_ms": 2.769,
+      "p95_ms": 2.912,
+      "p99_ms": 3.86,
+      "max_ms": 3.86,
+      "mean_ms": 2.786
+    }
+  }
+}

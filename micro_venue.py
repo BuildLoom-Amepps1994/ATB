@@ -115,6 +115,8 @@ LATE_FILL_FIRST_SHARE = Decimal('0.5')
 # catalogue publishes none; the venue checks a buy against the same step.
 SIZING_FALLBACK_COST_STEP = Decimal('0.00000001')
 NEEDS_DEPTH = 'paper venue needs a depth book'
+# A top-of-book quote has one level of known size and nothing known behind it.
+TOP_OF_BOOK_SOURCES = ('ticker', 'stream_ticker')
 # venue_rules.normalize records this issue when the catalogue has no such market.
 _NOT_LISTED = 'market is not in the catalogue'
 _FEE_KINDS = ('quote', 'base')
@@ -222,12 +224,17 @@ def _levels(book, name: str) -> tuple:
     return tuple(parsed)
 
 
-def _read_book(book, side: str, *, symbol: str, exchange: str) -> tuple[tuple, tuple]:
+def _read_book(book, side: str, *, symbol: str, exchange: str, amount: Decimal | None = None) -> tuple[tuple, tuple]:
     """Bids and asks of a usable book of ``symbol`` on ``exchange`` for ``side``.
 
     Anything else is a definite rejection. A book that does not name this
     symbol and exchange (a mix-up, or a stand-in without the fields) cannot be
     shown to price this order, so it is refused rather than filled against.
+
+    A buy always needs a depth book. A sell (the risk-reducing side) may also
+    fill against a top-of-book quote when its one level's stated size covers
+    the whole ``amount``: that level is real, and nothing behind it is used.
+    A quote too small for the sale is refused, never priced by a guess.
     """
     if book is None:
         raise ccxt.InvalidOrder(NEEDS_DEPTH)
@@ -242,7 +249,13 @@ def _read_book(book, side: str, *, symbol: str, exchange: str) -> tuple[tuple, t
     if bids[0][0] >= asks[0][0]:
         raise ccxt.InvalidOrder('paper venue book is crossed or locked')
     walked = asks if side == 'buy' else bids
-    if getattr(book, 'depth_known', None) is not True or any(quantity is None for _, quantity in walked):
+    if getattr(book, 'depth_known', None) is not True:
+        top_of_book = (side == 'sell' and getattr(book, 'source', None) in TOP_OF_BOOK_SOURCES
+                       and isinstance(amount, Decimal) and len(bids) == 1 and bids[0][1] is not None
+                       and bids[0][1] >= amount)
+        if not top_of_book:
+            raise ccxt.InvalidOrder(NEEDS_DEPTH)
+    elif any(quantity is None for _, quantity in walked):
         raise ccxt.InvalidOrder(NEEDS_DEPTH)
     return bids, asks
 
@@ -465,7 +478,8 @@ class MicroPaperVenue:
         if not ok:
             raise ccxt.InvalidOrder(f'{code}: {detail}')
         book = params.get('book')
-        bids, asks = _read_book(book, side, symbol=symbol, exchange=self.exchange_name)
+        bids, asks = _read_book(book, side, symbol=symbol, exchange=self.exchange_name,
+                                amount=requested if side == 'sell' else None)
         adverse_bps = self._number(params.get('adverse_bps') if params.get('adverse_bps') is not None else 0,
                                    'adverse_bps', allow_zero=True)
         if adverse_bps >= money.BPS:
@@ -537,6 +551,8 @@ class MicroPaperVenue:
                                                     ('partial_next', injected.partial is not None),
                                                     ('late_fill_next', injected.late_fill is not None)) if active]
         info = {'simulated': True, 'liquidity': 'taker', 'book_generation': generation, 'book_sequence': sequence,
+                'book_source': getattr(book, 'source', None),
+                'depth_known': getattr(book, 'depth_known', None) is True,
                 'fee_rate': money.text(fee_rate), 'fee_source': fee_source, 'fee_basis': fee_kind,
                 'adverse_bps': money.text(adverse_bps), 'levels_used': fill.levels_used,
                 'depth_exhausted': full.exhausted, 'best_bid': money.text(bids[0][0]),

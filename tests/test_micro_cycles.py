@@ -572,6 +572,8 @@ def test_a_stop_loss_exit_needs_no_profit_no_entry_signal_and_no_depth_book(worl
     assert closed['last_exit_trigger'] in ('stop_loss', 'regime_shift')
     assert Decimal(closed['realized_net']) < 0 and closed['realized_status'] == 'confirmed'
     assert any(call[0] == 'fetch_bids_asks' for call in w.exchange.calls)        # sold on a top-of-book quote
+    sale = [r for r in w.venue().records('ETH/USDT') if r['side'] == 'sell'][-1]
+    assert sale['info']['book_source'] == 'ticker' and sale['info']['depth_known'] is False
     decision = next(r for r in w.engine.micro.status()['pairs'] if r['symbol'] == 'ETH/USDT').get('decision') or {}
     assert decision.get('action') != 'enter'
     assert_ledger_consistent(w)

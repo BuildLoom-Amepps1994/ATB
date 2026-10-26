@@ -41,6 +41,7 @@ class Book:
     symbol: str | None = SYMBOL
     exchange: str | None = 'mexc'
     depth_known: bool = True
+    source: str = 'rest_depth'
     generation: int = 7
     venue_sequence: int | None = 900001
 
@@ -344,6 +345,18 @@ REJECTIONS = [
      'needs a depth book'),
     ('unknown-level-quantity', None, _buy(D('5'), book=book(asks=((D('2500'), D('0.004')), (D('2501'), None)))),
      'needs a depth book'),
+    ('ticker-buy-even-with-sizes', None,
+     _buy(D('5'), book=book(bids=((D('2499'), D('1')),), asks=((D('2500'), D('1')),), depth_known=False,
+                            source='ticker')), 'needs a depth book'),
+    ('ticker-sell-larger-than-its-level', None,
+     _sell(D('0.002'), book=book(bids=((D('2499'), D('0.001')),), asks=((D('2500'), D('1')),), depth_known=False,
+                                 source='ticker')), 'needs a depth book'),
+    ('ticker-sell-without-a-size', None,
+     _sell(D('0.001'), book=book(bids=((D('2499'), None),), asks=((D('2500'), None),), depth_known=False,
+                                 source='ticker')), 'needs a depth book'),
+    ('unlabeled-shallow-sell', None,
+     _sell(D('0.001'), book=book(bids=((D('2499'), D('1')),), asks=((D('2500'), D('1')),), depth_known=False,
+                                 source='fixture')), 'needs a depth book'),
     ('unsorted-book', None, _sell(D('0.001'), book=book(bids=tuple(reversed(BIDS)))), 'not sorted'),
     ('other-symbol-book', None,
      _buy(D('25.00'), book=book(symbol='BTC/USDT', asks=((D('60000'), D('1')),), bids=((D('59999'), D('1')),))),
@@ -711,3 +724,17 @@ def test_records_can_be_read_for_one_pair_from_a_point_in_time():
     assert [r['client_order_id'] for r in v.records(SYMBOL, since_ms=1_500_000)] == [second['clientOrderId']]
     assert v.records(SYMBOL, since_ms=2_000_000)[0]['timestamp_ms'] == 2_000_000      # the bound is inclusive
     assert v.records('BTC/USDT', since_ms=0) == [] and v.records(since_ms=3_000_000) == []
+
+
+def test_a_sell_covered_by_the_top_of_book_quote_fills_there_and_says_so():
+    """A risk-reducing sale may use a ticker's one real level when it covers the whole quantity."""
+    v = venue()
+    quote = book(bids=((D('2499.00'), D('0.0100')),), asks=((D('2500.00'), D('0.0100')),), depth_known=False,
+                 source='stream_ticker')
+    order = v.create_order(SYMBOL, 'market', 'sell', D('0.0040'), None, params(book=quote, adverse_bps=D('3')))
+    assert order['status'] == 'closed' and exact(order, 'filled') == D('0.0040')
+    assert exact(order, 'average') == D('2499.00') * (1 - D('0.0003'))
+    assert order['info']['book_source'] == 'stream_ticker' and order['info']['depth_known'] is False
+    assert order['info']['levels_used'] == 1
+    depth = v.create_order(SYMBOL, 'market', 'sell', D('0.0040'), None, params())
+    assert depth['info']['book_source'] == 'rest_depth' and depth['info']['depth_known'] is True

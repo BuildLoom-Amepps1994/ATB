@@ -1,6 +1,6 @@
 {
  "protocol": {
-  "version": "micro-research-v1",
+  "version": "micro-research-v2",
   "frozen_before_results": true,
   "splits": {
    "development": 0.6,
@@ -10,7 +10,14 @@
   "embargo_bars": 120,
   "warmup_bars_1m": 120,
   "decision": "every completed 1m bar; execution at the next bar open book",
-  "exit_path": "low, then high, then close of each held bar (pessimistic)",
+  "exit_path": "low (loss, time and regime exits), then high (profit exits), then close of each held bar",
+  "profit_exit_fill": "the lowest price in the bar range at which a profit exit fires, never the high; the range is searched whenever the high is in profit, since the protection band lies below a hold gap",
+  "stress_fee": "the multiple applies to the modeled fee, max(configured, public taker), in decimals",
+  "open_at_end": "counted at its executable estimate in net_marked, which the verdict reads",
+  "min_split_bars": 60,
+  "buy_and_hold_exit_stress_bps": 80,
+  "random_pick_multiplier": 4,
+  "book_model": "modeled from each bar at the market tick: spread_bps, level_quote and levels per series",
   "orders": "market only, taker fee both legs, quote-billed",
   "settings": {
    "micro_budget_usdt": 25,
@@ -56,12 +63,40 @@
   "random_baseline_budget": 25,
   "verdict_rule": "DEMONSTRATED only on real holdout data: net > 0, net > random mean + 2 sd, doubled-stress net > 0. Synthetic fixtures: MECHANICS ONLY."
  },
- "protocol_sha256": "cfe1de4a7da5fa9d552877cb091bcc321e572877d76ee338874222b68055da76",
+ "protocol_sha256": "5db2787e1cb75662aa7b66b9757a346a2f807e8643ec91477a36a529d255bc50",
  "feature_version": "micro-features-v1",
  "decision_version": "micro-entry-v1",
+ "params": {
+  "target_net_bps": 20.0,
+  "max_loss_bps": 120.0,
+  "max_hold_s": 1800.0,
+  "uncertainty_floor_bps": 5.0,
+  "max_spread_bps": 20.0,
+  "max_vol_bps": 60.0,
+  "min_efficiency_trend": 0.35,
+  "max_efficiency_range": 0.25,
+  "edge_ratio": 0.6
+ },
+ "code": {
+  "files": [
+   "micro.py",
+   "micro_strategy.py",
+   "micro_economics.py",
+   "micro_book.py",
+   "venue_rules.py",
+   "money.py",
+   "strategy.py",
+   "research/micro_research.py",
+   "research/micro_fixtures.py"
+  ],
+  "files_sha256": "f0bf6c28d39ffc96bdd43c99ecbc210243ab014b10337dd62c0bedf5de14b94d",
+  "commit": "20c70670a3d5fecf7caa8adceadc4d8bdb2ba875",
+  "dirty": false
+ },
  "series": [
   {
    "symbol": "ETH/USDT",
+   "venue": "mexc",
    "bars": 2880,
    "splits": {
     "development": [
@@ -77,27 +112,36 @@
      2880
     ]
    },
-   "feature_seconds": 7.36,
+   "book_model": {
+    "spread_bps": 2.0,
+    "level_quote": 400.0,
+    "levels": 20,
+    "tick": 0.01,
+    "from": "each bar (no recorded depth)"
+   },
+   "feature_seconds": 6.87,
    "by_budget": {
     "10": {
      "development": {
       "strategy": {
        "baseline": {
         "closed_cycles": 76,
-        "net": 0.577294,
-        "gross_pnl_before_fees": 2.09787,
-        "fees": 1.520576,
-        "net_pct_of_budget": 5.7729,
-        "average_net": 0.007596,
+        "net": 0.382489,
+        "net_marked": 0.382489,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": 1.90287,
+        "fees": 1.520381,
+        "net_pct_of_budget": 3.8249,
+        "average_net": 0.005033,
         "sd_net": 1e-06,
         "wins": 76,
         "losses": 0,
-        "worst": 0.007596,
-        "best": 0.007597,
+        "worst": 0.005032,
+        "best": 0.005034,
         "max_drawdown": 0.0,
         "profit_factor": null,
-        "fees_share_of_gross_gains": 0.7248,
-        "turnover": 1520.5756,
+        "fees_share_of_gross_gains": 0.799,
+        "turnover": 1520.3806,
         "exposure_pct_of_time": 36.71,
         "average_hold_min": 8.0,
         "triggers": {
@@ -105,7 +149,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": 0.574982,
+        "cash_change": 0.380178,
         "residual_at_end": {
          "base": 9.269510581431673e-07,
          "basis": 0.002311452785642001,
@@ -116,6 +160,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -145,6 +191,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -177,40 +225,41 @@
        "buy_and_hold": -0.045656,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
-        "closed_cycles": 150,
-        "net": -3.717155,
-        "gross_pnl_before_fees": -0.720875,
-        "fees": 2.99628,
-        "net_pct_of_budget": -37.1716,
-        "average_net": -0.024781,
-        "sd_net": 0.055585,
-        "wins": 76,
-        "losses": 74,
-        "worst": -0.089553,
-        "best": 0.030432,
-        "max_drawdown": 3.762243,
-        "profit_factor": 0.3788,
-        "fees_share_of_gross_gains": 0.7909,
-        "turnover": 2996.2787,
-        "exposure_pct_of_time": 68.84,
-        "average_hold_min": 7.6,
+        "closed_cycles": 152,
+        "net": 0.763632,
+        "net_marked": 0.754896,
+        "open_mark": -0.008736,
+        "gross_pnl_before_fees": 3.804396,
+        "fees": 3.040764,
+        "net_pct_of_budget": 7.6363,
+        "average_net": 0.005024,
+        "sd_net": 5e-06,
+        "wins": 152,
+        "losses": 0,
+        "worst": 0.005014,
+        "best": 0.005032,
+        "max_drawdown": 0.0,
+        "profit_factor": null,
+        "fees_share_of_gross_gains": 0.7993,
+        "turnover": 3040.7635,
+        "exposure_pct_of_time": 73.61,
+        "average_hold_min": 8.02,
         "triggers": {
-         "take_profit": 74,
-         "profit_protection": 2,
-         "stop_loss": 74
+         "profit_protection": 152
         },
-        "stop_outs": 74,
+        "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": -13.717584,
+        "cash_change": -9.23725,
         "residual_at_end": null,
         "open_at_end": {
-         "basis": 10.000429451660755,
-         "estimated_net_proceeds": 10.02468546036945
+         "basis": 10.000881540686601,
+         "estimated_net_proceeds": 9.99214590706488
         }
        },
        "atb_rapid_unchanged": "see 25 USDT row"
@@ -220,20 +269,22 @@
       "strategy": {
        "baseline": {
         "closed_cycles": 21,
-        "net": 0.159515,
-        "gross_pnl_before_fees": 0.579675,
-        "fees": 0.420159,
-        "net_pct_of_budget": 1.5952,
-        "average_net": 0.007596,
+        "net": 0.105688,
+        "net_marked": 0.106723,
+        "open_mark": 0.001035,
+        "gross_pnl_before_fees": 0.525793,
+        "fees": 0.420105,
+        "net_pct_of_budget": 1.0569,
+        "average_net": 0.005033,
         "sd_net": 1e-06,
         "wins": 21,
         "losses": 0,
-        "worst": 0.007596,
-        "best": 0.007597,
+        "worst": 0.005032,
+        "best": 0.005034,
         "max_drawdown": 0.0,
         "profit_factor": null,
-        "fees_share_of_gross_gains": 0.7248,
-        "turnover": 420.1591,
+        "fees_share_of_gross_gains": 0.799,
+        "turnover": 420.1052,
         "exposure_pct_of_time": 38.89,
         "average_hold_min": 8.0,
         "triggers": {
@@ -241,7 +292,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": -9.841048,
+        "cash_change": -9.894875,
         "residual_at_end": null,
         "open_at_end": {
          "basis": 10.000563069632134,
@@ -251,6 +302,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -280,6 +333,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -312,26 +367,29 @@
        "buy_and_hold": -0.063352,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 43,
-        "net": -1.775195,
-        "gross_pnl_before_fees": -0.916973,
-        "fees": 0.858222,
-        "net_pct_of_budget": -17.7519,
-        "average_net": -0.041284,
-        "sd_net": 0.048304,
+        "net": -1.828135,
+        "net_marked": -1.835128,
+        "open_mark": -0.006993,
+        "gross_pnl_before_fees": -0.969965,
+        "fees": 0.858169,
+        "net_pct_of_budget": -18.2813,
+        "average_net": -0.042515,
+        "sd_net": 0.047029,
         "wins": 21,
         "losses": 22,
         "worst": -0.096287,
-        "best": 0.007564,
-        "max_drawdown": 1.775195,
-        "profit_factor": 0.0821,
-        "fees_share_of_gross_gains": 1.4824,
-        "turnover": 858.2219,
+        "best": 0.005043,
+        "max_drawdown": 1.828135,
+        "profit_factor": 0.0547,
+        "fees_share_of_gross_gains": 1.6317,
+        "turnover": 858.1689,
         "exposure_pct_of_time": 74.07,
         "average_hold_min": 7.44,
         "triggers": {
@@ -340,7 +398,7 @@
         },
         "stop_outs": 22,
         "near_break_even_exits": 0,
-        "cash_change": -11.776304,
+        "cash_change": -11.829244,
         "residual_at_end": null,
         "open_at_end": {
          "basis": 10.001109086528881,
@@ -354,20 +412,22 @@
       "strategy": {
        "baseline": {
         "closed_cycles": 21,
-        "net": 0.159515,
-        "gross_pnl_before_fees": 0.579675,
-        "fees": 0.420159,
-        "net_pct_of_budget": 1.5952,
-        "average_net": 0.007596,
+        "net": 0.105688,
+        "net_marked": 0.105688,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": 0.525793,
+        "fees": 0.420105,
+        "net_pct_of_budget": 1.0569,
+        "average_net": 0.005033,
         "sd_net": 1e-06,
         "wins": 21,
         "losses": 0,
-        "worst": 0.007596,
-        "best": 0.007597,
+        "worst": 0.005032,
+        "best": 0.005034,
         "max_drawdown": 0.0,
         "profit_factor": null,
-        "fees_share_of_gross_gains": 0.7248,
-        "turnover": 420.1591,
+        "fees_share_of_gross_gains": 0.799,
+        "turnover": 420.1052,
         "exposure_pct_of_time": 38.89,
         "average_hold_min": 8.0,
         "triggers": {
@@ -375,7 +435,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": 0.158942,
+        "cash_change": 0.105115,
         "residual_at_end": {
          "base": 2.2981542396061201e-07,
          "basis": 0.000573069632135001,
@@ -386,6 +446,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -415,6 +477,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -447,40 +511,42 @@
        "buy_and_hold": 0.025222,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 43,
-        "net": -1.045508,
-        "gross_pnl_before_fees": -0.186555,
-        "fees": 0.858954,
-        "net_pct_of_budget": -10.4551,
-        "average_net": -0.024314,
-        "sd_net": 0.055724,
+        "net": -1.720383,
+        "net_marked": -1.71957,
+        "open_mark": 0.000812,
+        "gross_pnl_before_fees": -0.862106,
+        "fees": 0.858277,
+        "net_pct_of_budget": -17.2038,
+        "average_net": -0.040009,
+        "sd_net": 0.046939,
         "wins": 22,
         "losses": 21,
-        "worst": -0.080747,
-        "best": 0.030432,
-        "max_drawdown": 1.083441,
-        "profit_factor": 0.3821,
-        "fees_share_of_gross_gains": 0.7901,
-        "turnover": 858.9533,
-        "exposure_pct_of_time": 74.54,
-        "average_hold_min": 7.49,
+        "worst": -0.096303,
+        "best": 0.009988,
+        "max_drawdown": 1.730447,
+        "profit_factor": 0.0631,
+        "fees_share_of_gross_gains": 1.5439,
+        "turnover": 858.2764,
+        "exposure_pct_of_time": 73.84,
+        "average_hold_min": 7.42,
         "triggers": {
-         "profit_protection": 1,
-         "stop_loss": 21,
-         "take_profit": 21
+         "profit_protection": 22,
+         "stop_loss": 21
         },
         "stop_outs": 21,
         "near_break_even_exits": 0,
-        "cash_change": -11.045666,
+        "cash_change": -11.721895,
         "residual_at_end": null,
         "open_at_end": {
-         "basis": 10.000157781478052,
-         "estimated_net_proceeds": 9.97975762906356
+         "basis": 10.001512540474062,
+         "estimated_net_proceeds": 10.002324920184558
         }
        },
        "atb_rapid_unchanged": "see 25 USDT row"
@@ -492,20 +558,22 @@
       "strategy": {
        "baseline": {
         "closed_cycles": 76,
-        "net": 0.865653,
-        "gross_pnl_before_fees": 3.145757,
-        "fees": 2.280104,
-        "net_pct_of_budget": 5.771,
-        "average_net": 0.01139,
+        "net": 0.573544,
+        "net_marked": 0.573544,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": 2.853355,
+        "fees": 2.279811,
+        "net_pct_of_budget": 3.8236,
+        "average_net": 0.007547,
         "sd_net": 1e-06,
         "wins": 76,
         "losses": 0,
-        "worst": 0.011389,
-        "best": 0.011391,
+        "worst": 0.007546,
+        "best": 0.007547,
         "max_drawdown": 0.0,
         "profit_factor": null,
-        "fees_share_of_gross_gains": 0.7248,
-        "turnover": 2280.1036,
+        "fees_share_of_gross_gains": 0.799,
+        "turnover": 2279.8112,
         "exposure_pct_of_time": 36.71,
         "average_hold_min": 8.0,
         "triggers": {
@@ -513,7 +581,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": 0.863537,
+        "cash_change": 0.571428,
         "residual_at_end": {
          "base": 8.484211062046693e-07,
          "basis": 0.002115629851335001,
@@ -524,6 +592,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -553,6 +623,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -585,40 +657,41 @@
        "buy_and_hold": -0.068472,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
-        "closed_cycles": 150,
-        "net": -5.573837,
-        "gross_pnl_before_fees": -1.080919,
-        "fees": 4.492918,
-        "net_pct_of_budget": -37.1589,
-        "average_net": -0.037159,
-        "sd_net": 0.083353,
-        "wins": 76,
-        "losses": 74,
-        "worst": -0.134291,
-        "best": 0.045635,
-        "max_drawdown": 5.641434,
-        "profit_factor": 0.3788,
-        "fees_share_of_gross_gains": 0.7909,
-        "turnover": 4492.9178,
-        "exposure_pct_of_time": 68.84,
-        "average_hold_min": 7.6,
+        "closed_cycles": 152,
+        "net": 1.145076,
+        "net_marked": 1.132988,
+        "open_mark": -0.012088,
+        "gross_pnl_before_fees": 5.704701,
+        "fees": 4.559625,
+        "net_pct_of_budget": 7.6338,
+        "average_net": 0.007533,
+        "sd_net": 9e-06,
+        "wins": 152,
+        "losses": 0,
+        "worst": 0.007519,
+        "best": 0.007546,
+        "max_drawdown": 0.0,
+        "profit_factor": null,
+        "fees_share_of_gross_gains": 0.7993,
+        "turnover": 4559.6244,
+        "exposure_pct_of_time": 73.61,
+        "average_hold_min": 8.02,
         "triggers": {
-         "take_profit": 74,
-         "profit_protection": 2,
-         "stop_loss": 74
+         "profit_protection": 152
         },
-        "stop_outs": 74,
+        "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": -20.57007,
+        "cash_change": -13.850225,
         "residual_at_end": null,
         "open_at_end": {
-         "basis": 14.996232451727144,
-         "estimated_net_proceeds": 15.03327362671134
+         "basis": 14.995300950370199,
+         "estimated_net_proceeds": 14.98321277547354
         }
        },
        "atb_rapid_unchanged": "see 25 USDT row"
@@ -628,20 +701,22 @@
       "strategy": {
        "baseline": {
         "closed_cycles": 21,
-        "net": 0.239193,
-        "gross_pnl_before_fees": 0.86922,
-        "fees": 0.630028,
-        "net_pct_of_budget": 1.5946,
-        "average_net": 0.01139,
+        "net": 0.158479,
+        "net_marked": 0.161669,
+        "open_mark": 0.00319,
+        "gross_pnl_before_fees": 0.788425,
+        "fees": 0.629947,
+        "net_pct_of_budget": 1.0565,
+        "average_net": 0.007547,
         "sd_net": 1e-06,
         "wins": 21,
         "losses": 0,
-        "worst": 0.011389,
-        "best": 0.011391,
+        "worst": 0.007546,
+        "best": 0.007547,
         "max_drawdown": 0.0,
         "profit_factor": null,
-        "fees_share_of_gross_gains": 0.7248,
-        "turnover": 630.0275,
+        "fees_share_of_gross_gains": 0.799,
+        "turnover": 629.9467,
         "exposure_pct_of_time": 38.89,
         "average_hold_min": 8.0,
         "triggers": {
@@ -649,7 +724,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": -14.75752,
+        "cash_change": -14.838234,
         "residual_at_end": null,
         "open_at_end": {
          "basis": 14.99671295414292,
@@ -659,6 +734,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -688,6 +765,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -720,26 +799,29 @@
        "buy_and_hold": -0.095003,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 43,
-        "net": -2.661922,
-        "gross_pnl_before_fees": -1.375018,
-        "fees": 1.286904,
-        "net_pct_of_budget": -17.7461,
-        "average_net": -0.061905,
-        "sd_net": 0.072435,
+        "net": -2.741304,
+        "net_marked": -2.752944,
+        "open_mark": -0.01164,
+        "gross_pnl_before_fees": -1.45448,
+        "fees": 1.286824,
+        "net_pct_of_budget": -18.2754,
+        "average_net": -0.063751,
+        "sd_net": 0.070524,
         "wins": 21,
         "losses": 22,
         "worst": -0.144395,
-        "best": 0.011345,
-        "max_drawdown": 2.661922,
-        "profit_factor": 0.0821,
-        "fees_share_of_gross_gains": 1.4823,
-        "turnover": 1286.9034,
+        "best": 0.007565,
+        "max_drawdown": 2.741304,
+        "profit_factor": 0.0547,
+        "fees_share_of_gross_gains": 1.6316,
+        "turnover": 1286.8239,
         "exposure_pct_of_time": 74.07,
         "average_hold_min": 7.44,
         "triggers": {
@@ -748,7 +830,7 @@
         },
         "stop_outs": 22,
         "near_break_even_exits": 0,
-        "cash_change": -17.6585,
+        "cash_change": -17.737882,
         "residual_at_end": null,
         "open_at_end": {
          "basis": 14.996577767492573,
@@ -762,20 +844,22 @@
       "strategy": {
        "baseline": {
         "closed_cycles": 21,
-        "net": 0.239193,
-        "gross_pnl_before_fees": 0.86922,
-        "fees": 0.630028,
-        "net_pct_of_budget": 1.5946,
-        "average_net": 0.01139,
+        "net": 0.158479,
+        "net_marked": 0.158479,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": 0.788425,
+        "fees": 0.629947,
+        "net_pct_of_budget": 1.0565,
+        "average_net": 0.007547,
         "sd_net": 1e-06,
         "wins": 21,
         "losses": 0,
-        "worst": 0.011389,
-        "best": 0.011391,
+        "worst": 0.007546,
+        "best": 0.007547,
         "max_drawdown": 0.0,
         "profit_factor": null,
-        "fees_share_of_gross_gains": 0.7248,
-        "turnover": 630.0275,
+        "fees_share_of_gross_gains": 0.799,
+        "turnover": 629.9467,
         "exposure_pct_of_time": 38.89,
         "average_hold_min": 8.0,
         "triggers": {
@@ -783,7 +867,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": 0.23746,
+        "cash_change": 0.156746,
         "residual_at_end": {
          "base": 6.949584635565534e-07,
          "basis": 0.00173295414292,
@@ -794,6 +878,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -823,6 +909,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -855,40 +943,42 @@
        "buy_and_hold": 0.037821,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 43,
-        "net": -1.567732,
-        "gross_pnl_before_fees": -0.279732,
-        "fees": 1.288,
-        "net_pct_of_budget": -10.4515,
-        "average_net": -0.036459,
-        "sd_net": 0.083561,
+        "net": -2.579704,
+        "net_marked": -2.577159,
+        "open_mark": 0.002546,
+        "gross_pnl_before_fees": -1.292719,
+        "fees": 1.286985,
+        "net_pct_of_budget": -17.198,
+        "average_net": -0.059993,
+        "sd_net": 0.070388,
         "wins": 22,
         "losses": 21,
-        "worst": -0.121077,
-        "best": 0.045635,
-        "max_drawdown": 1.62462,
-        "profit_factor": 0.3821,
-        "fees_share_of_gross_gains": 0.7901,
-        "turnover": 1287.9999,
-        "exposure_pct_of_time": 74.54,
-        "average_hold_min": 7.49,
+        "worst": -0.144407,
+        "best": 0.014983,
+        "max_drawdown": 2.594802,
+        "profit_factor": 0.0631,
+        "fees_share_of_gross_gains": 1.5438,
+        "turnover": 1286.9851,
+        "exposure_pct_of_time": 73.84,
+        "average_hold_min": 7.42,
         "triggers": {
-         "profit_protection": 1,
-         "stop_loss": 21,
-         "take_profit": 21
+         "profit_protection": 22,
+         "stop_loss": 21
         },
         "stop_outs": 21,
         "near_break_even_exits": 0,
-        "cash_change": -16.563124,
+        "cash_change": -17.576885,
         "residual_at_end": null,
         "open_at_end": {
-         "basis": 14.995391538224425,
-         "estimated_net_proceeds": 14.964621490012895
+         "basis": 14.997180602860634,
+         "estimated_net_proceeds": 14.999726165090005
         }
        },
        "atb_rapid_unchanged": "see 25 USDT row"
@@ -900,20 +990,22 @@
       "strategy": {
        "baseline": {
         "closed_cycles": 76,
-        "net": 1.442949,
-        "gross_pnl_before_fees": 5.243631,
-        "fees": 3.800682,
-        "net_pct_of_budget": 5.7718,
-        "average_net": 0.018986,
+        "net": 0.956034,
+        "net_marked": 0.956034,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": 4.756229,
+        "fees": 3.800195,
+        "net_pct_of_budget": 3.8241,
+        "average_net": 0.012579,
         "sd_net": 1e-06,
         "wins": 76,
         "losses": 0,
-        "worst": 0.018985,
-        "best": 0.018987,
+        "worst": 0.012579,
+        "best": 0.01258,
         "max_drawdown": 0.0,
         "profit_factor": null,
-        "fees_share_of_gross_gains": 0.7248,
-        "turnover": 3800.6817,
+        "fees_share_of_gross_gains": 0.799,
+        "turnover": 3800.1943,
         "exposure_pct_of_time": 36.71,
         "average_hold_min": 8.0,
         "triggers": {
@@ -921,7 +1013,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": 1.441016,
+        "cash_change": 0.954101,
         "residual_at_end": {
          "base": 7.753721643478367e-07,
          "basis": 0.001933474408866001,
@@ -932,6 +1024,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -961,6 +1055,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -993,40 +1089,41 @@
        "buy_and_hold": -0.114139,
        "random_entries": {
         "repetitions": 200,
-        "mean": -2.755557,
-        "sd": 0.89369,
+        "measure": "net_marked",
+        "mean": -4.323514,
+        "sd": 0.742529,
         "strategy_percentile": 100.0
        },
        "always_enter": {
-        "closed_cycles": 150,
-        "net": -9.291035,
-        "gross_pnl_before_fees": -1.801837,
-        "fees": 7.489197,
-        "net_pct_of_budget": -37.1641,
-        "average_net": -0.06194,
-        "sd_net": 0.138946,
-        "wins": 76,
-        "losses": 74,
-        "worst": -0.223832,
-        "best": 0.076069,
-        "max_drawdown": 9.403725,
-        "profit_factor": 0.3788,
-        "fees_share_of_gross_gains": 0.7908,
-        "turnover": 7489.1965,
-        "exposure_pct_of_time": 68.84,
-        "average_hold_min": 7.6,
+        "closed_cycles": 152,
+        "net": 1.908674,
+        "net_marked": 1.890353,
+        "open_mark": -0.018321,
+        "gross_pnl_before_fees": 9.509062,
+        "fees": 7.600389,
+        "net_pct_of_budget": 7.6347,
+        "average_net": 0.012557,
+        "sd_net": 1.7e-05,
+        "wins": 152,
+        "losses": 0,
+        "worst": 0.012534,
+        "best": 0.012579,
+        "max_drawdown": 0.0,
+        "profit_factor": null,
+        "fees_share_of_gross_gains": 0.7993,
+        "turnover": 7600.3878,
+        "exposure_pct_of_time": 73.61,
+        "average_hold_min": 8.02,
         "triggers": {
-         "take_profit": 74,
-         "profit_protection": 2,
-         "stop_loss": 74
+         "profit_protection": 152
         },
-        "stop_outs": 74,
+        "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": -34.287696,
+        "cash_change": -23.087509,
         "residual_at_end": null,
         "open_at_end": {
-         "basis": 24.99666190437453,
-         "estimated_net_proceeds": 25.05795908708079
+         "basis": 24.99618249123757,
+         "estimated_net_proceeds": 24.97786172510031
         }
        },
        "atb_rapid_unchanged": {
@@ -1041,20 +1138,22 @@
       "strategy": {
        "baseline": {
         "closed_cycles": 21,
-        "net": 0.398708,
-        "gross_pnl_before_fees": 1.448895,
-        "fees": 1.050187,
-        "net_pct_of_budget": 1.5948,
-        "average_net": 0.018986,
+        "net": 0.264167,
+        "net_marked": 0.268392,
+        "open_mark": 0.004225,
+        "gross_pnl_before_fees": 1.314219,
+        "fees": 1.050052,
+        "net_pct_of_budget": 1.0567,
+        "average_net": 0.012579,
         "sd_net": 1e-06,
         "wins": 21,
         "losses": 0,
-        "worst": 0.018985,
-        "best": 0.018987,
+        "worst": 0.012579,
+        "best": 0.01258,
         "max_drawdown": 0.0,
         "profit_factor": null,
-        "fees_share_of_gross_gains": 0.7248,
-        "turnover": 1050.1866,
+        "fees_share_of_gross_gains": 0.799,
+        "turnover": 1050.0519,
         "exposure_pct_of_time": 38.89,
         "average_hold_min": 8.0,
         "triggers": {
@@ -1062,7 +1161,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": -24.598568,
+        "cash_change": -24.733109,
         "residual_at_end": null,
         "open_at_end": {
          "basis": 24.997276023775054,
@@ -1072,6 +1171,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1101,6 +1202,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1133,26 +1236,29 @@
        "buy_and_hold": -0.158371,
        "random_entries": {
         "repetitions": 200,
-        "mean": -0.886287,
-        "sd": 0.444879,
-        "strategy_percentile": 99.5
+        "measure": "net_marked",
+        "mean": -1.301002,
+        "sd": 0.376407,
+        "strategy_percentile": 100.0
        },
        "always_enter": {
         "closed_cycles": 43,
-        "net": -4.437164,
-        "gross_pnl_before_fees": -2.292036,
-        "fees": 2.145128,
-        "net_pct_of_budget": -17.7487,
-        "average_net": -0.10319,
-        "sd_net": 0.120746,
+        "net": -4.569485,
+        "net_marked": -4.588105,
+        "open_mark": -0.01862,
+        "gross_pnl_before_fees": -2.424489,
+        "fees": 2.144996,
+        "net_pct_of_budget": -18.2779,
+        "average_net": -0.106267,
+        "sd_net": 0.11756,
         "wins": 21,
         "losses": 22,
         "worst": -0.240682,
-        "best": 0.01891,
-        "max_drawdown": 4.437164,
-        "profit_factor": 0.0821,
-        "fees_share_of_gross_gains": 1.4822,
-        "turnover": 2145.1278,
+        "best": 0.012609,
+        "max_drawdown": 4.569485,
+        "profit_factor": 0.0548,
+        "fees_share_of_gross_gains": 1.6315,
+        "turnover": 2144.9953,
         "exposure_pct_of_time": 74.07,
         "average_hold_min": 7.44,
         "triggers": {
@@ -1161,7 +1267,7 @@
         },
         "stop_outs": 22,
         "near_break_even_exits": 0,
-        "cash_change": -29.432344,
+        "cash_change": -29.564665,
         "residual_at_end": null,
         "open_at_end": {
          "basis": 24.995179899404725,
@@ -1180,20 +1286,22 @@
       "strategy": {
        "baseline": {
         "closed_cycles": 21,
-        "net": 0.398708,
-        "gross_pnl_before_fees": 1.448895,
-        "fees": 1.050187,
-        "net_pct_of_budget": 1.5948,
-        "average_net": 0.018986,
+        "net": 0.264167,
+        "net_marked": 0.264167,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": 1.314219,
+        "fees": 1.050052,
+        "net_pct_of_budget": 1.0567,
+        "average_net": 0.012579,
         "sd_net": 1e-06,
         "wins": 21,
         "losses": 0,
-        "worst": 0.018985,
-        "best": 0.018987,
+        "worst": 0.012579,
+        "best": 0.01258,
         "max_drawdown": 0.0,
         "profit_factor": null,
-        "fees_share_of_gross_gains": 0.7248,
-        "turnover": 1050.1866,
+        "fees_share_of_gross_gains": 0.799,
+        "turnover": 1050.0519,
         "exposure_pct_of_time": 38.89,
         "average_hold_min": 8.0,
         "triggers": {
@@ -1201,7 +1309,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 0,
-        "cash_change": 0.396402,
+        "cash_change": 0.261861,
         "residual_at_end": {
          "base": 9.247738875171653e-07,
          "basis": 0.002306023775055001,
@@ -1212,6 +1320,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1241,6 +1351,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1273,40 +1385,42 @@
        "buy_and_hold": 0.063043,
        "random_entries": {
         "repetitions": 200,
-        "mean": -0.753909,
-        "sd": 0.48772,
-        "strategy_percentile": 99.5
+        "measure": "net_marked",
+        "mean": -1.193443,
+        "sd": 0.411705,
+        "strategy_percentile": 100.0
        },
        "always_enter": {
         "closed_cycles": 43,
-        "net": -2.61324,
-        "gross_pnl_before_fees": -0.466287,
-        "fees": 2.146953,
-        "net_pct_of_budget": -10.453,
-        "average_net": -0.060773,
-        "sd_net": 0.139291,
+        "net": -4.300071,
+        "net_marked": -4.296725,
+        "open_mark": 0.003346,
+        "gross_pnl_before_fees": -2.154807,
+        "fees": 2.145264,
+        "net_pct_of_budget": -17.2003,
+        "average_net": -0.100002,
+        "sd_net": 0.117331,
         "wins": 22,
         "losses": 21,
-        "worst": -0.201827,
-        "best": 0.076069,
-        "max_drawdown": 2.708069,
-        "profit_factor": 0.3821,
-        "fees_share_of_gross_gains": 0.7901,
-        "turnover": 2146.9531,
-        "exposure_pct_of_time": 74.54,
-        "average_hold_min": 7.49,
+        "worst": -0.240699,
+        "best": 0.024973,
+        "max_drawdown": 4.325245,
+        "profit_factor": 0.0631,
+        "fees_share_of_gross_gains": 1.5437,
+        "turnover": 2145.264,
+        "exposure_pct_of_time": 73.84,
+        "average_hold_min": 7.42,
         "triggers": {
-         "profit_protection": 1,
-         "stop_loss": 21,
-         "take_profit": 21
+         "profit_protection": 22,
+         "stop_loss": 21
         },
         "stop_outs": 21,
         "near_break_even_exits": 0,
-        "cash_change": -27.60879,
+        "cash_change": -29.296269,
         "residual_at_end": null,
         "open_at_end": {
-         "basis": 24.995549319403544,
-         "estimated_net_proceeds": 24.946886595867678
+         "basis": 24.99619730965784,
+         "estimated_net_proceeds": 24.99954360848334
         }
        },
        "atb_rapid_unchanged": {
@@ -1324,6 +1438,7 @@
   },
   {
    "symbol": "ADA/USDT",
+   "venue": "mexc",
    "bars": 2880,
    "splits": {
     "development": [
@@ -1339,7 +1454,14 @@
      2880
     ]
    },
-   "feature_seconds": 7.93,
+   "book_model": {
+    "spread_bps": 2.0,
+    "level_quote": 400.0,
+    "levels": 20,
+    "tick": 0.0001,
+    "from": "each bar (no recorded depth)"
+   },
+   "feature_seconds": 7.05,
    "by_budget": {
     "10": {
      "development": {
@@ -1347,6 +1469,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1376,6 +1500,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1405,6 +1531,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1437,6 +1565,7 @@
        "buy_and_hold": -0.031959,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -1444,6 +1573,8 @@
        "always_enter": {
         "closed_cycles": 66,
         "net": -6.308947,
+        "net_marked": -6.308947,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -4.995262,
         "fees": 1.313685,
         "net_pct_of_budget": -63.0895,
@@ -1481,6 +1612,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1510,6 +1643,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1539,6 +1674,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1571,26 +1708,29 @@
        "buy_and_hold": -0.027965,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 21,
-        "net": -1.767798,
-        "gross_pnl_before_fees": -1.349568,
-        "fees": 0.418231,
-        "net_pct_of_budget": -17.678,
-        "average_net": -0.084181,
-        "sd_net": 0.031137,
+        "net": -1.769793,
+        "net_marked": -1.769793,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": -1.351564,
+        "fees": 0.418229,
+        "net_pct_of_budget": -17.6979,
+        "average_net": -0.084276,
+        "sd_net": 0.030779,
         "wins": 1,
         "losses": 20,
         "worst": -0.11118,
-        "best": 0.027894,
+        "best": 0.025899,
         "max_drawdown": 1.795692,
-        "profit_factor": 0.0155,
-        "fees_share_of_gross_gains": 8.7274,
-        "turnover": 418.2304,
+        "profit_factor": 0.0144,
+        "fees_share_of_gross_gains": 9.1068,
+        "turnover": 418.2284,
         "exposure_pct_of_time": 29.86,
         "average_hold_min": 6.14,
         "triggers": {
@@ -1600,7 +1740,7 @@
         },
         "stop_outs": 18,
         "near_break_even_exits": 0,
-        "cash_change": -1.767798,
+        "cash_change": -1.769793,
         "residual_at_end": {
          "base": 4.526455389945879e-07,
          "basis": 2.28203376396e-07,
@@ -1616,6 +1756,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1645,6 +1787,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1674,6 +1818,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1706,36 +1852,39 @@
        "buy_and_hold": -0.033958,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 21,
-        "net": -1.77973,
-        "gross_pnl_before_fees": -1.361511,
-        "fees": 0.418219,
-        "net_pct_of_budget": -17.7973,
-        "average_net": -0.084749,
-        "sd_net": 0.031131,
+        "net": -1.80166,
+        "net_marked": -1.80166,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": -1.383463,
+        "fees": 0.418197,
+        "net_pct_of_budget": -18.0166,
+        "average_net": -0.085793,
+        "sd_net": 0.027216,
         "wins": 1,
         "losses": 20,
         "worst": -0.109149,
-        "best": 0.029855,
+        "best": 0.007925,
         "max_drawdown": 1.809585,
-        "profit_factor": 0.0165,
-        "fees_share_of_gross_gains": 8.3837,
-        "turnover": 418.2185,
+        "profit_factor": 0.0044,
+        "fees_share_of_gross_gains": 14.9714,
+        "turnover": 418.1965,
         "exposure_pct_of_time": 29.86,
         "average_hold_min": 6.14,
         "triggers": {
-         "take_profit": 1,
+         "profit_protection": 1,
          "stop_loss": 18,
          "regime_shift": 2
         },
         "stop_outs": 18,
         "near_break_even_exits": 0,
-        "cash_change": -1.77973,
+        "cash_change": -1.80166,
         "residual_at_end": {
          "base": 8.236058549402099e-07,
          "basis": 4.14894892885e-07,
@@ -1753,6 +1902,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1782,6 +1933,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1811,6 +1964,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1843,6 +1998,7 @@
        "buy_and_hold": -0.047939,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -1850,6 +2006,8 @@
        "always_enter": {
         "closed_cycles": 66,
         "net": -9.463421,
+        "net_marked": -9.463421,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -7.492894,
         "fees": 1.970527,
         "net_pct_of_budget": -63.0895,
@@ -1887,6 +2045,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1916,6 +2076,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1945,6 +2107,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -1977,26 +2141,29 @@
        "buy_and_hold": -0.041947,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 21,
-        "net": -2.651697,
-        "gross_pnl_before_fees": -2.024351,
-        "fees": 0.627346,
-        "net_pct_of_budget": -17.678,
-        "average_net": -0.126271,
-        "sd_net": 0.046706,
+        "net": -2.654689,
+        "net_marked": -2.654689,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": -2.027347,
+        "fees": 0.627343,
+        "net_pct_of_budget": -17.6979,
+        "average_net": -0.126414,
+        "sd_net": 0.046169,
         "wins": 1,
         "losses": 20,
         "worst": -0.166771,
-        "best": 0.04184,
+        "best": 0.038848,
         "max_drawdown": 2.693537,
-        "profit_factor": 0.0155,
-        "fees_share_of_gross_gains": 8.7274,
-        "turnover": 627.3456,
+        "profit_factor": 0.0144,
+        "fees_share_of_gross_gains": 9.1068,
+        "turnover": 627.3427,
         "exposure_pct_of_time": 29.86,
         "average_hold_min": 6.14,
         "triggers": {
@@ -2006,7 +2173,7 @@
         },
         "stop_outs": 18,
         "near_break_even_exits": 0,
-        "cash_change": -2.651697,
+        "cash_change": -2.654689,
         "residual_at_end": {
          "base": 1.789683084918819e-07,
          "basis": 9.0227714066e-08,
@@ -2022,6 +2189,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2051,6 +2220,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2080,6 +2251,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2112,36 +2285,39 @@
        "buy_and_hold": -0.050937,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 21,
-        "net": -2.669595,
-        "gross_pnl_before_fees": -2.042267,
-        "fees": 0.627328,
-        "net_pct_of_budget": -17.7973,
-        "average_net": -0.127124,
-        "sd_net": 0.046696,
+        "net": -2.702489,
+        "net_marked": -2.702489,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": -2.075194,
+        "fees": 0.627295,
+        "net_pct_of_budget": -18.0166,
+        "average_net": -0.12869,
+        "sd_net": 0.040824,
         "wins": 1,
         "losses": 20,
         "worst": -0.163724,
-        "best": 0.044782,
+        "best": 0.011888,
         "max_drawdown": 2.714377,
-        "profit_factor": 0.0165,
-        "fees_share_of_gross_gains": 8.3837,
-        "turnover": 627.3277,
+        "profit_factor": 0.0044,
+        "fees_share_of_gross_gains": 14.9714,
+        "turnover": 627.2948,
         "exposure_pct_of_time": 29.86,
         "average_hold_min": 6.14,
         "triggers": {
-         "take_profit": 1,
+         "profit_protection": 1,
          "stop_loss": 18,
          "regime_shift": 2
         },
         "stop_outs": 18,
         "near_break_even_exits": 0,
-        "cash_change": -2.669595,
+        "cash_change": -2.70249,
         "residual_at_end": {
          "base": 7.354087824103147e-07,
          "basis": 3.70465248843e-07,
@@ -2159,6 +2335,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2188,6 +2366,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2217,6 +2397,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2249,6 +2431,7 @@
        "buy_and_hold": -0.079898,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -2256,6 +2439,8 @@
        "always_enter": {
         "closed_cycles": 66,
         "net": -15.772368,
+        "net_marked": -15.772368,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -12.488156,
         "fees": 3.284212,
         "net_pct_of_budget": -63.0895,
@@ -2298,6 +2483,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2327,6 +2514,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2356,6 +2545,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2388,26 +2579,29 @@
        "buy_and_hold": -0.069912,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 21,
-        "net": -4.419495,
-        "gross_pnl_before_fees": -3.373919,
-        "fees": 1.045576,
-        "net_pct_of_budget": -17.678,
-        "average_net": -0.210452,
-        "sd_net": 0.077843,
+        "net": -4.424482,
+        "net_marked": -4.424482,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": -3.378911,
+        "fees": 1.045571,
+        "net_pct_of_budget": -17.6979,
+        "average_net": -0.21069,
+        "sd_net": 0.076948,
         "wins": 1,
         "losses": 20,
         "worst": -0.277951,
-        "best": 0.069734,
+        "best": 0.064747,
         "max_drawdown": 4.489229,
-        "profit_factor": 0.0155,
-        "fees_share_of_gross_gains": 8.7274,
-        "turnover": 1045.5761,
+        "profit_factor": 0.0144,
+        "fees_share_of_gross_gains": 9.1068,
+        "turnover": 1045.5711,
         "exposure_pct_of_time": 29.86,
         "average_hold_min": 6.14,
         "triggers": {
@@ -2417,7 +2611,7 @@
         },
         "stop_outs": 18,
         "near_break_even_exits": 0,
-        "cash_change": -4.419495,
+        "cash_change": -4.424482,
         "residual_at_end": {
          "base": 6.316138474864698e-07,
          "basis": 3.1843109046e-07,
@@ -2438,6 +2632,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2467,6 +2663,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2496,6 +2694,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2528,36 +2728,39 @@
        "buy_and_hold": -0.084896,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 21,
-        "net": -4.449324,
-        "gross_pnl_before_fees": -3.403778,
-        "fees": 1.045546,
-        "net_pct_of_budget": -17.7973,
-        "average_net": -0.211873,
-        "sd_net": 0.077827,
+        "net": -4.504149,
+        "net_marked": -4.504149,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": -3.458657,
+        "fees": 1.045491,
+        "net_pct_of_budget": -18.0166,
+        "average_net": -0.214483,
+        "sd_net": 0.06804,
         "wins": 1,
         "losses": 20,
         "worst": -0.272873,
-        "best": 0.074637,
+        "best": 0.019813,
         "max_drawdown": 4.523961,
-        "profit_factor": 0.0165,
-        "fees_share_of_gross_gains": 8.3837,
-        "turnover": 1045.5462,
+        "profit_factor": 0.0044,
+        "fees_share_of_gross_gains": 14.9714,
+        "turnover": 1045.4913,
         "exposure_pct_of_time": 29.86,
         "average_hold_min": 6.14,
         "triggers": {
-         "take_profit": 1,
+         "profit_protection": 1,
          "stop_loss": 18,
          "regime_shift": 2
         },
         "stop_outs": 18,
         "near_break_even_exits": 0,
-        "cash_change": -4.449325,
+        "cash_change": -4.504149,
         "residual_at_end": {
          "base": 5.590146373505245e-07,
          "basis": 2.8160596077e-07,
@@ -2580,6 +2783,7 @@
   },
   {
    "symbol": "BTC/USDT",
+   "venue": "mexc",
    "bars": 2880,
    "splits": {
     "development": [
@@ -2595,7 +2799,14 @@
      2880
     ]
    },
-   "feature_seconds": 7.64,
+   "book_model": {
+    "spread_bps": 2.0,
+    "level_quote": 400.0,
+    "levels": 20,
+    "tick": 0.01,
+    "from": "each bar (no recorded depth)"
+   },
+   "feature_seconds": 6.89,
    "by_budget": {
     "10": {
      "development": {
@@ -2603,6 +2814,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2632,6 +2845,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2661,6 +2876,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2693,40 +2910,44 @@
        "buy_and_hold": -0.678089,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 55,
-        "net": -2.416347,
-        "gross_pnl_before_fees": -1.318781,
-        "fees": 1.097565,
-        "net_pct_of_budget": -24.1635,
-        "average_net": -0.043934,
-        "sd_net": 0.032993,
+        "net": -2.46835,
+        "net_marked": -2.46835,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": -1.370845,
+        "fees": 1.097504,
+        "net_pct_of_budget": -24.6835,
+        "average_net": -0.044879,
+        "sd_net": 0.03108,
         "wins": 5,
         "losses": 50,
-        "worst": -0.109541,
-        "best": 0.032537,
-        "max_drawdown": 2.476563,
-        "profit_factor": 0.0561,
-        "fees_share_of_gross_gains": 4.1419,
-        "turnover": 1097.565,
+        "worst": -0.109518,
+        "best": 0.025033,
+        "max_drawdown": 2.500952,
+        "profit_factor": 0.0359,
+        "fees_share_of_gross_gains": 5.1428,
+        "turnover": 1097.5041,
         "exposure_pct_of_time": 48.49,
         "average_hold_min": 14.6,
         "triggers": {
-         "take_profit": 5,
+         "profit_protection": 2,
+         "take_profit": 3,
          "max_hold": 14,
          "regime_shift": 31,
          "stop_loss": 5
         },
         "stop_outs": 5,
         "near_break_even_exits": 1,
-        "cash_change": -2.432522,
+        "cash_change": -2.493413,
         "residual_at_end": {
-         "base": 2.8611581881675125e-07,
-         "basis": 0.016174940743421864,
+         "base": 4.4334187819737443e-07,
+         "basis": 0.025063597290435335,
          "note": "below the quantity step: still owned, carried at cost into the next cycle"
         },
         "open_at_end": null
@@ -2739,6 +2960,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2768,6 +2991,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2797,6 +3022,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2829,41 +3056,43 @@
        "buy_and_hold": -0.257631,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 15,
-        "net": -0.643623,
-        "gross_pnl_before_fees": -0.344278,
-        "fees": 0.299345,
-        "net_pct_of_budget": -6.4362,
-        "average_net": -0.042908,
-        "sd_net": 0.037037,
+        "net": -0.664127,
+        "net_marked": -0.718882,
+        "open_mark": -0.054755,
+        "gross_pnl_before_fees": -0.364799,
+        "fees": 0.299328,
+        "net_pct_of_budget": -6.6413,
+        "average_net": -0.044275,
+        "sd_net": 0.034598,
         "wins": 3,
         "losses": 12,
-        "worst": -0.094088,
-        "best": 0.025868,
-        "max_drawdown": 0.674591,
-        "profit_factor": 0.0586,
-        "fees_share_of_gross_gains": 2.9603,
-        "turnover": 299.345,
+        "worst": -0.094066,
+        "best": 0.009373,
+        "max_drawdown": 0.674124,
+        "profit_factor": 0.0283,
+        "fees_share_of_gross_gains": 3.7198,
+        "turnover": 299.3282,
         "exposure_pct_of_time": 60.88,
         "average_hold_min": 17.53,
         "triggers": {
-         "profit_protection": 1,
-         "take_profit": 1,
+         "profit_protection": 2,
          "max_hold": 5,
          "regime_shift": 5,
          "stop_loss": 3
         },
         "stop_outs": 3,
-        "near_break_even_exits": 0,
-        "cash_change": -10.654355,
+        "near_break_even_exits": 1,
+        "cash_change": -10.67116,
         "residual_at_end": null,
         "open_at_end": {
-         "basis": 10.010731501605763,
+         "basis": 10.007033343454506,
          "estimated_net_proceeds": 9.952278010802946
         }
        },
@@ -2875,6 +3104,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2904,6 +3135,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2933,6 +3166,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -2965,26 +3200,29 @@
        "buy_and_hold": -0.070989,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 13,
-        "net": -0.44307,
-        "gross_pnl_before_fees": -0.183523,
-        "fees": 0.259548,
-        "net_pct_of_budget": -4.4307,
-        "average_net": -0.034082,
-        "sd_net": 0.030612,
+        "net": -0.445162,
+        "net_marked": -0.544637,
+        "open_mark": -0.099476,
+        "gross_pnl_before_fees": -0.185616,
+        "fees": 0.259546,
+        "net_pct_of_budget": -4.4516,
+        "average_net": -0.034243,
+        "sd_net": 0.030267,
         "wins": 2,
         "losses": 11,
         "worst": -0.077903,
-        "best": 0.027112,
-        "max_drawdown": 0.44307,
-        "profit_factor": 0.0674,
-        "fees_share_of_gross_gains": 2.8657,
-        "turnover": 259.5477,
+        "best": 0.02502,
+        "max_drawdown": 0.445162,
+        "profit_factor": 0.063,
+        "fees_share_of_gross_gains": 2.9335,
+        "turnover": 259.5456,
         "exposure_pct_of_time": 67.82,
         "average_hold_min": 22.54,
         "triggers": {
@@ -2994,7 +3232,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 2,
-        "cash_change": -10.45187,
+        "cash_change": -10.453961,
         "residual_at_end": null,
         "open_at_end": {
          "basis": 10.008799528719683,
@@ -3011,6 +3249,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3040,6 +3280,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3069,6 +3311,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3101,40 +3345,44 @@
        "buy_and_hold": -1.015079,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 55,
-        "net": -3.67675,
-        "gross_pnl_before_fees": -2.031011,
-        "fees": 1.645739,
-        "net_pct_of_budget": -24.5117,
-        "average_net": -0.06685,
-        "sd_net": 0.048406,
+        "net": -3.754891,
+        "net_marked": -3.754891,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": -2.109243,
+        "fees": 1.645647,
+        "net_pct_of_budget": -25.0326,
+        "average_net": -0.068271,
+        "sd_net": 0.045494,
         "wins": 5,
         "losses": 50,
-        "worst": -0.159021,
-        "best": 0.049001,
-        "max_drawdown": 3.766653,
-        "profit_factor": 0.0551,
-        "fees_share_of_gross_gains": 4.1529,
-        "turnover": 1645.7387,
+        "worst": -0.158948,
+        "best": 0.037546,
+        "max_drawdown": 3.80384,
+        "profit_factor": 0.0355,
+        "fees_share_of_gross_gains": 5.1446,
+        "turnover": 1645.6472,
         "exposure_pct_of_time": 48.43,
         "average_hold_min": 14.58,
         "triggers": {
-         "take_profit": 5,
+         "profit_protection": 2,
+         "take_profit": 3,
          "max_hold": 14,
          "regime_shift": 31,
          "stop_loss": 5
         },
         "stop_outs": 5,
         "near_break_even_exits": 1,
-        "cash_change": -3.706992,
+        "cash_change": -3.798485,
         "residual_at_end": {
-         "base": 5.339848637435817e-07,
-         "basis": 0.030241834098311653,
+         "base": 7.697452610931047e-07,
+         "basis": 0.0435942620220311,
          "note": "below the quantity step: still owned, carried at cost into the next cycle"
         },
         "open_at_end": null
@@ -3147,6 +3395,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3176,6 +3426,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3205,6 +3457,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3237,41 +3491,43 @@
        "buy_and_hold": -0.386446,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 15,
-        "net": -0.938547,
-        "gross_pnl_before_fees": -0.489658,
-        "fees": 0.448889,
-        "net_pct_of_budget": -6.257,
-        "average_net": -0.06257,
-        "sd_net": 0.055167,
+        "net": -0.970108,
+        "net_marked": -1.052652,
+        "open_mark": -0.082543,
+        "gross_pnl_before_fees": -0.521246,
+        "fees": 0.448863,
+        "net_pct_of_budget": -6.4674,
+        "average_net": -0.064674,
+        "sd_net": 0.051536,
         "wins": 3,
         "losses": 12,
-        "worst": -0.139061,
-        "best": 0.03886,
-        "max_drawdown": 0.985057,
-        "profit_factor": 0.0603,
-        "fees_share_of_gross_gains": 2.9584,
-        "turnover": 448.8888,
+        "worst": -0.139028,
+        "best": 0.013699,
+        "max_drawdown": 0.985117,
+        "profit_factor": 0.0287,
+        "fees_share_of_gross_gains": 3.7357,
+        "turnover": 448.8628,
         "exposure_pct_of_time": 61.11,
         "average_hold_min": 17.6,
         "triggers": {
-         "profit_protection": 1,
-         "take_profit": 1,
+         "profit_protection": 2,
          "max_hold": 6,
          "regime_shift": 6,
          "stop_loss": 1
         },
         "stop_outs": 1,
         "near_break_even_exits": 0,
-        "cash_change": -15.955048,
+        "cash_change": -15.981069,
         "residual_at_end": null,
         "open_at_end": {
-         "basis": 15.016500387746213,
+         "basis": 15.010960360827143,
          "estimated_net_proceeds": 14.928417016204419
         }
        },
@@ -3283,6 +3539,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3312,6 +3570,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3341,6 +3601,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3373,26 +3635,29 @@
        "buy_and_hold": -0.106483,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 13,
-        "net": -0.664231,
-        "gross_pnl_before_fees": -0.275029,
-        "fees": 0.389202,
-        "net_pct_of_budget": -4.4282,
-        "average_net": -0.051095,
-        "sd_net": 0.045886,
+        "net": -0.66737,
+        "net_marked": -0.801097,
+        "open_mark": -0.133726,
+        "gross_pnl_before_fees": -0.278171,
+        "fees": 0.389199,
+        "net_pct_of_budget": -4.4491,
+        "average_net": -0.051336,
+        "sd_net": 0.045368,
         "wins": 2,
         "losses": 11,
         "worst": -0.11725,
-        "best": 0.04067,
-        "max_drawdown": 0.664231,
-        "profit_factor": 0.0674,
-        "fees_share_of_gross_gains": 2.8657,
-        "turnover": 389.2022,
+        "best": 0.037531,
+        "max_drawdown": 0.66737,
+        "profit_factor": 0.063,
+        "fees_share_of_gross_gains": 2.9335,
+        "turnover": 389.1991,
         "exposure_pct_of_time": 67.82,
         "average_hold_min": 22.54,
         "triggers": {
@@ -3402,7 +3667,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 2,
-        "cash_change": -15.661943,
+        "cash_change": -15.665082,
         "residual_at_end": null,
         "open_at_end": {
          "basis": 14.997711981504928,
@@ -3419,6 +3684,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3448,6 +3715,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3477,6 +3746,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3509,41 +3780,44 @@
        "buy_and_hold": -1.697278,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 59,
-        "net": -6.122834,
-        "gross_pnl_before_fees": -3.179582,
-        "fees": 2.943252,
-        "net_pct_of_budget": -24.4913,
-        "average_net": -0.103777,
-        "sd_net": 0.074684,
+        "net": -6.216835,
+        "net_marked": -6.216835,
+        "open_mark": 0.0,
+        "gross_pnl_before_fees": -3.273673,
+        "fees": 2.943162,
+        "net_pct_of_budget": -24.8673,
+        "average_net": -0.10537,
+        "sd_net": 0.071601,
         "wins": 6,
         "losses": 53,
-        "worst": -0.21387,
-        "best": 0.081733,
-        "max_drawdown": 6.272732,
-        "profit_factor": 0.0517,
-        "fees_share_of_gross_gains": 4.2851,
-        "turnover": 2943.2521,
+        "worst": -0.224635,
+        "best": 0.062553,
+        "max_drawdown": 6.298402,
+        "profit_factor": 0.0378,
+        "fees_share_of_gross_gains": 4.9292,
+        "turnover": 2943.1613,
         "exposure_pct_of_time": 47.28,
         "average_hold_min": 13.27,
         "triggers": {
-         "take_profit": 4,
+         "profit_protection": 3,
+         "take_profit": 3,
          "max_hold": 13,
-         "stop_loss": 7,
-         "profit_protection": 2,
-         "regime_shift": 33
+         "stop_loss": 8,
+         "regime_shift": 32
         },
-        "stop_outs": 7,
+        "stop_outs": 8,
         "near_break_even_exits": 1,
-        "cash_change": -6.151134,
+        "cash_change": -6.241819,
         "residual_at_end": {
-         "base": 4.98655093770647e-07,
-         "basis": 0.02829997322954711,
+         "base": 4.4023080567267145e-07,
+         "basis": 0.02498422299955427,
          "note": "below the quantity step: still owned, carried at cost into the next cycle"
         },
         "open_at_end": null
@@ -3561,6 +3835,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3590,6 +3866,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3619,6 +3897,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3651,41 +3931,43 @@
        "buy_and_hold": -0.644077,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 16,
-        "net": -1.536631,
-        "gross_pnl_before_fees": -0.738381,
-        "fees": 0.79825,
-        "net_pct_of_budget": -6.1465,
-        "average_net": -0.096039,
-        "sd_net": 0.088021,
+        "net": -1.589142,
+        "net_marked": -1.636082,
+        "open_mark": -0.046941,
+        "gross_pnl_before_fees": -0.790935,
+        "fees": 0.798207,
+        "net_pct_of_budget": -6.3566,
+        "average_net": -0.099321,
+        "sd_net": 0.082412,
         "wins": 3,
         "losses": 13,
-        "worst": -0.24967,
-        "best": 0.064874,
-        "max_drawdown": 1.614255,
-        "profit_factor": 0.0614,
-        "fees_share_of_gross_gains": 3.1546,
-        "turnover": 798.2504,
+        "worst": -0.249645,
+        "best": 0.02285,
+        "max_drawdown": 1.614178,
+        "profit_factor": 0.0293,
+        "fees_share_of_gross_gains": 3.9843,
+        "turnover": 798.207,
         "exposure_pct_of_time": 54.17,
         "average_hold_min": 14.62,
         "triggers": {
-         "profit_protection": 1,
-         "take_profit": 1,
+         "profit_protection": 2,
          "max_hold": 4,
          "stop_loss": 4,
          "regime_shift": 6
         },
         "stop_outs": 4,
         "near_break_even_exits": 0,
-        "cash_change": -26.582866,
+        "cash_change": -26.626143,
         "residual_at_end": null,
         "open_at_end": {
-         "basis": 25.04623497995322,
+         "basis": 25.037001324040038,
          "estimated_net_proceeds": 24.99006071943377
         }
        },
@@ -3702,6 +3984,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3731,6 +4015,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3760,6 +4046,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3792,26 +4080,29 @@
        "buy_and_hold": -0.177472,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
        },
        "always_enter": {
         "closed_cycles": 13,
-        "net": -1.107302,
-        "gross_pnl_before_fees": -0.458552,
-        "fees": 0.64875,
-        "net_pct_of_budget": -4.4292,
-        "average_net": -0.085177,
-        "sd_net": 0.076419,
+        "net": -1.11234,
+        "net_marked": -1.291095,
+        "open_mark": -0.178756,
+        "gross_pnl_before_fees": -0.463595,
+        "fees": 0.648745,
+        "net_pct_of_budget": -4.4494,
+        "average_net": -0.085565,
+        "sd_net": 0.075588,
         "wins": 2,
         "losses": 11,
         "worst": -0.195581,
-        "best": 0.067564,
-        "max_drawdown": 1.107302,
-        "profit_factor": 0.0672,
-        "fees_share_of_gross_gains": 2.87,
-        "turnover": 648.7499,
+        "best": 0.062526,
+        "max_drawdown": 1.11234,
+        "profit_factor": 0.063,
+        "fees_share_of_gross_gains": 2.9354,
+        "turnover": 648.7449,
         "exposure_pct_of_time": 67.82,
         "average_hold_min": 22.54,
         "triggers": {
@@ -3821,7 +4112,7 @@
         },
         "stop_outs": 0,
         "near_break_even_exits": 2,
-        "cash_change": -26.113813,
+        "cash_change": -26.118851,
         "residual_at_end": null,
         "open_at_end": {
          "basis": 25.006511626895406,
@@ -3843,6 +4134,7 @@
   },
   {
    "symbol": "SOL/USDT",
+   "venue": "mexc",
    "bars": 2880,
    "splits": {
     "development": [
@@ -3858,7 +4150,14 @@
      2880
     ]
    },
-   "feature_seconds": 7.71,
+   "book_model": {
+    "spread_bps": 2.0,
+    "level_quote": 400.0,
+    "levels": 20,
+    "tick": 0.01,
+    "from": "each bar (no recorded depth)"
+   },
+   "feature_seconds": 7.07,
    "by_budget": {
     "10": {
      "development": {
@@ -3866,6 +4165,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3895,6 +4196,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3924,6 +4227,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -3956,6 +4261,7 @@
        "buy_and_hold": -1.263552,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -3963,6 +4269,8 @@
        "always_enter": {
         "closed_cycles": 35,
         "net": -2.022975,
+        "net_marked": -2.049817,
+        "open_mark": -0.026842,
         "gross_pnl_before_fees": -1.325,
         "fees": 0.697975,
         "net_pct_of_budget": -20.2297,
@@ -4000,6 +4308,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4029,6 +4339,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4058,6 +4370,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4090,6 +4404,7 @@
        "buy_and_hold": -0.375603,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -4097,6 +4412,8 @@
        "always_enter": {
         "closed_cycles": 11,
         "net": -0.700516,
+        "net_marked": -0.736944,
+        "open_mark": -0.036428,
         "gross_pnl_before_fees": -0.481217,
         "fees": 0.219299,
         "net_pct_of_budget": -7.0052,
@@ -4134,6 +4451,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4163,6 +4482,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4192,6 +4513,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4224,6 +4547,7 @@
        "buy_and_hold": -0.364093,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -4231,6 +4555,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -0.634209,
+        "net_marked": -0.684437,
+        "open_mark": -0.050228,
         "gross_pnl_before_fees": -0.434844,
         "fees": 0.199365,
         "net_pct_of_budget": -6.3421,
@@ -4269,6 +4595,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4298,6 +4626,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4327,6 +4657,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4359,6 +4691,7 @@
        "buy_and_hold": -1.894707,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -4366,6 +4699,8 @@
        "always_enter": {
         "closed_cycles": 35,
         "net": -3.264062,
+        "net_marked": -3.264062,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -2.21768,
         "fees": 1.046382,
         "net_pct_of_budget": -21.7604,
@@ -4404,6 +4739,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4433,6 +4770,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4462,6 +4801,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4494,6 +4835,7 @@
        "buy_and_hold": -0.56322,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -4501,6 +4843,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -0.873094,
+        "net_marked": -0.942111,
+        "open_mark": -0.069018,
         "gross_pnl_before_fees": -0.574068,
         "fees": 0.299026,
         "net_pct_of_budget": -5.8206,
@@ -4538,6 +4882,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4567,6 +4913,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4596,6 +4944,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4628,6 +4978,7 @@
        "buy_and_hold": -0.545958,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -4635,6 +4986,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -0.966791,
+        "net_marked": -1.028327,
+        "open_mark": -0.061537,
         "gross_pnl_before_fees": -0.667858,
         "fees": 0.298932,
         "net_pct_of_budget": -6.4453,
@@ -4673,6 +5026,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4702,6 +5057,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4731,6 +5088,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4763,6 +5122,7 @@
        "buy_and_hold": -3.158278,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -4770,6 +5130,8 @@
        "always_enter": {
         "closed_cycles": 35,
         "net": -5.288156,
+        "net_marked": -5.288156,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -3.5438,
         "fees": 1.744356,
         "net_pct_of_budget": -21.1526,
@@ -4813,6 +5175,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4842,6 +5206,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4871,6 +5237,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4903,6 +5271,7 @@
        "buy_and_hold": -0.938823,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -4910,6 +5279,8 @@
        "always_enter": {
         "closed_cycles": 11,
         "net": -1.720865,
+        "net_marked": -1.821852,
+        "open_mark": -0.100987,
         "gross_pnl_before_fees": -1.172698,
         "fees": 0.548167,
         "net_pct_of_budget": -6.8835,
@@ -4952,6 +5323,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -4981,6 +5354,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5010,6 +5385,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5042,6 +5419,7 @@
        "buy_and_hold": -0.910056,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -5049,6 +5427,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -1.551182,
+        "net_marked": -1.653805,
+        "open_mark": -0.102622,
         "gross_pnl_before_fees": -1.052835,
         "fees": 0.498347,
         "net_pct_of_budget": -6.2047,
@@ -5092,6 +5472,7 @@
   },
   {
    "symbol": "XRP/USDT",
+   "venue": "mexc",
    "bars": 2880,
    "splits": {
     "development": [
@@ -5107,7 +5488,14 @@
      2880
     ]
    },
-   "feature_seconds": 7.47,
+   "book_model": {
+    "spread_bps": 2.0,
+    "level_quote": 400.0,
+    "levels": 20,
+    "tick": 0.0001,
+    "from": "each bar (no recorded depth)"
+   },
+   "feature_seconds": 6.84,
    "by_budget": {
     "10": {
      "development": {
@@ -5115,6 +5503,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5144,6 +5534,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5173,6 +5565,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5205,6 +5599,7 @@
        "buy_and_hold": -0.02929,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -5212,6 +5607,8 @@
        "always_enter": {
         "closed_cycles": 33,
         "net": -1.076277,
+        "net_marked": -1.105568,
+        "open_mark": -0.029291,
         "gross_pnl_before_fees": -0.417354,
         "fees": 0.658923,
         "net_pct_of_budget": -10.7628,
@@ -5247,6 +5644,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5276,6 +5675,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5305,6 +5706,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5337,6 +5740,7 @@
        "buy_and_hold": -0.02929,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -5344,6 +5748,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -0.326145,
+        "net_marked": -0.326145,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -0.126471,
         "fees": 0.199674,
         "net_pct_of_budget": -3.2614,
@@ -5380,6 +5786,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5409,6 +5817,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5438,6 +5848,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5470,6 +5882,7 @@
        "buy_and_hold": -0.02929,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -5477,6 +5890,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -0.326145,
+        "net_marked": -0.326145,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -0.126471,
         "fees": 0.199674,
         "net_pct_of_budget": -3.2614,
@@ -5515,6 +5930,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5544,6 +5961,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5573,6 +5992,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5605,6 +6026,7 @@
        "buy_and_hold": -0.043936,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -5612,6 +6034,8 @@
        "always_enter": {
         "closed_cycles": 33,
         "net": -1.614415,
+        "net_marked": -1.658351,
+        "open_mark": -0.043936,
         "gross_pnl_before_fees": -0.626031,
         "fees": 0.988384,
         "net_pct_of_budget": -10.7628,
@@ -5647,6 +6071,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5676,6 +6102,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5705,6 +6133,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5737,6 +6167,7 @@
        "buy_and_hold": -0.043936,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -5744,6 +6175,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -0.489217,
+        "net_marked": -0.489217,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -0.189706,
         "fees": 0.29951,
         "net_pct_of_budget": -3.2614,
@@ -5780,6 +6213,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5809,6 +6244,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5838,6 +6275,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5870,6 +6309,7 @@
        "buy_and_hold": -0.043936,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -5877,6 +6317,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -0.489217,
+        "net_marked": -0.489217,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -0.189706,
         "fees": 0.29951,
         "net_pct_of_budget": -3.2614,
@@ -5915,6 +6357,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5944,6 +6388,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -5973,6 +6419,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -6005,6 +6453,7 @@
        "buy_and_hold": -0.073226,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -6012,6 +6461,8 @@
        "always_enter": {
         "closed_cycles": 33,
         "net": -2.690692,
+        "net_marked": -2.763919,
+        "open_mark": -0.073226,
         "gross_pnl_before_fees": -1.043386,
         "fees": 1.647307,
         "net_pct_of_budget": -10.7628,
@@ -6052,6 +6503,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -6081,6 +6534,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -6110,6 +6565,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -6142,6 +6599,7 @@
        "buy_and_hold": -0.073226,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -6149,6 +6607,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -0.815361,
+        "net_marked": -0.815361,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -0.316177,
         "fees": 0.499184,
         "net_pct_of_budget": -3.2614,
@@ -6190,6 +6650,8 @@
        "baseline": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -6219,6 +6681,8 @@
        "doubled": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -6248,6 +6712,8 @@
        "severe": {
         "closed_cycles": 0,
         "net": 0,
+        "net_marked": 0.0,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": 0,
         "fees": 0,
         "net_pct_of_budget": 0.0,
@@ -6280,6 +6746,7 @@
        "buy_and_hold": -0.073226,
        "random_entries": {
         "repetitions": 0,
+        "measure": "net_marked",
         "mean": null,
         "sd": null,
         "strategy_percentile": null
@@ -6287,6 +6754,8 @@
        "always_enter": {
         "closed_cycles": 10,
         "net": -0.815361,
+        "net_marked": -0.815361,
+        "open_mark": 0.0,
         "gross_pnl_before_fees": -0.316177,
         "fees": 0.499184,
         "net_pct_of_budget": -3.2614,
@@ -6980,5 +7449,5 @@
   }
  ],
  "real_data": "NOT RUN: exchange endpoints are unreachable from the build environment",
- "runtime_seconds": 731.1
+ "runtime_seconds": 1213.3
 }

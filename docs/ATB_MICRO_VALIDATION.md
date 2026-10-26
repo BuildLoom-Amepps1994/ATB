@@ -9,10 +9,10 @@ overlap the full suite and are never added to it.
 | Item | Value |
 |---|---|
 | Branch | `claude/project-thread-vqle7r`, from main `b1e0217` |
-| Code commit tested | `9535a55` (the commits after it change documentation only; `git diff 9535a55 HEAD -- '*.py' '*.js' '*.html' '*.cjs' '*.yml' '*.iss' '*.txt'` is empty) |
+| Code commit tested | `20c7067` (the commits after it change documentation and recorded results only; `git diff 20c7067 HEAD -- '*.py' '*.js' '*.html' '*.cjs' '*.yml' '*.iss' '*.txt'` is empty) |
 | Host | Linux cloud container, 4 CPUs, Python 3.13.17, Node 22.22.0 |
 | Dependencies | `requirements-lock.txt` as on main (ccxt 4.5.90, pandas 3.1.0) |
-| Isolation | `tests/conftest.py` sets a new temporary `CRYPTOPILOT_DATA_DIR` and `LOCALAPPDATA`, the null keyring backend and no update checks before any application module is imported, and refuses every non-loopback connection. Every pytest and benchmark command below also exported a new `CRYPTOPILOT_DATA_DIR` under `/tmp` and `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring` first; the soak sets both itself for its `--data-dir` folder |
+| Isolation | `tests/conftest.py` sets a new temporary `CRYPTOPILOT_DATA_DIR` and `LOCALAPPDATA`, the null keyring backend and no update checks before any application module is imported, removes every proxy variable, and refuses every non-loopback connection, datagram and name lookup, in child Python processes too (`scripts/offline_net.py`). Every pytest and benchmark command below also exported a new `CRYPTOPILOT_DATA_DIR` under `/tmp` and `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring` first; the soak sets both itself for its `--data-dir` folder |
 | Exchange access | None. MEXC and Kraken are unreachable from this host; every exchange interaction is a fixture |
 | Credentials | None requested, read or used. No settings file, portfolio, order database or log of a real installation was opened |
 
@@ -61,8 +61,14 @@ after each change; they are not added to the totals above.
 | After the second review round of that fix | `tests` | 1317 passed, 0 failed, 0 skipped, 293.4 s |
 | Mutation check of the five new idle-cadence tests | the five tests and three neighbours, against 12 variants of `micro.py` | Every variant that removes one part of the fix fails at least one test, except two parts that cover each other (the reset clears and the "no decision yet" rule; removing both fails the reset test). `c043668` fails three of the five (one of them only through its start-up read) |
 | Slow-host check of the same five tests | each tick slowed by 0, 3, 6, 8, 10, 15, 20 and 40 ms of real time | All passed at every setting |
-| Slow-host check of every cycle test on the final code | `tests/test_micro_cycles.py`, each tick slowed by 15 ms of real time | 58 passed, 292.2 s |
+| Slow-host check of every cycle test on `9535a55` | `tests/test_micro_cycles.py`, each tick slowed by 15 ms of real time | 58 passed, 292.2 s |
 | New test for the 25 USDT settings bound | `tests/test_micro_refusal.py` | 15 passed; the new test fails if the bound is raised to 50 or if `MicroManager.budget_cap` stops taking the minimum with the 25 USDT constant |
+| After the final review round's fixes, before their commit | `tests` | 1368 passed and 1 failed: the archive self-screen test, which reads HEAD and passed (29 archive tests) once the fixes were committed as `7066d6f`; dashboard 19 passed |
+| Mutation check of the final round's main fixes | the new tests, against the network guard without the `NO_PROXY` setting, without the child-process guard, without the proxy clearing in `conftest.py`, and the research harness with the high fill, the MEXC-only rules and the verdict on closed cycles only | Each variant fails at least one new test |
+| Windows CI on `7066d6f` | the full suite on `windows-latest`, Python 3.14.9 | 1365 passed, 2 failed, 7 skipped, 658.8 s. Both failures were archive tests whose fixture wrote its file with `write_text`, which gives CRLF on Windows, so the committed blob was not the bytes the test expected; the fixture now writes bytes (`3c0c45d`), and the Windows test step of `3c0c45d` passed |
+| After the second review round's fixes (`20c7067`) | `tests/test_micro_*.py`, `tests/test_money_and_venue_rules.py`, `tests/test_offline_guard.py`, `tests/test_source_archive.py` | 705 passed, 219.3 s |
+| Mutation check of the second round's fixes | each new test against its fix reverted: the anchored name screen, `create_system` left to `zipfile`, `getnameinfo` unguarded, the search only when the high fires, and the unbounded rounding loops | Each fails: three name cases, the cross-platform hash, the lookup test, the band test (0.0249 instead of the band's bottom) and both rounding cases (still looping after 10 s) |
+| Windows CI on `20c7067` | the full suite on `windows-latest`, Python 3.14.9, then the installer build and its smoke tests | 1374 passed, 0 failed, 7 skipped, 665.2 s; the installer built and both smoke tests passed |
 
 ## Reviews
 
@@ -109,6 +115,77 @@ after each change; they are not added to the totals above.
   (only the headline ratios are). The others were wrong numbers, ranges,
   test counts and descriptions. All were corrected, and the one untested part
   of a PASS gate, the settings bound on the micro budget, got a test.
+* **Final review of the files that had none of their own** (`money.py`,
+  `venue_rules.py`, `micro_policy.py`, `tests/conftest.py`, the soak, archive
+  and benchmark scripts and the research harness): three reviewers, each
+  finding then checked by a separate verifier. No path past the 25 USDT cap
+  or the PAPER-only refusal was found. 21 findings were confirmed and all were
+  fixed with tests:
+  * Isolation: a proxy on loopback (this host has one) carried urllib and
+    requests to any remote host past the socket guard; name lookups through
+    `gethostbyname`, UDP datagrams, Windows' asyncio proactor connects and
+    child processes were not covered. The guard is now
+    `scripts/offline_net.py`: proxy variables are removed and `NO_PROXY` is
+    `*`, every one of those paths is refused, and child Python processes load
+    it through `tests/offline_child/sitecustomize.py`
+    (`tests/test_offline_guard.py`).
+  * Source archive: it refused this repository itself (its own test held a
+    literal key block), so the earlier PASS for that gate was wrong. It also
+    followed committed symbolic links, shipped skip-worktree edits, gave a
+    different hash for a CRLF checkout, missed several secret forms, and its
+    tests used the developer's global git configuration. It now reads the
+    commit's own git objects, refuses links and submodules, stores entries
+    uncompressed so the hash does not depend on the zlib build, screens more
+    names and contents (also UTF-16), and its tests run git without global
+    or system configuration (`tests/test_source_archive.py`).
+  * Soak harness: the source identity left out the harness itself and said
+    "clean" when git could not tell; a profile named by an inherited
+    `CRYPTOPILOT_DATA_DIR` was not protected; `--sample-seconds` accepted 0,
+    negative and NaN; fixture mode had no network guard
+    (`tests/test_micro_soak.py`).
+  * Research harness: a profit exit was filled at the bar's high (now at the
+    lowest price in the bar at which it fires); the doubled and severe
+    stresses did not scale a public taker fee above the configured rate;
+    real-data books used a 0.01 tick whatever the market's, which blocked
+    sub-dollar pairs and crashed on sub-cent ones; rules were always read as
+    MEXC's, so Kraken data never traded; splits too short for their embargo
+    were indexed anyway; a holding still open at the end of a split was left
+    out of the verdict; the result recorded neither the book model, the
+    decision parameters nor the code; and a second fixture clock did not
+    replace the first (`tests/test_micro_research.py`). The protocol is now
+    `micro-research-v2` and the fixture results were re-run (*Research run*).
+  * Venue rules: an unrecognised MEXC side rule allowed both sides; it now
+    allows sells only, so a holding can close but nothing opens.
+  The verifiers judged five more findings unreachable from any real caller.
+  Two were hardened anyway: step rounding can no longer cross its input, and
+  market rules stamped in the future or read with a bad clock are stale
+  (`tests/test_money_and_venue_rules.py`). Not changed: the `DECIMAL_PLACES`
+  precision path (neither venue uses it), `money.parse` of a NumPy float (no
+  caller passes one) and the benchmark's request count for the ticker
+  fallback (the benchmark never takes that path).
+* **Second review of those fixes**: two reviewers (the network guard, archive
+  and soak; the research harness, money and venue rules), each finding then
+  checked by a separate verifier that reproduced it. Five were confirmed and
+  fixed with tests, each of which fails when its fix is reverted:
+  * The archive's name screen had become narrower than before: anchoring the
+    names let `prod.env` and `app_settings.json` ship. The anchors are gone.
+  * The archive hash differed between Windows and Linux, because `zipfile`
+    records the creating system. It is now fixed at 3, and a test builds
+    with the platform set to Windows and compares the hashes.
+  * `socket.getnameinfo` (a reverse DNS query) passed the network guard. It
+    is refused for a remote address unless only the numeric form is asked.
+  * In the research harness, a bar whose high sat in the hold gap between the
+    protection band and the target, and whose close fell into the band, was
+    sold at the close, although the band was crossed lower on the way up. The
+    whole range is now searched whenever the high is in profit, and the fill
+    is the lowest price where a profit exit fires. The test's close-in-band
+    case booked 0.0249 USDT before the fix and the band's bottom after it.
+  * `money.q_down` and `money.q_up` looped forever on a 35-digit value with a
+    step of 3e-30, where adding the step no longer moves a 34-digit number.
+    They now make at most two corrections and then refuse.
+  The verifiers confirmed every other part of the fixes, including the
+  Windows asyncio signatures, the proxy handling of urllib, requests and
+  httpx, and the linear time of the secret patterns on 400 KB inputs.
 
 ## Brief test matrix (items 1 to 30)
 
@@ -196,8 +273,17 @@ made while it ran; the code files' hash at the end was the same.
 ## Research run
 
 `python -m research.micro_research --out research/results/micro_fixtures.json`
-on `c043668` (`9535a55` changed only the book cadence in `micro.py`, which the research harness does not use): exit 0, 12 min 12 s wall clock (the report records a run time of 731.1 s). At 25 USDT on the untouched holdout with baseline costs it closed 21 cycles on the ETH mechanics fixture and none on the other four fixtures. Results and their meaning are in
-`docs/ATB_MICRO_RESEARCH.md`. Real data: **NOT RUN**.
+on `20c7067` (protocol `micro-research-v2`; the result file records the
+commit and that the decision and research files were unmodified): exit 0,
+20 min 14 s wall clock (the report records a run time of 1213.3 s; the
+benchmark check in `docs/ATB_MICRO_PERFORMANCE.md` ran on another core for
+8 of those minutes; the wider profit-exit search, which prices more points of
+each held bar, is the likely cause of the rise from 731 s, but it was not
+profiled). At 25 USDT on the untouched holdout with baseline costs
+it closed 21 cycles on the ETH mechanics fixture, each by profit protection
+at about 0.0126 USDT, and none on the other four fixtures. Results and their
+meaning are in `docs/ATB_MICRO_RESEARCH.md`, including why every earlier
+fixture run is superseded. Real data: **NOT RUN**.
 
 ## Windows
 
@@ -209,12 +295,18 @@ request description: a file cannot record the run of the commit it is in.
 ## Source archive
 
 `python scripts/make_source_archive.py --out dist` builds a ZIP of exactly the
-files git tracks at the commit, refuses a dirty tree and any file that looks
-like a database, a settings file, a key or a credential assignment, and
-writes a manifest with every file's SHA-256 and the archive's own. A file
-cannot contain the hash of the archive it is in, so the archive of the final
-commit and its hash are recorded in the pull request description and the
-final report, not here.
+files of the HEAD commit, read from git's objects rather than the working
+tree. It refuses a dirty tree, a committed link or submodule, and any file
+that looks like a database (by name or content), a settings, environment or
+log file, a key or a credential assignment, and it writes a manifest with
+every file's SHA-256 and the archive's own. Entries are stored uncompressed
+with a fixed time, permissions and creating system, so the same commit gives
+the same archive hash on Windows and Linux (a test builds it both ways).
+Until the final review it refused
+this repository itself (see *Reviews*), so no archive existed before then. A
+file cannot contain the hash of the archive it is in, so the archive of the
+final commit and its hash are recorded in the pull request description and
+the final report, not here.
 
 ## Not run
 

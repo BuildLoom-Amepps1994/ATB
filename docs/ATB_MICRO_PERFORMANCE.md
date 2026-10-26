@@ -216,6 +216,21 @@ of p99 below 100 samples.
   24 hour soak's samples will show more.
 * These are fixture round trips on Linux. Windows and real network latency
   are **NOT RUN**.
+* **The micro rows ran before the fixture-clock fix** of the final review.
+  `bench_micro.py` builds a new engine, and installs a new fixture clock, for
+  each row. Before the fix each clock captured the previous one's patched
+  `time.time`, so later rows read the time through a chain of up to 13
+  clocks (a reviewer measured about 0.6 µs per call against 0.08 µs), and
+  the engine's `datetime` kept following the first clock, so stored
+  timestamps and the risk gate's time windows did not advance with the
+  fixture in those rows. A check run on `20c7067`, after the fix
+  (`benchmarks/results/micro_bench_clock_check_20c7067.json`, run while the
+  research harness used another core), closed the same 12 cycles, with entry
+  and exit decision to commit at 50.67 and 35.37 ms p50. At p50 its 0 ms tick
+  rows were 9 to 33 % faster and its 150 ms rows 0.2 to 1.7 % faster, but its first row,
+  which had no chain in either run, was faster too (14.34 against 19.72 ms
+  between bars), so the difference is host variation, not the fix. The tables
+  above keep the `9535a55` run.
 
 ## Limits
 

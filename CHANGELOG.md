@@ -63,8 +63,23 @@ Changed
   (a new bar's candles becoming current, a changed gate) and otherwise every
   30 s, keeping its last decision in between.
 * Tests run in an isolated environment: a new temporary data folder, the null
-  keyring backend and a refusal of every non-loopback connection
-  (`tests/conftest.py`).
+  keyring backend, no proxy variables, and a refusal of every non-loopback
+  connection, datagram and name lookup, also in child Python processes
+  (`tests/conftest.py`, `scripts/offline_net.py`).
+* The source archive is built from the commit's git objects; committed links
+  and submodules are refused, entries are stored uncompressed with a fixed
+  creator system so Windows and Linux give the same hash, and the secret
+  screen covers more forms.
+* The research protocol is `micro-research-v2`: a profit exit fills at the
+  lowest price in the bar at which it fires, also when the high sits in the
+  hold gap above the protection band (v1 filled it at the bar's high),
+  stress fees multiply the fee actually modeled, real-data books use the
+  market's own tick and venue, short splits are reported as not run, a
+  holding open at the end counts in the verdict, and results record the book
+  model, decision parameters and code identity.
+* An unrecognised MEXC side rule (`tradeSideType`) allows sells only.
+* Step rounding (`money.q_down`, `money.q_up`) refuses a step finer than the
+  value's 34-digit precision instead of looping.
 * The risk gate's `issued_at` reads the monotonic clock at issue time.
 * `MarketData` has a priority `order_book` read; the order journal has an
   index on client order ids; the database schema version is 4.

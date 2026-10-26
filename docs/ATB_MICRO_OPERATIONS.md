@@ -114,14 +114,18 @@ it stops at the end of the requested time (or on Ctrl+C).
    ```
 
    Each run needs a new, empty folder; a folder that already holds files, or
-   one that overlaps the normal profile folder, is refused. Keep the PC awake.
+   one that overlaps the normal profile folder (or the profile that a
+   `CRYPTOPILOT_DATA_DIR` set in that window points at), is refused.
+   `--sample-seconds` takes 1 to 3600 (default 60). Keep the PC awake.
 4. Share `soak\summary.json` (and, if asked, `soak\samples.jsonl`) from each
    folder. They hold timings, cycle counts, waiting reasons and simulated
    results; no key and no account data.
 
 The summary records the requested and actual duration, platform, the source
-commit and file hash read at start (and whether the checkout changed during
-the run, so do not edit or update the folder while it runs), every fault (a pause from sleep, a stopped worker, a
+commit and the hash of the app, research and script files read at start (the
+commit and its clean or dirty state are recorded as unknown when git cannot
+say), whether those files changed during the run (so do not edit or update the
+folder while it runs), every fault (a pause from sleep, a stopped worker, a
 sample error) and what the run did not test. One run is one sample of one
 period: it shows the mode runs unattended, not that it makes money.
 

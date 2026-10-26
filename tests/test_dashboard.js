@@ -2,7 +2,7 @@
 // Run with Node 22+ (24 LTS recommended): node --test tests/test_dashboard.js. No exchange/network access.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast} = require('../static/dashboard-core.js');
+const {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, microAmount, microView} = require('../static/dashboard-core.js');
 
 test('untrusted server strings and validation details are safe for display', () => {
   assert.equal(escapeHtml('<img src=x onerror="alert(1)">\''), '&lt;img src=x onerror=&quot;alert(1)&quot;&gt;&#39;');
@@ -145,4 +145,72 @@ test('every element the dashboard script looks up exists in the page', () => {
   const used = [...new Set([...script.matchAll(/\$\('([A-Za-z0-9_-]+)'\)/g)].map(match => match[1]))];
   assert.ok(used.length > 50);
   assert.deepEqual(used.filter(id => !ids.has(id)), []);
+});
+
+test('micro amounts never hide a sign or a non-zero value behind rounding', () => {
+  assert.equal(microAmount('-0.00003'), '-0.00003');
+  assert.equal(microAmount('0'), '0.0000');
+  assert.equal(microAmount('1e-12'), '<0.00000001');
+  assert.equal(microAmount('-1e-12'), '-<0.00000001');
+  assert.equal(microAmount('0.004', 4, true), '+0.0040');
+  assert.equal(microAmount('-0.0001', 4, true), '-0.0001');
+  assert.equal(microAmount(null), 'unknown');
+  assert.equal(microAmount('not a number'), 'unknown');
+});
+
+const microState = () => ({
+  active: true, running: false, paper_only: true, paper_only_reason: 'The micro-trading mode is PAPER only in this build.',
+  budget: {cap: '25', absolute_cap: '25', allocation: '50', reserved: '0', committed_basis: '24.97', max_cycles: 2},
+  latch: null, review_block: [], last_error: null, counters: {NO_ECONOMIC_EDGE: 7, SPREAD: 2},
+  pairs: [
+    {symbol: 'BTC/USDT', selected: true, regime: 'ranging', waiting: {code: 'NO_ECONOMIC_EDGE', status: 'Required move exceeds the expected range', waiting_s: 120},
+     sizing: {eligible: true, max_debit: '24.9750', gross_quote: '24.95', fee_reserve: '0.0250', minimum_feasible_budget: '1.01'},
+     book: {best_bid: '100', best_ask: '100.01', spread_bps: 1, age_s: 0.4, source: 'rest_depth'},
+     decision: {checks: [{check: 'spread', passed: true, detail: '1.0 bps'}, {check: 'edge', passed: false, detail: '<b>needs 30 bps</b>'}]}},
+    {symbol: 'PEPE/USDT', selected: false, sizing: {eligible: false, code: 'BUDGET_BELOW_VENUE_MINIMUM', detail: 'Venue minimum 30 USDT', minimum_feasible_budget: '30.05'}},
+  ],
+  cycles: [{cycle_id: 'cyc_aaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'ETH/USDT', state: 'HOLDING', strategy: 'range_reversion', owned_base: '0.0099',
+            entry_debit: '24.97', target_net: '0.05', stop_net: '0.2', age_s: 300, max_hold_s: 1800,
+            estimate: {est_net_pnl: '-0.00003', depth_model: 'book', uncertainty: '0.0125', break_even_bid: '2506.77',
+                       target_bid: '2511.78'}, entry_price: '2500.51', exit_verdict: {reason: 'hold'}}],
+  results: {closed_cycles: 3, wins: 1, losses: 2, flat: 0, realized_net_total: '-0.0123', average_net: '-0.0041', worst_loss: '-0.02',
+            best_gain: '0.015', max_drawdown: '0.03', fees_paid: '0.15', fees_share_of_gross_gains: 10, turnover: '150',
+            average_hold_s: 600, near_break_even_exits: 1, exit_triggers: {take_profit: 1, stop_loss: 2}, note: 'PAPER simulated fills.'},
+});
+
+test('the micro panel separates estimates from simulated fills and explains ineligible pairs', () => {
+  assert.equal(microView(null), null);
+  assert.equal(microView({active: false, cycles: []}), null);
+  const view = microView(microState());
+  assert.match(view.headline, /Stopped/);
+  assert.equal(view.holding, 1);
+  assert.match(view.budget[0][1], /25\.00 USDT \(fees included/);
+  const [btc, pepe] = view.pairs;
+  assert.match(btc.eligibility, /^Eligible · 24\.9750 USDT all-in \(24\.9500 order \+ 0\.0250 fee reserve\)/);
+  assert.match(btc.waiting, /for 2 min$/);
+  assert.equal(btc.checks.length, 2);
+  assert.match(btc.checks[1], /^✗ edge: <b>/);           // plain text: the renderer escapes it
+  assert.equal(pepe.selected, false);
+  assert.match(pepe.eligibility, /^BUDGET_BELOW_VENUE_MINIMUM: Venue minimum 30 USDT/);
+  assert.equal(pepe.minimum, '30.05 USDT');
+  const [eth] = view.cycles;
+  assert.equal(eth.estimate, '-0.00003 ± 0.0125 USDT (estimated, book)');
+  assert.equal(eth.prices, 'entry 2500.51 · break-even bid 2506.77 · target bid 2511.78');
+  assert.equal(eth.debit, '24.9700 USDT (simulated fill)');
+  assert.equal(view.results[1][1], '-0.0123 USDT');
+  assert.ok(view.notes.some(note => /PAPER only/.test(note)));
+  assert.deepEqual(view.counters, ['NO_ECONOMIC_EDGE 7', 'SPREAD 2']);
+});
+
+test('micro stops and unknown outcomes are shown as blocking warnings with a recovery action', () => {
+  const state = microState();
+  state.latch = {reason: '4 consecutive losing micro cycles'};
+  state.review_block = [{cycle_id: 'cyc_bbbbbbbbbbbbbbbbbbbbbbbb', symbol: 'ETH/USDT', state: 'EXIT_UNKNOWN', explanation: 'The paper venue reports the exit order as closed.'}];
+  const view = microView(state);
+  assert.equal(view.latched, true);
+  assert.ok(view.warnings.some(text => /Micro stop latched: 4 consecutive/.test(text) && /RESUME TRADING/.test(text)));
+  assert.ok(view.warnings.some(text => /Review required for ETH\/USDT \(Exit outcome unknown/.test(text)));
+  assert.deepEqual(view.recovery.map(item => item.cycle_id), ['cyc_bbbbbbbbbbbbbbbbbbbbbbbb']);
+  const unavailable = microView({active: true, error: 'micro status unavailable: OperationalError'});
+  assert.deepEqual(unavailable.warnings, ['micro status unavailable: OperationalError']);
 });

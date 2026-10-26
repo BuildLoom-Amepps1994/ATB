@@ -10,6 +10,8 @@ The **code review fixes** that follow 1.3.0 close several live-execution gaps: f
 
 **Market filters and faster scans** (after the review fixes): entries also require a directional 20-candle move (trend efficiency of at least 0.3, where a random walk averages about 0.22), and altcoin entries require BTC/USDT to be in an uptrend on the confirmation timeframe. Both filters only skip entries; sizing, stops, exits and order submission are unchanged, and **Market filters** in the settings turns them off. Qualifying setups are ranked by trend efficiency times capped relative volume rather than by 24h turnover. The worker now scans five seconds after each signal candle closes instead of waiting for the next fixed interval, MEXC candle downloads overlap (Kraken stays sequential at its one-request-per-second limit), and indicator calculations are about seven times faster with identical results. See [benchmarks](benchmarks/bench_hot_path.py).
 
+**Hardening review** (after 1.4.0): an independent risk gate now authorizes every order on every path, paper or live, automatic or manual, with hard USDT caps per order and per asset, an order-rate limit, a daily realised-loss stop, a drawdown stop from the tracked peak, failure/rejection/slippage breakers and a durable **kill switch** (release phrase `RESUME TRADING`). Orders run through an explicit journaled state machine with client order ids, so an ambiguous submit is looked up and never resent, and paper orders use the same path through an in-process exchange adapter. Every scan records one replayable decision per symbol with all checks and reasons (`GET /api/decisions`), structured events with correlation ids go to `logs/events.jsonl`, and `GET /api/metrics` reports p50/p95/p99 latencies. An optional, off-by-default **Streaming quotes** setting watches best bid/ask over the exchange websocket with heartbeat, ordering and reconnect checks while REST stays the fallback. See the [operations runbook](RUNBOOK.md), the [hardening review](HARDENING_REVIEW.md) and `benchmarks/results/`.
+
 Live and research signals share bounded indicator windows and an entry-gap guard. The research screen compares fixed-rule earlier/later periods and a full-period double-cost replay, reports insufficient coverage/sample size, and saves a JSON report with assumptions and candle fingerprints. These are descriptive checks, not an independent profitable strategy certification. See [1.3 validation and remaining limits](BOT_IMPROVEMENTS_1.3.0.md).
 
 ## Run on Windows
@@ -93,6 +95,8 @@ Signals execute at the following open. Candle stop/target fills model adverse ga
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev-lock.txt
 .\.venv\Scripts\python.exe -m pytest tests -q
 node --test tests/test_dashboard.js
+python benchmarks/replay.py                 # decision replay check, exits 1 on any mismatch
+python benchmarks/bench_latency.py          # quote -> decision -> order latency percentiles
 ```
 
 The dashboard tests need Node.js 22 or newer (24 LTS recommended; 26 becomes LTS on 2026-10-28; Node 18 and 20 are end of life). Optional browser regression checks require Playwright 1.64 or newer, which needs Windows 11 or Server 2019+, and Chromium/Edge: `node tests/test_dashboard_browser.cjs` (`CRYPTOPILOT_BROWSER_CHANNEL=msedge` selects Edge). Those tests intercept all app routes, use fake state, and submit no trading requests.
@@ -103,7 +107,13 @@ Double-click `BUILD_WINDOWS_EXE.bat` to create an isolated build environment and
 
 | File | Responsibility |
 |---|---|
-| `trader.py` | Lifecycle, execution, portfolios, risk guards |
+| `trader.py` | Lifecycle, scans, execution, portfolios |
+| `risk.py` | Independent risk gate, kill switch, latches and breakers |
+| `orders.py` | Order states, client order ids, read-only exchange lookup |
+| `paper_exchange.py` | In-process simulated exchange with CCXT method shapes |
+| `decision.py` | Pure, replayable entry/exit decision records |
+| `feed.py` | Optional websocket best bid/ask feed with continuity checks |
+| `observability.py` | Redacted JSON event log, correlation ids, metrics |
 | `market_data.py` | Paced read retries, data quality, caching and candle prefetch |
 | `strategy.py` | Transparent signals and chronological research simulation |
 | `storage.py` | Validated settings, scoped SQLite state, audit and order journal |

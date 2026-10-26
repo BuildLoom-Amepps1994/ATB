@@ -830,6 +830,135 @@ def test_a_venue_that_publishes_the_bar_late_is_retried_at_a_bounded_rate(world,
     assert w.engine.micro.pairs['ETH/USDT']['decision']['code'] != 'STALE_DATA'
 
 
+def _falling_eth(minute: int) -> list[SeriesMarket]:
+    return [SeriesMarket('ETH/USDT', minute - 300, trend(900, base=2500.0, bps_per_minute=-6.0),
+                         market=fine_market('ETH/USDT'))]
+
+
+def _book_reads(w: World, symbol: str = 'ETH/USDT') -> int:
+    return sum(1 for call in w.exchange.calls if call[0] == 'fetch_order_book' and call[1] == symbol)
+
+
+def test_a_pair_with_no_possible_setup_reads_its_book_for_each_new_decision_and_otherwise_every_30_s(world):
+    """The idle cadence: a new bar's decision reads the book even inside the idle interval, never STALE_DATA from it.
+
+    The fixture clock also adds the real time the ticks take, so every boundary below keeps several seconds of
+    margin rather than relying on exact steps.
+    """
+    w = world(markets=_falling_eth, watchlist=['ETH/USDT'])
+    mgr = w.engine.micro
+    w.clock.advance(60 - (w.clock.time() % 60) + 45)             # 45 s into a bar: the context is current
+    w.tick()
+    first = mgr.pairs['ETH/USDT']['decision']
+    assert mgr.context['ETH/USDT']['current'] is True
+    assert first['action'] == 'abstain' and first['code'] not in ('STALE_DATA', 'DEPTH_UNKNOWN')
+    assert mgr.pairs['ETH/USDT']['regime'] not in ('trending_up', 'ranging')        # no setup is possible
+    reads = _book_reads(w)
+    assert reads >= 1
+    for _ in range(10):                                        # inside the interval: no read, the decision is kept
+        w.clock.advance(1.0)
+        w.tick()
+        assert mgr.pairs['ETH/USDT']['decision']['decision_id'] == first['decision_id']
+    assert _book_reads(w) == reads
+    w.clock.advance(60 - (w.clock.time() % 60) + 0.5)          # just after the bar closed: candles not current yet
+    w.tick()
+    assert mgr.context['ETH/USDT']['current'] is False
+    assert mgr.pairs['ETH/USDT']['decision']['code'] == 'STALE_DATA'
+    assert _book_reads(w) == reads                             # stale candles decide alone: no book read
+    w.clock.advance(micro.CONTEXT_RETRY_S + 1.0)               # the new bar's candles are read
+    w.tick()
+    assert mgr.context['ETH/USDT']['current'] is True
+    decided = mgr.pairs['ETH/USDT']['decision']
+    assert _book_reads(w) == reads + 1                         # read now, about 8 s before the idle read was due
+    assert decided['code'] not in ('STALE_DATA', 'DEPTH_UNKNOWN') and decided['decision_id'] != first['decision_id']
+    reads += 1
+    for _ in range(int(micro.IDLE_BOOK_SECONDS) - 6):          # the next idle read is due 30 s after that one
+        w.clock.advance(1.0)
+        w.tick()
+        assert mgr.pairs['ETH/USDT']['decision']['decision_id'] == decided['decision_id']
+    assert _book_reads(w) == reads                             # one forced read did not bring a second one
+    w.clock.advance(7.0)
+    w.tick()
+    assert _book_reads(w) == reads + 1
+    assert mgr.pairs['ETH/USDT']['decision']['code'] not in ('STALE_DATA', 'DEPTH_UNKNOWN')
+    assert not w.cycles()
+
+
+def test_a_residual_on_a_selected_pair_with_no_setup_keeps_its_mark_inside_the_age_limit(world, monkeypatch):
+    """The idle entry cadence (30 s) must not delay a residual's mark, which the risk gate needs within 30 s here.
+
+    The residual is stood in for by the ownership query: a closed cycle's residual makes a pair owned without
+    an open cycle (the real path is in the deselected-pair test above).
+    """
+    # 33 s gives an 11 s mark interval, so the residual reads fall at a different point of each bar and meet the
+    # new-bar reads at every offset within a few bars.
+    w = world(markets=_falling_eth, watchlist=['ETH/USDT'], data_max_age_seconds=33)
+    mgr = w.engine.micro
+    monkeypatch.setattr(mgr, 'owned_symbols', lambda: {'ETH/USDT'})
+    monkeypatch.setattr(mgr, 'open_symbols', lambda: set())
+    interval = 33 / 3
+    w.clock.advance(60 - (w.clock.time() % 60) + 1)
+    worst = 0.0
+    for _ in range(11 * 60):                                   # about eleven bars of one-second ticks
+        w.clock.advance(1.0)
+        w.tick()
+        worst = max(worst, w.engine._price_age('ETH/USDT'))
+    # A book read within its age limit counts as the mark's refresh, so the bound is the interval plus that limit.
+    assert worst <= interval + float(w.engine.cfg['micro_book_max_age_seconds']) + 2.0 < 33, worst
+    w.clock.advance(60 - (w.clock.time() % 60) + 30)           # mid-bar on the fixture clock, whatever the host speed
+    w.tick()
+    assert mgr.pairs['ETH/USDT']['decision']['code'] not in ('STALE_DATA', 'DEPTH_UNKNOWN')
+
+
+def test_a_residual_on_a_plausible_pair_leaves_its_3_s_book_cadence_alone(world, monkeypatch):
+    """The residual's mark schedule must not hold back the reads of a pair whose setup is plausible."""
+    w = world(markets=_flat_eth, watchlist=['ETH/USDT'], data_max_age_seconds=33)
+    mgr = w.engine.micro
+    monkeypatch.setattr(mgr, 'owned_symbols', lambda: {'ETH/USDT'})
+    monkeypatch.setattr(mgr, 'open_symbols', lambda: set())
+    w.clock.advance(60 - (w.clock.time() % 60) + 1)
+    w.tick()
+    assert mgr.pairs['ETH/USDT']['regime'] in ('trending_up', 'ranging')            # a setup is plausible
+    last_read, reads, gaps, worst = w.clock.monotonic(), _book_reads(w), [], 0.0
+    for step in [1.0, 1.0, 1.5] * 130:                       # uneven steps, as real ticks are
+        w.clock.advance(step)
+        w.tick()
+        if _book_reads(w) > reads:
+            gaps.append(w.clock.monotonic() - last_read)
+            last_read, reads = w.clock.monotonic(), _book_reads(w)
+        worst = max(worst, w.engine._price_age('ETH/USDT'))
+    assert not w.cycles()
+    assert max(gaps) <= micro.ENTRY_BOOK_SECONDS + 1.6, max(gaps)    # one tick step past the 3 s cadence at most
+    assert worst <= 33 / 3 + 2.0, worst                               # the 3 s reads keep the mark fresh too
+
+def test_a_forced_read_reuses_only_a_book_under_half_its_age_limit(world):
+    """A reused book must still be fresh when the decision checks it; an older one is read again."""
+    w = world(markets=_falling_eth, watchlist=['ETH/USDT'])
+    mgr = w.engine.micro
+    max_age = float(w.engine.cfg['micro_book_max_age_seconds'])
+    first = mgr._book('ETH/USDT', interval=micro.IDLE_BOOK_SECONDS, max_age=max_age, idle=True, force=True)
+    reads = _book_reads(w)
+    w.clock.advance(max_age / 2 - 1.0)
+    assert mgr._book('ETH/USDT', interval=micro.IDLE_BOOK_SECONDS, max_age=max_age, idle=True,
+                     force=True).generation == first.generation
+    assert _book_reads(w) == reads
+    w.clock.advance(1.5)                                       # past half the limit, still inside it
+    again = mgr._book('ETH/USDT', interval=micro.IDLE_BOOK_SECONDS, max_age=max_age, idle=True, force=True)
+    assert _book_reads(w) == reads + 1 and again.generation > first.generation
+    assert mgr._book('ETH/USDT', interval=micro.IDLE_BOOK_SECONDS, max_age=max_age, idle=True) is again
+
+def test_after_a_memory_reset_an_idle_pair_reads_its_book_for_its_next_decision(world):
+    w = world(markets=_falling_eth, watchlist=['ETH/USDT'])
+    mgr = w.engine.micro
+    w.clock.advance(60 - (w.clock.time() % 60) + 20)
+    w.tick()
+    reads = _book_reads(w)
+    w.clock.advance(8.0)                                       # the book is past its 5 s limit; the idle read is 22 s away
+    mgr.reset_memory()
+    w.tick()
+    assert _book_reads(w) == reads + 1
+    assert mgr.pairs['ETH/USDT']['decision']['code'] not in ('STALE_DATA', 'DEPTH_UNKNOWN')
+
 # ===================================================================== integration review regressions
 def _partial_exit(w: World, fraction: str = '0.4') -> str:
     """A HOLDING cycle that already sold part of its holding (one SELL intent, accounted)."""

@@ -207,6 +207,7 @@ class MicroManager:
         self.last_tick = self.last_error = None
         self.tick_count = 0
         self._next_book: dict[str, float] = {}
+        self._next_mark: dict[str, float] = {}      # residual marks keep their own schedule
         self._flatten_until = 0.0                    # monotonic deadline of a pending Exit-all request
         self._flatten_tried: set[str] = set()        # cycles already given their first Exit-all attempt
         self._late_checked: dict[str, float] = {}
@@ -228,6 +229,9 @@ class MicroManager:
             self.context.clear()
             self.rules_cache.clear()
             self.pairs.clear()
+            self._decided_bar.clear()
+            self._next_book.clear()
+            self._next_mark.clear()
         return self._venue
 
     def active(self) -> bool:
@@ -1017,19 +1021,23 @@ class MicroManager:
         except ValueError:
             pass
 
-    def _book(self, symbol: str, *, interval: float, max_age: float,
-              idle: bool = False) -> micro_book.BookSnapshot | None:
+    def _book(self, symbol: str, *, interval: float, max_age: float, idle: bool = False,
+              force: bool = False) -> micro_book.BookSnapshot | None:
         """A book no older than ``max_age``, read at most every ``interval``.
 
         Exits (``idle`` False) read a new book whenever none is fresh enough,
         so a holding is never left without one. An ``idle`` read honours its
-        interval even then and returns None until it is due.
+        interval even then and returns None until it is due. ``force`` reads
+        now whatever the schedule, unless a book younger than half of
+        ``max_age`` can be reused (so it is still fresh when the decision is
+        made), and the next read is then due ``interval`` after it.
         """
         now_mono = time.monotonic()
         current = self.books.latest(symbol, now_mono=now_mono, max_age_s=max_age)
-        if current is not None and current.age_seconds(now_mono) < interval:
+        reuse = min(interval, max_age / 2.0) if force else interval
+        if current is not None and current.age_seconds(now_mono) < reuse:
             return current
-        if now_mono < self._next_book.get(symbol, 0.0) and (current is not None or idle):
+        if not force and now_mono < self._next_book.get(symbol, 0.0) and (current is not None or idle):
             return current
         self._next_book[symbol] = now_mono + interval
         try:
@@ -1232,7 +1240,20 @@ class MicroManager:
         for symbol in sorted(self.owned_symbols() - self.open_symbols()):
             if not engine._orders_allowed():
                 return
-            self._book(symbol, interval=interval, max_age=max_age, idle=True)
+            # A schedule of its own, in both directions: the idle entry cadence of a pair that is still selected
+            # must not delay the residual's mark, and the mark must not delay that pair's own reads.
+            now_mono = time.monotonic()
+            if now_mono < self._next_mark.get(symbol, 0.0):
+                continue
+            self._next_mark[symbol] = now_mono + interval
+            if self.books.latest(symbol, now_mono=now_mono, max_age_s=min(max_age, interval)) is not None:
+                continue                        # that book's read already refreshed the mark
+            try:
+                self._fetch_book(symbol)
+            except micro_book.BookError as exc:
+                self._note_error(symbol, f'order book refused: {exc.code}')
+            except Exception as exc:
+                self._note_error(symbol, f'order book unavailable: {type(exc).__name__}')
 
     # ------------------------------------------------------------- exits
     def _manage_exits(self, params, *, only_due: bool = False) -> None:
@@ -1692,25 +1713,35 @@ class MicroManager:
             if last is not None and features is not None:
                 # The bar closed on the venue's clock; the exit was stamped on this PC's.
                 fresh_after_exit = (features.bar_ts_ms / 1000.0 + 60.0 + offset) > last['closed_wall']
+            # Features of an older bar than the one that just closed are not fresh data for an entry, even
+            # when the bar closed during this pass after the pair's context was read (checked again below).
+            features_current = features is None or (bool(context.get('current'))
+                                                    and context.get('bar_due') == self._bar_due())
             pre_regime = None
             if features is not None:
                 pre_regime, _ = strat.classify_regime(features, spread_bps=0.0, depth_ok=True, data_fresh=True,
                                                       params=params)
             plausible = pre_regime in ('trending_up', 'ranging') and capacity and not blockers and not latch \
                 and cooldown <= 0 and fresh_after_exit
-            decided_on = (context.get('bar_due'), pre_regime, capacity, bool(blockers), bool(latch), cooldown > 0,
-                          fresh_after_exit)
+            decided_on = (context.get('bar_due'), features_current, pre_regime, capacity, bool(blockers), bool(latch),
+                          cooldown > 0, fresh_after_exit)
             if plausible:
                 book = self._book(symbol, interval=ENTRY_BOOK_SECONDS, max_age=max_age)
             else:
-                # No setup is possible on this bar: the book is read once per new bar and then at most every
-                # IDLE_BOOK_SECONDS, and between reads the pair keeps its last decision instead of a new one.
-                # A changed gate (a cycle that just closed, a latch, a cooldown that ran out) is a new decision too,
-                # and an 'enter' decision is never kept: it was acted on or refused.
-                last_decision = (self.pairs.get(symbol) or {}).get('decision') or {}
-                new_bar = self._decided_bar.get(symbol) != decided_on or last_decision.get('action') == 'enter'
-                book = self._book(symbol, interval=0.0 if new_bar else IDLE_BOOK_SECONDS, max_age=max_age, idle=True)
-                if book is None and not new_bar and last_decision:
+                # No setup is possible on this bar: the book is read once per new decision (a new bar, the bar's
+                # candles becoming current, a changed gate such as a cycle that just closed, a latch or a cooldown
+                # that ran out) and otherwise at most every IDLE_BOOK_SECONDS. Features that are not current decide
+                # STALE_DATA whatever the book, so they do not force a read. Between reads the pair keeps its last
+                # decision: the same book on the same inputs would only repeat it, and could pass its age limit
+                # before it is checked. An 'enter' decision is never kept: it was acted on or refused.
+                row = self.pairs.get(symbol) or {}
+                last_decision = row.get('decision') or {}
+                new_decision = (not last_decision or self._decided_bar.get(symbol) != decided_on
+                                or last_decision.get('action') == 'enter')
+                book = self._book(symbol, interval=IDLE_BOOK_SECONDS, max_age=max_age, idle=True,
+                                  force=new_decision and features_current)
+                if not new_decision and (book is None
+                                         or book.generation == (row.get('book') or {}).get('generation')):
                     continue
             rules = self.rules(symbol)
             cost = self.cost(rules)
@@ -1729,8 +1760,7 @@ class MicroManager:
                 except Exception as exc:
                     self._note_error(symbol, f'sizing failed: {type(exc).__name__}')
             fresh_book = book if book is not None and book.age_seconds(time.monotonic()) <= max_age else None
-            # Features of an older bar than the one that just closed are not fresh data for an entry, even
-            # when the bar closed during this pass after the pair's context was read.
+            # Read again after the book: the bar may have closed while the book was read.
             features_current = features is None or (bool(context.get('current'))
                                                     and context.get('bar_due') == self._bar_due())
             regime, regime_reasons = strat.classify_regime(
@@ -2049,6 +2079,9 @@ class MicroManager:
     def reset_memory(self) -> None:
         with self.lock:
             self.pairs.clear()
+            self._decided_bar.clear()
+            self._next_book.clear()
+            self._next_mark.clear()
             self.counters.clear()
             self.waiting_since.clear()
             self.context.clear()

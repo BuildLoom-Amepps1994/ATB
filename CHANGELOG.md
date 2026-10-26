@@ -58,8 +58,9 @@ Changed
   micro cycle is held the refresh waits until the catalogue is 1.5 hours old
   and then makes one attempt (`MarketData.read` takes a bounded `attempts`).
 * Held micro cycles are re-checked between pairs while the entry pass reads
-  books; a pair with no possible setup reads its book once per new bar or
-  changed gate and then every 30 s, keeping its last decision in between.
+  books; a pair with no possible setup reads its book for each new decision
+  (a new bar's candles becoming current, a changed gate) and otherwise every
+  30 s, keeping its last decision in between.
 * Tests run in an isolated environment: a new temporary data folder, the null
   keyring backend and a refusal of every non-loopback connection
   (`tests/conftest.py`).

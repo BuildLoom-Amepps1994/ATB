@@ -175,9 +175,10 @@ While running, three checks keep the ledger and the venue record in step:
 * Order books: REST depth (`MarketData.order_book`, 20 levels, a priority
   method so it never queues behind candle downloads) per pair, at most every
   `max(1 s, 3 × rateLimit × pairs)`; every 3 s for a pair whose setup is
-  plausible; for any other pair once per new bar or changed gate (a cycle
-  that just closed, a latch, a cooldown that ran out) and then every 30 s,
-  the pair keeping its last decision between reads; held pairs on every pass,
+  plausible; for any other pair once per new decision (a new bar's candles
+  becoming current, or a changed gate: a cycle that just closed, a latch, a
+  cooldown that ran out) even inside the 30 s interval, and otherwise every
+  30 s, the pair keeping its last decision between reads; held pairs on every pass,
   and again between pairs while the entry pass reads books. A book older than
   `micro_book_max_age_seconds` is not used for entries or profit exits; loss,
   time and regime exits fall back to the top-of-book quote (stream or REST).
@@ -205,9 +206,10 @@ While running, three checks keep the ledger and the venue record in step:
   cycles keep overlapping. Without a holding the refresh keeps its retries.
 * Each book also refreshes the engine's marks, which the risk gate's
   freshness checks read. A closed cycle's residual that no open cycle reads is
-  re-quoted at least every third of `data_max_age_seconds`, because the legacy
-  monitor leaves micro-owned pairs alone and a stale mark would make the gate
-  refuse every entry.
+  re-quoted every third of `data_max_age_seconds` on a schedule of its own, so
+  the 30 s idle cadence of a pair that is still selected cannot delay it. The
+  legacy monitor leaves micro-owned pairs alone, and a stale mark would make
+  the gate refuse every entry.
 * MEXC limits (public documentation, checked 2026-10-26): 300 IP weight per
   10 s, depth weight 3 at the default limit; the engine's rate limiter and
   `MarketData` pacing apply to every read.

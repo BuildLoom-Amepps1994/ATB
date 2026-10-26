@@ -397,8 +397,12 @@ class MicroParams:          # built from settings by the manager; all bounded by
 def classify_regime(features: Features | None, *, spread_bps, depth_ok: bool, data_fresh: bool,
                     params: MicroParams) -> tuple[str, tuple[str, ...]]
 
-def stop_net_bps(features: Features, params: MicroParams) -> float | None
-    # clamp(2.0 * atr_bps, 25, max_loss_bps); None when 2*atr_bps > max_loss_bps (too volatile for the cap)
+def stop_net_bps(features: Features, params: MicroParams, entry_cost_bps: float = 0.0) -> float | None
+    # entry_cost_bps + max(2.0 * atr_bps, 25); None when that sum exceeds max_loss_bps.
+    # Revised after review: the original clamp(2 ATR, 25, max_loss) ignored the round-trip cost
+    # the position carries from the moment it is bought, so a stop inside that cost fired on the
+    # first exit check with the book unchanged. entry_cost_bps = max_debit * (1 - best_bid /
+    # break_even_bid) as bps of the budget cap (entry_cost_bps()).
 
 @dataclass(frozen=True)
 class MicroDecision:
@@ -442,7 +446,8 @@ Economic gate (a heuristic feasibility test, never called an expected value):
 `expected_range_bps = atr_bps * sqrt(max_hold_s / 60)`; require
 `required_move_bps <= edge_ratio * expected_range_bps` (else `NO_ECONOMIC_EDGE`)
 and `spread_bps <= 0.35 * required_move_bps` (else `FEES`), and
-`stop_net_bps(...)` not None (else `VOLATILITY`). The opportunity key is
+`max(2 ATR, 25) <= max_loss_bps` (else `VOLATILITY`) and
+`stop_net_bps(features, params, entry_cost_bps)` not None (else `NO_ECONOMIC_EDGE`). The opportunity key is
 `f'{symbol}|{candidate}|{bar_ts_ms}'`.
 
 ```python
@@ -485,7 +490,8 @@ the reservation release commit in one SQLite transaction.
 
 `time_horizon` gains `'micro'`. New fields (all in `LATER_FIELDS`):
 `micro_budget_usdt` 25 (0.5..25), `micro_max_cycles` 2 (1..4),
-`micro_target_net_bps` 20 (5..200), `micro_max_loss_bps` 80 (20..400),
+`micro_target_net_bps` 20 (5..200), `micro_max_loss_bps` 120 (20..400; 80 before the stop revision, see
+docs/ATB_MICRO_ECONOMICS.md),
 `micro_max_hold_minutes` 30 (2..240), `micro_cooldown_seconds` 60 (0..3600),
 `micro_max_consecutive_losses` 4 (2..20), `micro_daily_loss_limit_usdt` 1.0
 (0.1..25), `micro_latency_bps` 3 (0..50), `micro_book_max_age_seconds` 5 (1..30).

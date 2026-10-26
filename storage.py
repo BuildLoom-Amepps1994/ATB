@@ -41,7 +41,7 @@ DEFAULTS = {
     # maximum all-in quote debit of one entry, fees included; it can be set
     # lower for research but never above micro_economics.MICRO_MAX_ALL_IN_USDT.
     'micro_budget_usdt': 25.0, 'micro_max_cycles': 2, 'micro_target_net_bps': 20.0,
-    'micro_max_loss_bps': 80.0, 'micro_max_hold_minutes': 30, 'micro_cooldown_seconds': 60,
+    'micro_max_loss_bps': 120.0, 'micro_max_hold_minutes': 30, 'micro_cooldown_seconds': 60,
     'micro_max_consecutive_losses': 4, 'micro_daily_loss_limit_usdt': 1.0, 'micro_latency_bps': 3.0,
     'micro_book_max_age_seconds': 5,
 }

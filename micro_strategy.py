@@ -82,10 +82,11 @@ Entry checks beyond the contract's list, each failing closed:
   and ask imply.
 * ``stop_beyond_entry_cost``: selling at the best bid the moment the position
   is bought already loses the round-trip cost (``max_debit * (1 - best_bid /
-  break_even_bid)``). The contract's ``clamp(2 ATR, 25, max_loss)`` stop does
-  not count it, so a stop inside it fires on the first exit check with the
-  book unchanged. The stop must sit at least ``STOP_MIN_ROOM_ATR`` ATR beyond
-  that cost (else NO_ECONOMIC_EDGE).
+  break_even_bid)``), so the stop is that cost plus an adverse move of
+  ``max(2 ATR, 25)`` bps (:func:`stop_net_bps`), and it fires on a real move,
+  never on the unchanged book. The sum must fit ``max_loss_bps`` (else
+  NO_ECONOMIC_EDGE; an unmeasurable cost is ERROR). The contract's original
+  ``clamp(2 ATR, 25, max_loss)`` ignored the cost and is superseded.
 
 Exit (``evaluate_exit``): safety exits (stop loss, maximum hold, regime shift)
 need no profit, no entry signal and no depth; profit exits (take profit,
@@ -180,7 +181,6 @@ AMOUNT_STEP = Decimal('0.00000001')  # proposal amounts: target rounded up, stop
 # stale sizing record cannot scale a proposal above the absolute micro cap.
 MICRO_MAX_ALL_IN_USDT = Decimal('25')
 MAX_BAR_AGE_S = 2 * BAR_MS_1M / 1000  # the decision bar closed at most two 1m bars before now
-STOP_MIN_ROOM_ATR = 1.0              # the stop sits at least one ATR beyond the loss carried at entry
 MAX_RECORD_INT = 2 ** 63 - 1         # a larger integer is not stored in a decision record
 
 # MicroParams ranges: the contract's settings bounds where a setting exists
@@ -507,20 +507,46 @@ def classify_regime(features: Features | None, *, spread_bps, depth_ok: bool, da
                                 f'{"up" if f.higher_trend_up else "not up"}: neither a clean trend nor a range',)
 
 
-def stop_net_bps(features: Features, params: MicroParams) -> float | None:
-    """Stop distance in bps of the budget cap: ``2 * atr_bps`` floored at 25, never above ``max_loss_bps``.
-
-    None when ``2 * atr_bps`` exceeds ``max_loss_bps``: a stop the loss cap
-    allows would sit inside ordinary noise. When ``max_loss_bps`` is below the
-    25 bps floor the cap wins (the hard cap is never exceeded).
-    """
+def stop_move_bps(features: Features) -> float | None:
+    """The adverse move a stop allows beyond the entry cost: ``max(2 * atr_bps, 25)`` bps, or None."""
     atr = _number(getattr(features, 'atr_bps', None))
     if atr is None or atr < 0:
         return None
-    raw = STOP_ATR_MULTIPLE * atr
-    if raw > params.max_loss_bps:
+    return max(STOP_ATR_MULTIPLE * atr, STOP_FLOOR_BPS)
+
+
+def stop_net_bps(features: Features, params: MicroParams, entry_cost_bps=0.0) -> float | None:
+    """Stop distance in bps of the budget cap: the entry cost plus :func:`stop_move_bps`, never above ``max_loss_bps``.
+
+    The exit compares the estimated net of selling now with ``-stop_net``,
+    and that estimate starts at ``-entry_cost_bps`` (fees, latency and the
+    spread of both legs) the moment the position is bought. A stop of the
+    entry cost plus an adverse move of two 1m ATR (at least 25 bps) therefore
+    fires on a real adverse move, never on the unchanged book. None when that
+    sum exceeds ``max_loss_bps`` (the hard cap on the estimated net loss of a
+    cycle is never exceeded: the cycle is not entered) or an input is unusable.
+    """
+    move, cost = stop_move_bps(features), _number(entry_cost_bps)
+    if move is None or cost is None or cost < 0:
         return None
-    return min(max(raw, STOP_FLOOR_BPS), params.max_loss_bps)
+    total = cost + move
+    return total if total <= params.max_loss_bps else None
+
+
+def entry_cost_bps(*, budget_cap, max_debit, break_even_bid, best_bid) -> float | None:
+    """The loss carried at entry, in bps of ``budget_cap``, or None when it cannot be measured.
+
+    The estimated net of selling ``sellable`` at exit bid ``X`` is linear in
+    ``X`` and zero at the break-even bid, so selling at the current best bid
+    the moment the position is bought nets ``-max_debit * (1 - best_bid /
+    break_even_bid)``.
+    """
+    cap, debit = _decimal(budget_cap), _decimal(max_debit)
+    even, bid = _decimal(break_even_bid), _decimal(best_bid)
+    if cap is None or cap <= 0 or debit is None or debit < 0 or even is None or even <= 0 or bid is None or bid <= 0:
+        return None
+    carried = money.mul(debit, money.sub(money.ONE, money.div(bid, even))) if even > bid else money.ZERO
+    return float(money.mul(money.div(carried, cap), money.BPS))
 
 
 # ----------------------------------------------------------------------- entry
@@ -584,28 +610,27 @@ def _sizing_amounts(sizing: dict) -> tuple[dict | None, str]:
     return amounts, ''
 
 
-def _stop_room(check, stop_bps: float, atr_bps: float, *, budget_cap: Decimal, max_debit: Decimal, break_even,
-               best_bid) -> None:
-    """Record ``stop_beyond_entry_cost``: the stop must clear the loss carried at entry by one ATR.
+def _stop_with_cost(check, features: Features, params: MicroParams, *, budget_cap: Decimal, max_debit: Decimal,
+                    break_even, best_bid) -> float | None:
+    """Record ``stop_beyond_entry_cost`` and return the stop in bps, or None.
 
-    The estimated net of selling ``sellable`` at exit bid ``X`` is linear in
-    ``X`` and zero at the break-even bid, so selling at the current best bid
-    the moment the position is bought nets ``-max_debit * (1 - best_bid /
-    break_even_bid)``: fees, latency and the spread of both legs. A stop
-    smaller than that fires on the first exit check with the book unchanged.
+    The stop is the loss carried at entry plus the ATR move
+    (:func:`stop_net_bps`); the sum must fit the loss cap (else
+    NO_ECONOMIC_EDGE), and an unmeasurable entry cost is an ERROR.
     """
-    even, bid = _decimal(break_even), _decimal(best_bid)
-    if even is None or even <= 0 or bid is None or bid <= 0:
+    cost = entry_cost_bps(budget_cap=budget_cap, max_debit=max_debit, break_even_bid=break_even, best_bid=best_bid)
+    if cost is None:
         check('stop_beyond_entry_cost', False, ERROR, 'break-even bid unknown: the loss carried at entry cannot be '
               'measured', break_even_bid=break_even)
-        return
-    carried = money.mul(max_debit, money.sub(money.ONE, money.div(bid, even))) if even > bid else money.ZERO
-    carried_bps = float(money.mul(money.div(carried, budget_cap), money.BPS))
-    room, need = stop_bps - carried_bps, STOP_MIN_ROOM_ATR * atr_bps
-    check('stop_beyond_entry_cost', room >= need, NO_ECONOMIC_EDGE,
-          f'stop {stop_bps:.1f} bps leaves {room:.1f} bps beyond the {carried_bps:.1f} bps lost at entry (needs '
-          f'{need:.1f} bps, {STOP_MIN_ROOM_ATR:g} ATR)', stop_net_bps=stop_bps, entry_cost_bps=carried_bps,
-          room_bps=room, min_room_bps=need, break_even_bid=even, best_bid=bid)
+        return None
+    move = stop_move_bps(features)
+    stop_bps = stop_net_bps(features, params, cost)
+    check('stop_beyond_entry_cost', stop_bps is not None, NO_ECONOMIC_EDGE,
+          f'stop {cost + move:.1f} bps: {cost:.1f} bps lost at entry plus a {move:.1f} bps adverse move '
+          f'(max of {STOP_ATR_MULTIPLE:g} ATR and {STOP_FLOOR_BPS:g}), against the {params.max_loss_bps:g} bps loss cap',
+          stop_net_bps=cost + move, entry_cost_bps=cost, move_bps=move, max_loss_bps=params.max_loss_bps,
+          break_even_bid=_decimal(break_even), best_bid=_decimal(best_bid))
+    return stop_bps
 
 
 def evaluate_entry(*, symbol, features, regime, regime_reasons, sizing: dict, book_summary: dict,
@@ -815,14 +840,16 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
     # ---- economics: a feasibility heuristic, never an expected value
     stop_bps = expected_range = required = None
     if features is not None:
-        stop_bps = stop_net_bps(features, params)
-        check('stop_within_loss_cap', stop_bps is not None, VOLATILITY,
-              f'stop {stop_bps:.1f} bps within the {params.max_loss_bps:g} bps loss cap' if stop_bps is not None else
-              f'a 2 ATR stop ({2 * features.atr_bps:.1f} bps) exceeds the {params.max_loss_bps:g} bps loss cap')
+        move = stop_move_bps(features)
+        fits = move is not None and move <= params.max_loss_bps
+        check('stop_within_loss_cap', fits, VOLATILITY,
+              f'a {move:.1f} bps adverse-move stop fits the {params.max_loss_bps:g} bps loss cap' if fits else
+              f'a {STOP_ATR_MULTIPLE:g} ATR stop ({STOP_ATR_MULTIPLE * features.atr_bps:.1f} bps) exceeds the '
+              f'{params.max_loss_bps:g} bps loss cap before any entry cost', move_bps=move)
         expected_range = features.atr_bps * math.sqrt(params.max_hold_s / 60)
-        if stop_bps is not None and budget_cap is not None and quote_ok:
-            _stop_room(check, stop_bps, features.atr_bps, budget_cap=budget_cap, max_debit=max_debit,
-                       break_even=sizing.get('break_even_bid'), best_bid=book.get('best_bid'))
+        if fits and budget_cap is not None and quote_ok:
+            stop_bps = _stop_with_cost(check, features, params, budget_cap=budget_cap, max_debit=max_debit,
+                                       break_even=sizing.get('break_even_bid'), best_bid=book.get('best_bid'))
     if own_sizing:
         required = _number(sizing.get('required_move_bps'))
         if required is not None and required <= 0:
@@ -852,6 +879,8 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
         if problem is not None:      # recorded only when it fails: amounts are not a market condition
             check('amounts', False, ERROR, f'target and stop amounts cannot be computed ({problem})')
 
+    if candidate is not None and stop_bps is None and all(item['passed'] for item in checks):
+        check('stop', False, ERROR, 'no stop distance could be computed')     # fail closed, never enter without one
     failed = [item for item in checks if not item['passed']]
     codes = tuple(item['code'] for item in failed)
     reasons = tuple(item['detail'] for item in failed)

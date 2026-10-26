@@ -354,7 +354,10 @@ def test_momentum_pullback_enters_a_clean_uptrend_after_a_pullback(momentum):
     # Targets and stops are in quote, scaled from the 25 USDT cap; the stop never exceeds the loss cap.
     assert D(proposal['target_net']) >= D('25') * D('20') / 10000
     assert D('0') < D(proposal['stop_net']) <= D('25') * D('80') / 10000
-    assert proposal['stop_net_bps'] == ms.stop_net_bps(momentum, PARAMS)
+    # The stop is the loss carried at entry (5 bps: break-even 100.04 against the 99.99 bid) plus the ATR move.
+    cost = ms.entry_cost_bps(budget_cap='25', max_debit='25.00', break_even_bid='100.04', best_bid='99.99')
+    assert 4.9 < cost < 5.1
+    assert proposal['stop_net_bps'] == ms.stop_net_bps(momentum, PARAMS, cost) == cost + ms.stop_move_bps(momentum)
     assert proposal['max_hold_s'] == 1800 and proposal['required_move_bps'] == '15'
     assert proposal['expected_range_bps'] == pytest.approx(momentum.atr_bps * math.sqrt(30))
     assert proposal['heuristic_rank'] >= 1 / PARAMS.edge_ratio and 'not calibrated' in proposal['heuristic_note']
@@ -453,7 +456,8 @@ def test_a_smaller_consistent_sizing_still_enters_and_scales_from_its_own_cap(mo
     small = sizing(budget_cap='10', target_budget='10', gross_quote='9.98', fee_reserve='0.02', max_debit='10.00')
     decision = decide(momentum, sizing_record=small)
     assert decision.action == 'enter'
-    assert D(decision.proposal['target_net']) == D('0.02') and D(decision.proposal['stop_net']) == D('0.025')
+    # The 25 bps move plus the 5 bps entry cost, both of the 10 USDT cap.
+    assert D(decision.proposal['target_net']) == D('0.02') and D('0.0299') < D(decision.proposal['stop_net']) <= D('0.03')
     assert decide(momentum).proposal['target_net'] == '0.050'      # the 25 USDT cap itself is allowed
 
 
@@ -474,36 +478,51 @@ def test_a_sizing_result_for_another_symbol_is_never_used(momentum):
     assert decide(momentum).inputs['sizing']['symbol'] == 'ETH/USDT'
 
 
-def test_the_stop_must_clear_the_loss_the_position_carries_at_entry(momentum):
-    """A stop inside the round-trip cost fires on the first exit check while the book is unchanged."""
+def test_the_stop_is_the_loss_carried_at_entry_plus_an_adverse_move(momentum):
+    """A stop that ignored the round-trip cost would fire on the first exit check while the book is unchanged."""
     params = dataclasses.replace(PARAMS, target_net_bps=5)
     record, immediate = contract_sizing(target_bps=5)
     assert D('33') < D(record['required_move_bps']) < D('34.2')
-    volatile = dataclasses.replace(momentum, atr_bps=12.5)          # 2 ATR = 25 bps: the floor
-    limit = params.edge_ratio * volatile.atr_bps * math.sqrt(params.max_hold_s / 60)
-    assert float(record['required_move_bps']) <= limit                # the contract's economic gate passes
-    stop_net = D('25') * D('25') / 10000
-    assert immediate <= -stop_net                                      # selling now already hits the stop
-    exit_now = exit_for(estimate(money.text(immediate), uncertainty='0.0125'), target=D('0.0125'), stop=stop_net)
+    calm = dataclasses.replace(momentum, atr_bps=12.5)              # 2 ATR = 25 bps: the floor
+    limit = params.edge_ratio * calm.atr_bps * math.sqrt(params.max_hold_s / 60)
+    assert float(record['required_move_bps']) <= limit                # the economic gate passes
+    # The contract's original stop, clamp(2 ATR, 25, max_loss) = 25 bps, sits inside the cost: selling at once hits it.
+    old_stop = D('25') * D('25') / 10000
+    exit_now = exit_for(estimate(money.text(immediate), uncertainty='0.0125'), target=D('0.0125'), stop=old_stop)
     assert (exit_now.action, exit_now.trigger) == ('exit', 'stop_loss')
-    decision = decide(volatile, params=params, sizing_record=record)
-    assert_abstains(decision, ms.NO_ECONOMIC_EDGE)
-    assert [c['check'] for c in decision.checks if not c['passed']] == ['stop_beyond_entry_cost']
-    room = next(c for c in decision.checks if c['check'] == 'stop_beyond_entry_cost')
-    assert room['stop_net_bps'] == 25.0 and 30 < room['entry_cost_bps'] < 31 and room['room_bps'] < 0
-    # The default 20 bps target: a 36 bps stop clears the 31 bps cost by 5 bps, far less than one 18 bps ATR.
-    record20, _ = contract_sizing(target_bps=20)
-    wider = dataclasses.replace(momentum, atr_bps=18.0)
-    assert float(record20['required_move_bps']) <= PARAMS.edge_ratio * 18.0 * math.sqrt(30)
-    assert_abstains(decide(wider, sizing_record=record20), ms.NO_ECONOMIC_EDGE)
-    # A market whose ATR leaves a full ATR beyond the cost may enter on the same sizing.
-    roomy = dataclasses.replace(momentum, atr_bps=31.5)
-    entered = decide(roomy, sizing_record=record20)
-    assert entered.action == 'enter' and entered.proposal['stop_net_bps'] == 63.0
-    # An eligible sizing that hides its break-even bid cannot show the stop clears the cost.
+    decision = decide(calm, params=params, sizing_record=record)
+    assert decision.action == 'enter'
+    stop = next(c for c in decision.checks if c['check'] == 'stop_beyond_entry_cost')
+    assert 30 < stop['entry_cost_bps'] < 31 and stop['move_bps'] == 25.0
+    assert decision.proposal['stop_net_bps'] == pytest.approx(stop['entry_cost_bps'] + 25.0)
+    stop_net = D(decision.proposal['stop_net'])
+    assert -stop_net < immediate                                         # the unchanged book does not trigger it
+    held = exit_for(estimate(money.text(immediate), uncertainty='0.0125'), target=D('0.0125'), stop=stop_net)
+    assert held.action == 'hold'
+    # The same move beyond a cost that leaves no room under the loss cap is refused, never entered with a smaller stop.
+    tight = dataclasses.replace(params, max_loss_bps=50)
+    refused = decide(calm, params=tight, sizing_record=record)
+    assert_abstains(refused, ms.NO_ECONOMIC_EDGE)
+    assert [c['check'] for c in refused.checks if not c['passed']] == ['stop_beyond_entry_cost']
+    # The move alone beyond the cap is a volatility refusal, reported before the cost is even counted.
+    wild = decide(dataclasses.replace(momentum, atr_bps=40.5), sizing_record=record)
+    assert_abstains(wild, ms.VOLATILITY)
+    assert 'stop_beyond_entry_cost' not in [c['check'] for c in wild.checks]
+    # An eligible sizing that hides its break-even bid cannot show what the entry costs.
     hidden = decide(momentum, sizing_record=sizing(break_even_bid=None))
     assert_abstains(hidden, ms.ERROR)
     assert [c['check'] for c in hidden.checks if not c['passed']] == ['stop_beyond_entry_cost']
+
+
+def test_entry_cost_is_measured_from_the_break_even_bid_or_not_at_all():
+    assert ms.entry_cost_bps(budget_cap='25', max_debit='25', break_even_bid='100', best_bid='100') == 0.0
+    assert ms.entry_cost_bps(budget_cap='25', max_debit='25', break_even_bid='100', best_bid='101') == 0.0
+    assert ms.entry_cost_bps(budget_cap='25', max_debit='25', break_even_bid='100', best_bid='99') == \
+        pytest.approx(100.0)
+    for bad in (dict(break_even_bid=None), dict(break_even_bid='0'), dict(best_bid='-1'), dict(budget_cap='0'),
+                dict(max_debit='nan'), dict(best_bid='junk')):
+        args = {**dict(budget_cap='25', max_debit='25', break_even_bid='100', best_bid='99'), **bad}
+        assert ms.entry_cost_bps(**args) is None
 
 
 @pytest.mark.parametrize('seed', [1, 2, 3, 4, 5])
@@ -791,17 +810,21 @@ def test_params_accept_the_settings_bounds_and_amount_errors_abstain(momentum):
     assert [c['check'] for c in decision.checks if not c['passed']] == ['amounts']
 
 
-def test_stop_is_twice_atr_floored_at_25_and_never_beyond_the_loss_cap(momentum):
-    def stop(atr, cap=80.0):
+def test_stop_is_the_entry_cost_plus_twice_atr_floored_at_25_and_never_beyond_the_loss_cap(momentum):
+    def stop(atr, cap=80.0, cost=0.0):
         return ms.stop_net_bps(dataclasses.replace(momentum, atr_bps=atr),
-                               dataclasses.replace(PARAMS, max_loss_bps=cap))
+                               dataclasses.replace(PARAMS, max_loss_bps=cap), cost)
     assert stop(5.0) == 25.0 and stop(20.0) == 40.0 and stop(40.0) == 80.0
     assert stop(40.01) is None                     # a 2 ATR stop the cap cannot hold: too volatile
-    assert stop(8.0, cap=20.0) == 20.0             # a cap below the floor wins
+    assert stop(8.0, cap=20.0) is None             # a cap below the 25 bps floor holds no stop: never entered
+    assert stop(5.0, cost=30.0) == 55.0 and stop(20.0, cost=40.0) == 80.0
+    assert stop(20.0, cost=40.5) is None           # cost plus move beyond the cap
+    assert stop(5.0, cost=-1.0) is None and stop(5.0, cost=float('nan')) is None
     # Features refuse a NaN ATR; anything else carrying one gets no stop.
     with pytest.raises(ValueError):
         dataclasses.replace(momentum, atr_bps=float('nan'))
     assert ms.stop_net_bps(types.SimpleNamespace(atr_bps=float('nan')), PARAMS) is None
+    assert ms.stop_move_bps(types.SimpleNamespace(atr_bps=-1.0)) is None
 
 
 # --------------------------------------------------------------------- exit

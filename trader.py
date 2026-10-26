@@ -13,6 +13,7 @@ from typing import Any
 import ccxt
 
 import credentials
+import decision
 import observability
 import orders
 import paper_exchange
@@ -90,6 +91,7 @@ class TradingEngine:
         self._last_authorization: risk.Authorization | None = None
         self.paper = self._new_paper_exchange()
         self.unresolved_probe: list[dict] = []
+        self.decisions = decision.DecisionLog()
         # A simulated order has no exchange-side effect; a crash mid-paper-order
         # leaves nothing to reconcile, so its intent is closed at startup.
         storage.abandon_stale_paper_intents(self.exchange_name)
@@ -1308,21 +1310,22 @@ class TradingEngine:
             return False
 
     def _protect_positions(self, symbol: str, price: float):
+        """Stored stop/target check at an observed bid; no trailing update here."""
         for position in self._active_positions(self.mode):
             if position['symbol'] == symbol:
-                if self._is_dust(position, self._catalogue().get(symbol), price):
-                    continue
-                if price <= position['stop']:
-                    self._sell(position, price, 'Stored stop / trailing stop (software monitored)')
-                elif price >= position['target']:
-                    self._sell(position, price, 'Stored profit target (software monitored)')
+                verdict = decision.evaluate_exit(position, price, dust=self._is_dust(
+                    position, self._catalogue().get(symbol), price))
+                if verdict['action'] == 'exit':
+                    self._sell(position, price, verdict['reason'])
 
     def _mark_positions(self, symbol: str, price: float, atr: float, trend_broken: bool):
         for position in self._active_positions(self.mode):
             if position['symbol'] != symbol:
                 continue
-            highest = max(float(position['highest']), price)
-            stop = max(float(position['stop']), highest - 2.5 * atr) if finite_positive(atr) else float(position['stop'])
+            verdict = decision.evaluate_exit(position, price, atr=atr if finite_positive(atr) else None,
+                                             trend_broken=trend_broken,
+                                             dust=self._is_dust(position, self._catalogue().get(symbol), price))
+            highest, stop = verdict['highest'], verdict['stop']
             # An unchanged level needs no durable (fsync) write on every poll.
             if highest != float(position['highest']) or stop != float(position['stop']):
                 try:
@@ -1332,12 +1335,8 @@ class TradingEngine:
                 except Exception as exc:
                     self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
                     return
-            if (self._orders_allowed() and not self._is_dust(
-                    position, self._catalogue().get(symbol), price)):
-                if price <= stop:
-                    self._sell(position, price, 'Updated trailing stop (software monitored)')
-                elif trend_broken:
-                    self._sell(position, price, 'Completed-candle trend reversal')
+            if verdict['action'] == 'exit' and self._orders_allowed():
+                self._sell(position, price, verdict['reason'])
 
     def scan_once(self, allow_orders: bool = False, exited_symbols=None):
         # Acquiring this while holding the state lock makes config/start checks
@@ -1430,31 +1429,44 @@ class TradingEngine:
                     # HTF data gates entries only. Stops and trend exits above
                     # remain independent of a higher-timeframe API failure.
                     filters = self.cfg.get('market_filters', True)
+                    higher_error = higher_candle_ts = None
+                    regime_ok, market_ok = False, None
                     try:
                         higher = self.data.candles(symbol, higher_tf, limit=85)
                         regime_ok = regime_signal(higher)
+                        higher_candle_ts = int(higher.iloc[-1]['timestamp']) if len(higher) else None
                         market_ok = (self._market_regime(higher_tf, market_state)
                                      if filters and symbol != MARKET_SYMBOL else None)
-                        signal, reason, score = entry_signal(last, regime_ok=regime_ok, rapid=horizon == 'rapid',
-                                                             market_ok=market_ok, filters=filters)
                     except Exception as exc:
-                        regime_ok, signal, score = False, False, 0
-                        reason = f'Higher-timeframe data unavailable: {type(exc).__name__}'
-                    liquid = volume >= self.cfg['min_quote_volume']
-                    spread_ok = spread is not None and spread <= self.cfg['max_spread_pct']
-                    if not liquid:
-                        reason = 'Low or unknown 24h quote volume'
-                    elif not spread_ok:
-                        reason = 'Wide or unknown bid-ask spread'
+                        higher_error = type(exc).__name__
+                    # One pure, replayable decision per symbol; the record keeps
+                    # every check, the data timestamps and the abstention reason.
+                    decided_at = time.time()
+                    with self.lock:
+                        quote_ts = self.last_price_times.get(symbol)
+                    held_now = any(p['symbol'] == symbol for p in self._active_positions(self.mode))
+                    verdict = decision.evaluate_entry(
+                        symbol=symbol, last=last, regime_ok=regime_ok, market_ok=market_ok, rapid=horizon == 'rapid',
+                        filters=filters, price=price, volume=volume, spread_pct=spread, quote_age_s=self._price_age(symbol),
+                        quote_ts=quote_ts, cfg=self.cfg, now=decided_at, held=held_now,
+                        exited_this_candle=symbol in exited_symbols, higher_candle_ts=higher_candle_ts,
+                        higher_error=higher_error, signal_fn=entry_signal, price_ok_fn=entry_price_ok,
+                        quality_fn=setup_quality)
+                    self.decisions.add(verdict)
+                    self.metrics.incr(f'decision.{verdict.action}')
+                    if quote_ts is not None:
+                        self.metrics.observe('decision.quote_to_decision_ms', max(0.0, (decided_at - quote_ts) * 1000))
+                    observability.event('decision.entry', decision_id=verdict.decision_id, symbol=symbol,
+                                        action=verdict.action, status=verdict.status, score=verdict.score,
+                                        confidence=verdict.confidence, reasons=list(verdict.reasons),
+                                        signal_candle_ts_ms=verdict.inputs['signal_candle_ts_ms'],
+                                        quote_age_s=verdict.inputs['quote_age_s'])
+                    reason, score, candidate = verdict.status, verdict.score, verdict.action == 'enter'
                     signal_close = float(last['close'])
-                    close_enough = entry_price_ok(price, signal_close, atr)
-                    if signal and not close_enough:
-                        reason = 'Market price moved too far from the completed signal candle'
-                    candidate = bool(signal and liquid and spread_ok and close_enough
-                                     and self._fresh(symbol) and symbol not in exited_symbols)
                     if candidate:
                         # Every candidate passed all checks; rank by setup quality, then turnover.
-                        candidates.append((setup_quality(last), volume, symbol, price, atr, int(last['timestamp']), signal_close))
+                        candidates.append((verdict.proposal['quality'], volume, symbol, price, atr, int(last['timestamp']),
+                                           signal_close, verdict.decision_id))
                     rsi = float(last['rsi'])
                     assessments.append({'symbol': symbol, 'price': price, 'bid': self.last_prices[symbol],
                                         'ask': self.last_asks.get(symbol), 'price_basis': 'ask' if symbol in self.last_asks else 'bid',
@@ -1469,7 +1481,9 @@ class TradingEngine:
                                         'regime': 'uptrend' if regime_ok else 'weak',
                                         'kind': 'MEME' if is_meme(symbol) else 'CORE' if symbol.split('/')[0] in ('BTC', 'ETH') else 'ALT',
                                         'status': reason, 'candidate': candidate, 'timeframe': primary_tf,
-                                        'price_age_seconds': self._price_age(symbol)})
+                                        'price_age_seconds': self._price_age(symbol),
+                                        'decision_id': verdict.decision_id, 'decision': verdict.action,
+                                        'confidence': verdict.confidence, 'reasons': list(verdict.reasons)})
                     successful_assessments += 1
                 except Exception as exc:
                     with self.lock:
@@ -1719,6 +1733,7 @@ class TradingEngine:
         for candidate in candidates:
             _score, _volume, symbol, observed_price, atr, candle = candidate[:6]
             signal_close = candidate[6] if len(candidate) > 6 else observed_price
+            decision_id = candidate[7] if len(candidate) > 7 else None
             if count >= 2 or not self._orders_allowed():
                 break
             positions = self._active_positions(self.mode)
@@ -1756,7 +1771,7 @@ class TradingEngine:
                         self.risk_block = 'Aggregate protective-stop risk cap reached'
                 continue
             if self._buy(symbol, budget, price, fraction, entry_candle=candle, kind='entry',
-                         signal_close=signal_close, atr=atr, spread=spread):
+                         signal_close=signal_close, atr=atr, spread=spread, decision_id=decision_id):
                 count += 1
             if self.mode == 'live' and self.live_halted:
                 break

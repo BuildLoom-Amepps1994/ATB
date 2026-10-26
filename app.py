@@ -270,6 +270,12 @@ def risk_action(req: RiskAction):
     return ensure_ok(work)
 
 
+@app.get('/api/decisions')
+def decisions(symbol: str | None = None, limit: int = 50):
+    """Recent decision records (entries, holds and abstentions with reasons). Local only."""
+    return ensure_ok(lambda: {'decisions': engine.decisions.recent(symbol.upper() if symbol else None, max(1, min(int(limit), 500)))})
+
+
 @app.get('/api/metrics')
 def metrics():
     """In-process telemetry: counters, gauges and p50/p95/p99 latencies. Local only."""

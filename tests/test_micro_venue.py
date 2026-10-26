@@ -38,6 +38,8 @@ class Book:
     """Duck-typed stand-in for micro_book.BookSnapshot."""
     bids: tuple
     asks: tuple
+    symbol: str | None = SYMBOL
+    exchange: str | None = 'mexc'
     depth_known: bool = True
     generation: int = 7
     venue_sequence: int | None = 900001
@@ -175,6 +177,21 @@ def test_adverse_bps_moves_every_level_against_the_order():
     assert adverse['info']['adverse_bps'] == '10'
 
 
+def test_adverse_bps_also_moves_the_deeper_levels_an_order_walks_into():
+    v = venue()
+    up, down = D('1.001'), D('0.999')
+    buy = v.create_market_buy_order_with_cost(SYMBOL, D('25.00'), params(adverse_bps=D('10')))
+    # Two whole levels at their adverse prices, then whole steps of the third:
+    # floor((25 - 10.01 - 10.014004) / 2512.51) = 0.0019.
+    assert buy['info']['levels_used'] == 3
+    assert exact(buy, 'filled') == D('0.004') + D('0.004') + D('0.0019')
+    assert exact(buy, 'cost') == (D('0.004') * ASKS[0][0] * up + D('0.004') * ASKS[1][0] * up
+                                  + D('0.0019') * ASKS[2][0] * up)
+    sell = v.create_order(SYMBOL, 'market', 'sell', D('0.03'), None, params(adverse_bps=D('10')))
+    assert sell['info']['levels_used'] == 2
+    assert exact(sell, 'cost') == D('0.01') * BIDS[0][0] * down + D('0.02') * BIDS[1][0] * down
+
+
 def test_base_fee_buy_delivers_fewer_coins_and_quote_fee_bills_usdt():
     base_billed = venue({SYMBOL: rules(buy_fee_currency='base')})
     order = base_billed.create_market_buy_order_with_cost(SYMBOL, D('5.00'), params())
@@ -206,6 +223,29 @@ def test_sells_walk_the_bids_and_a_larger_sale_receives_a_worse_vwap():
     assert exact(large, 'average') < exact(small, 'average')
     assert large['status'] == 'closed' and large['amount'] == 0.03 and large['remaining'] == 0.0
     assert large['info']['levels_used'] == 2
+
+
+def test_a_partial_level_never_spends_more_than_the_requested_cost():
+    # A 34-digit price makes money.div round the step count up onto a boundary.
+    price = D('1245.454545454545454545454545454546')
+    asks = ((price, D('1')),)
+    overspent = []
+    for cents in range(100, 3000):
+        spend = D(cents) / 100
+        fill = micro_venue._walk_asks(asks, spend=spend, adverse=money.ZERO, amount_step=STEP)
+        assert fill.base == money.q_down(fill.base, STEP)
+        if fill.quote > spend:
+            overspent.append(spend)
+        # Never more than the cost, and never a whole step less than it could buy
+        # (in the 34-digit money context: the default 28 digits would round these).
+        assert money.sub(spend, fill.quote) < money.mul(STEP, price)
+    assert overspent == []
+    v = venue()
+    order = v.create_market_buy_order_with_cost(
+        SYMBOL, D('1.37'), params(book=book(asks=asks, bids=((D('1245'), D('1')),))))
+    assert exact(order, 'cost') <= D('1.37') and exact(order, 'remaining_cost') >= 0
+    assert exact(order, 'filled') == D('0.001') and exact(order, 'cost') == money.mul(D('0.001'), price)
+    assert v.records()[0]['cost'] == exact(order, 'cost')
 
 
 def test_exhausted_depth_cancels_the_remainder_with_an_exact_partial_fill():
@@ -293,8 +333,9 @@ REJECTIONS = [
     ('no-cost-buys', _set(('info', 'quoteOrderQtyMarketAllowed'), False), _buy(D('5')),
      venue_rules.COST_BUY_UNSUPPORTED),
     ('unknown-taker-fee', _set(('taker',), None), _buy(D('5')), 'taker fee is unknown'),
-    ('unknown-quote-step', _set(('precision', 'price'), None), _buy(D('5')), 'quote-amount step is unknown'),
-    ('unknown-quantity-step', _set(('precision', 'amount'), None), _sell(D('0.001')), 'quantity step is unknown'),
+    ('off-the-fallback-quote-step', _set(('precision', 'price'), None), _buy(D('5.000000005')),
+     'multiple of the quote-amount step 0.00000001'),
+    ('unknown-quantity-step-buy', _set(('precision', 'amount'), None), _buy(D('5')), 'quantity step is unknown'),
     ('missing-book', None, _buy(D('5'), book=None), 'needs a depth book'),
     ('one-sided-book', None, _buy(D('5'), book=book(bids=())), 'needs a depth book'),
     ('crossed-book', None, _buy(D('5'), book=book(bids=((D('2501'), D('1')),))), 'crossed'),
@@ -304,6 +345,12 @@ REJECTIONS = [
     ('unknown-level-quantity', None, _buy(D('5'), book=book(asks=((D('2500'), D('0.004')), (D('2501'), None)))),
      'needs a depth book'),
     ('unsorted-book', None, _sell(D('0.001'), book=book(bids=tuple(reversed(BIDS)))), 'not sorted'),
+    ('other-symbol-book', None,
+     _buy(D('25.00'), book=book(symbol='BTC/USDT', asks=((D('60000'), D('1')),), bids=((D('59999'), D('1')),))),
+     'book is for BTC/USDT on mexc'),
+    ('other-exchange-book', None, _sell(D('0.001'), book=book(exchange='kraken')), 'book is for ETH/USDT on kraken'),
+    ('book-without-symbol', None, _buy(D('5'), book=book(symbol=None)), 'book is for None'),
+    ('book-without-exchange', None, _buy(D('5'), book=book(exchange=None)), 'on None'),
     ('no-client-order-id', None, lambda v: v.create_market_buy_order_with_cost(SYMBOL, D('5'), {'book': book()}),
      'clientOrderId'),
     ('negative-cost', None, _buy(D('-5')), 'cost'),
@@ -340,6 +387,78 @@ def test_unpublished_limits_are_listed_as_unchecked_not_treated_as_zero():
     order = v.create_order(SYMBOL, 'market', 'sell', D('0.001'), None, params())
     assert 'maximum quantity not published' in order['info']['unchecked']
     assert not any('minimum' in item for item in order['info']['unchecked'])
+
+
+def test_unpublished_steps_follow_the_sizing_fallback_and_never_block_an_exit():
+    raw = market()
+    raw['precision']['price'] = None
+    v = venue({SYMBOL: rules(raw)})
+    # Sizing (contract step 3) proceeds on a 0.00000001 quote step when none is published.
+    assert v.cost_to_precision(SYMBOL, '24.975024975') == '24.97502497'
+    buy = v.create_market_buy_order_with_cost(SYMBOL, D('24.97502497'), params())
+    assert buy['status'] == 'closed' and D(0) < exact(buy, 'cost') <= D('24.97502497')
+    assert any(item.startswith('quote-amount step not published') for item in buy['info']['unchecked'])
+    raw = market()
+    raw['precision']['amount'] = None
+    v = venue({SYMBOL: rules(raw)})
+    # A held position stays exitable: the sell fills as asked and says the step was not checked.
+    assert v.amount_to_precision(SYMBOL, D('0.0099')) == '0.0099'
+    with pytest.raises(ccxt.InvalidOrder):
+        v.amount_to_precision(SYMBOL, 0)
+    sell = v.create_order(SYMBOL, 'market', 'sell', D('0.0099'), None, params())
+    assert sell['status'] == 'closed' and exact(sell, 'filled') == D('0.0099')
+    assert any(item.startswith('quantity step not published') for item in sell['info']['unchecked'])
+    v.partial_next = D('0.5')
+    half = v.create_order(SYMBOL, 'market', 'sell', D('0.0099'), None, params())
+    assert half['status'] == 'canceled' and exact(half, 'filled') == D('0.00495')
+    # A buy still needs the quantity step to fill in whole steps (see REJECTIONS).
+    with pytest.raises(ccxt.InvalidOrder, match='quantity step is unknown'):
+        v.create_market_buy_order_with_cost(SYMBOL, D('5.00'), params())
+
+
+def test_orders_beyond_the_paper_balance_are_insufficient_funds_and_store_nothing():
+    wallet = {'USDT': 25.0, 'ETH': 0.01}
+    v = micro_venue.MicroPaperVenue('mexc', rules=lambda symbol: rules(), balances=lambda: dict(wallet))
+    refused = (
+        lambda: v.create_market_buy_order_with_cost(SYMBOL, D('25.00'), params()),       # + 0.0125 USDT fee
+        lambda: v.create_market_buy_order_with_cost(SYMBOL, D('900.00'), params()),
+        lambda: v.create_order(SYMBOL, 'market', 'sell', D('0.0101'), None, params()),
+        lambda: v.create_order(SYMBOL, 'market', 'sell', D('0.01'), None, params(fee_currency='base')),  # + base fee
+    )
+    for call in refused:
+        with pytest.raises(ccxt.InsufficientFunds) as raised:
+            call()
+        assert isinstance(raised.value, orders.definite_rejections())
+    assert v.records() == []
+    # Within the balance, the maximum fee included, the same orders fill.
+    bought = v.create_market_buy_order_with_cost(SYMBOL, D('24.98'), params(clientOrderId='funded-1'))
+    assert bought['status'] == 'closed'
+    assert v.create_market_buy_order_with_cost(SYMBOL, D('25.00'), params(fee_currency='base'))['status'] == 'closed'
+    assert v.create_order(SYMBOL, 'market', 'sell', D('0.01'), None, params())['status'] == 'closed'
+    # A balance that changed after acceptance never turns the accepted order into a rejection.
+    wallet['USDT'] = 0.0
+    repeat = v.create_market_buy_order_with_cost(SYMBOL, D('24.98'), {'clientOrderId': 'funded-1', 'book': book()})
+    assert repeat['id'] == bought['id']
+    # A balance the ledger does not report is unknown, not zero: the order fills and says so.
+    wallet.clear()
+    order = v.create_market_buy_order_with_cost(SYMBOL, D('5.00'), params())
+    assert order['status'] == 'closed' and 'free USDT balance not known' in order['info']['unchecked']
+    assert len(v.records()) == 4
+
+
+def test_a_value_the_store_could_not_read_back_is_refused_before_it_is_stored():
+    raw = market()
+    raw['taker'] = None
+    v = venue({SYMBOL: rules(raw)})
+    # A fee of 0.0019 ETH * 1e-30 has an exponent the read path refuses.
+    with pytest.raises(ccxt.InvalidOrder, match='fee_cost') as raised:
+        v.create_market_buy_order_with_cost(SYMBOL, D('5.00'), params(clientOrderId='tiny-fee', taker_fee=D('1e-30'),
+                                                                      fee_currency='base'))
+    assert isinstance(raised.value, orders.definite_rejections())
+    assert v.records() == [] and v.fetch_closed_orders() == []
+    assert orders.locate(v, SYMBOL, 'tiny-fee') is None
+    accepted = v.create_market_buy_order_with_cost(SYMBOL, D('5.00'), params(taker_fee=D('0.001')))
+    assert [record['client_order_id'] for record in v.records()] == [accepted['clientOrderId']]
 
 
 # ------------------------------------------------------------- idempotency
@@ -461,8 +580,10 @@ def test_dropped_response_is_resolved_by_a_read_only_lookup_without_a_resend():
         v.fetch_order(found['id'], 'BTC/USDT')
 
 
-@pytest.mark.parametrize('side,size,fraction', [('buy', D('25.00'), D('0.8')), ('sell', D('0.03'), D('1'))])
-def test_late_fill_reports_a_cancel_first_and_a_larger_cumulative_fill_later(side, size, fraction):
+@pytest.mark.parametrize('side,size,fraction,first_levels', [('buy', D('25.00'), D('0.8'), 1),
+                                                             ('buy', D('25.00'), D('1'), 2),
+                                                             ('sell', D('0.03'), D('1'), 2)])
+def test_late_fill_reports_a_cancel_first_and_a_larger_cumulative_fill_later(side, size, fraction, first_levels):
     v = venue()
     v.late_fill_next = fraction
     if side == 'buy':
@@ -471,6 +592,9 @@ def test_late_fill_reports_a_cancel_first_and_a_larger_cumulative_fill_later(sid
         first = v.create_order(SYMBOL, 'market', 'sell', size, None, params(clientOrderId='race-1'))
     assert first['status'] == 'canceled' and orders.classify(first) == 'final_filled'
     assert 'late_fill' not in first['info']                 # the first answer does not know the future
+    # Nor does any other field of it: it describes its own fill and names no late-fill injection.
+    assert 'late_fill_next' not in first['info']['injected']
+    assert first['info']['levels_used'] == first_levels and first['info']['depth_exhausted'] is False
     later = [v.fetch_order(first['id'], SYMBOL), v.fetch_order(None, SYMBOL, {'clientOrderId': 'race-1'}),
              v.fetch_closed_orders(SYMBOL)[0]]
     for order in later:
@@ -481,8 +605,12 @@ def test_late_fill_reports_a_cancel_first_and_a_larger_cumulative_fill_later(sid
     (record,) = v.records()
     assert record['filled'] == exact(later[0], 'filled')    # the venue's record is the cumulative fill
     assert record['info']['late_fill']['first_report']['filled'] == first['info']['exact']['filled']
+    assert record['info']['late_fill']['first_report']['levels_used'] == first_levels
+    assert later[0]['info']['levels_used'] == record['info']['levels_used']   # later reads: the stored fill
+    assert record['info']['injected'] == ['late_fill_next']   # the store keeps what was simulated
     if fraction == 1:
-        assert later[0]['status'] == 'closed' and exact(later[0], 'filled') == size
+        assert later[0]['status'] == 'closed'
+        assert (exact(later[0], 'filled') == size) if side == 'sell' else (exact(later[0], 'cost') <= size)
     else:
         assert later[0]['status'] == 'canceled' and exact(later[0], 'cost') <= size * fraction
     assert v.late_fill_next is None
@@ -509,7 +637,7 @@ def test_fetch_closed_orders_filters_symbol_and_since():
     v = venue({SYMBOL: rules(), btc: rules(market(btc), symbol=btc)}, clock=lambda: next(times))
     first = v.create_market_buy_order_with_cost(SYMBOL, D('5.00'), params())
     second = v.create_order(SYMBOL, 'market', 'sell', D('0.001'), None, params())
-    third = v.create_market_buy_order_with_cost(btc, D('5.00'), params())
+    third = v.create_market_buy_order_with_cost(btc, D('5.00'), params(book=book(symbol=btc)))
     assert [o['timestamp'] for o in (first, second, third)] == [1_000_000, 2_000_000, 3_000_000]
     ids = lambda found: [o['id'] for o in found]
     assert ids(v.fetch_closed_orders(SYMBOL)) == [first['id'], second['id']]
@@ -528,6 +656,10 @@ def test_precision_helpers_truncate_and_their_output_is_accepted():
     assert v.cost_to_precision(SYMBOL, 25 / 1.001) == '24.97'
     with pytest.raises(ccxt.InvalidOrder):
         v.amount_to_precision(SYMBOL, 0.00009)
+    # More than 34 significant digits still truncate; they never round up past the input.
+    assert v.amount_to_precision(SYMBOL, '0.00019999999999999999999999999999999999') == '0.0001'
+    assert v.cost_to_precision(SYMBOL, '4.999999999999999999999999999999999999') == '4.99'
+    assert v.cost_to_precision(SYMBOL, D('4.999999999999999999999999999999999999')) == '4.99'
     spend = float(v.cost_to_precision(SYMBOL, 25 / 1.001))   # the engine's own pattern
     assert v.create_market_buy_order_with_cost(SYMBOL, spend, params())['status'] == 'closed'
     quantity = float(v.amount_to_precision(SYMBOL, 0.0123456))

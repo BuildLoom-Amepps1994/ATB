@@ -26,7 +26,13 @@ Semantics:
   fill, and the exact remainder in ``info['exact']``. There is no maker
   simulation, so any other order type raises ``ccxt.NotSupported``.
 * A level whose quantity is unknown (a ticker top of book) cannot be filled
-  against: the order is refused as missing depth.
+  against: the order is refused as missing depth. The book must be the one of
+  the order's symbol on this venue's exchange; any other book is refused, so a
+  symbol mix-up can never become a fill at another pair's prices.
+* Quantization never rounds up. :func:`money.q_down` divides at 34
+  significant digits, so its result is checked against the input and lowered
+  by one step when the division rounded onto the next boundary; the last level
+  of a buy is lowered while it would spend more than the requested cost.
 * The fee is a taker fee: the higher of the public taker schedule and the
   configured rate passed as ``params['taker_fee']``, so a paper fill is never
   charged less than either. A maker rate is never used. It is billed in the
@@ -34,12 +40,20 @@ Semantics:
   or the rules' side-specific fee currency); a base fee on a buy reduces the
   coins delivered, and ``unknown`` bills the quote asset.
 * Definite rejections raise before anything is stored: ``ccxt.BadSymbol`` for
-  a pair the catalogue does not list, ``ccxt.InvalidOrder`` for every other
-  venue rule (untradable side, an amount off its step, below a minimum or
-  above a maximum, a missing, crossed or depth-less book, an unknown fee). A
-  step the rules do not publish cannot be checked, so such an order is
-  refused; a minimum or maximum that is not published is not enforced, and
-  the record lists it under ``info['unchecked']`` (missing is never zero).
+  a pair the catalogue does not list, ``ccxt.InsufficientFunds`` for an order
+  the paper ledger's free balance cannot cover (a quote-billed buy's maximum
+  fee and a base-billed sell's maximum fee included), ``ccxt.InvalidOrder``
+  for every other venue rule (untradable side, an amount off its step, below
+  a minimum or above a maximum, a missing, crossed, depth-less or foreign
+  book, an unknown fee, a figure the store could not read back). A minimum,
+  maximum or balance that is not published is not enforced, and the record
+  lists it under ``info['unchecked']`` (missing is never zero).
+* Unpublished steps follow the contract. A buy's quote amount is checked
+  against the sizing fallback step ``SIZING_FALLBACK_COST_STEP`` (contract
+  sizing step 3) and the record says so. A sell with no published quantity
+  step fills the quantity as given and lists the step as unchecked, so a held
+  position can always be exited. A buy with no quantity step is refused: its
+  last level cannot be filled in whole steps.
 * Idempotency: a client order id is unique per exchange. An identical repeat
   returns the stored order without filling twice; a repeat with different
   terms is ``ccxt.InvalidOrder``. The repeat check runs before the rules and
@@ -60,7 +74,9 @@ book allows and cancels the rest; ``late_fill_next`` stores a fill of that
 fraction of what the book allows but answers the create with status
 ``canceled`` and a smaller partial fill (``LATE_FILL_FIRST_SHARE`` of it), as
 when a cancel acknowledgement races a late fill; every later read shows the
-larger cumulative fill. ``latency_s`` delays every create's response.
+larger cumulative fill. The first answer describes only its own fill (levels
+used, depth) and does not name the late-fill injection; the stored record
+keeps both. ``latency_s`` delays every create's response.
 """
 from __future__ import annotations
 
@@ -95,6 +111,9 @@ DECIMAL_COLUMNS = ('requested_cost', 'requested_amount', 'filled', 'cost', 'aver
 
 # The share of the eventual fill a late-fill injection reports in its first answer.
 LATE_FILL_FIRST_SHARE = Decimal('0.5')
+# The quote-amount step the sizing contract assumes (and records) when the
+# catalogue publishes none; the venue checks a buy against the same step.
+SIZING_FALLBACK_COST_STEP = Decimal('0.00000001')
 NEEDS_DEPTH = 'paper venue needs a depth book'
 # venue_rules.normalize records this issue when the catalogue has no such market.
 _NOT_LISTED = 'market is not in the catalogue'
@@ -123,24 +142,55 @@ class _Injected:
     late_fill: Decimal | None
 
 
+def _step_down(value: Decimal, step: Decimal) -> Decimal:
+    """``value - step``; refused when 34-digit rounding would not make it smaller."""
+    lower = money.sub(value, step)
+    if not lower < value:
+        raise ccxt.InvalidOrder(f'paper venue cannot lower {money.text(value)} by the step {money.text(step)} '
+                                f'exactly')
+    return lower
+
+
+def _floor_step(value: Decimal, step: Decimal) -> Decimal:
+    """The largest multiple of ``step`` that is not above ``value``, without exception.
+
+    ``money.q_down`` divides at 34 significant digits, so for an input with
+    more digits the quotient can round up onto the next boundary and the
+    result exceed ``value`` by one step. The result is compared with the input
+    exactly and lowered until it is not above it.
+    """
+    result = money.q_down(value, step)
+    while result > value:
+        result = _step_down(result, step)
+    return result
+
+
 def _walk_asks(asks, *, spend: Decimal, adverse: Decimal, amount_step: Decimal) -> _Fill:
-    """Spend ``spend`` quote across ``asks`` (best first), each price raised by ``adverse``."""
-    remaining, base, quote, used = spend, money.ZERO, money.ZERO, 0
+    """Spend at most ``spend`` quote across ``asks`` (best first), each price raised by ``adverse``.
+
+    Every amount added to the running total is compared with ``spend`` as the
+    very sum that is kept, so the total can never exceed it, whatever the
+    34-digit rounding of a quotient or product does.
+    """
+    base, quote, used = money.ZERO, money.ZERO, 0
     for price, quantity in asks:
-        if remaining <= 0:
+        if quote >= spend:
             break
         paid = money.mul(price, money.add(money.ONE, adverse))
         level_quote = money.mul(paid, quantity)
-        if level_quote <= remaining:
-            base, quote = money.add(base, quantity), money.add(quote, level_quote)
-            remaining, used = money.sub(remaining, level_quote), used + 1
+        if money.add(quote, level_quote) <= spend:
+            base, quote, used = money.add(base, quantity), money.add(quote, level_quote), used + 1
             continue
-        part = money.q_down(money.div(remaining, paid), amount_step)
+        # Whole quantity steps of this level. The rounded quotient can name one
+        # step more than the rest pays for; lower it until the total fits.
+        part = _floor_step(money.div(money.sub(spend, quote), paid), amount_step)
+        while part > 0 and money.add(quote, money.mul(part, paid)) > spend:
+            part = _step_down(part, amount_step)
         if part > 0:
             base, quote, used = money.add(base, part), money.add(quote, money.mul(part, paid)), used + 1
         # The rest is less than one quantity step at this price: precision, not missing depth.
         return _Fill(base, quote, used, exhausted=False)
-    return _Fill(base, quote, used, exhausted=remaining > 0)
+    return _Fill(base, quote, used, exhausted=quote < spend)
 
 
 def _walk_bids(bids, *, amount: Decimal, adverse: Decimal) -> _Fill:
@@ -172,10 +222,19 @@ def _levels(book, name: str) -> tuple:
     return tuple(parsed)
 
 
-def _read_book(book, side: str) -> tuple[tuple, tuple]:
-    """Bids and asks of a usable book for ``side``; anything else is a definite rejection."""
+def _read_book(book, side: str, *, symbol: str, exchange: str) -> tuple[tuple, tuple]:
+    """Bids and asks of a usable book of ``symbol`` on ``exchange`` for ``side``.
+
+    Anything else is a definite rejection. A book that does not name this
+    symbol and exchange (a mix-up, or a stand-in without the fields) cannot be
+    shown to price this order, so it is refused rather than filled against.
+    """
     if book is None:
         raise ccxt.InvalidOrder(NEEDS_DEPTH)
+    book_symbol, book_exchange = getattr(book, 'symbol', None), getattr(book, 'exchange', None)
+    if book_symbol != symbol or book_exchange != exchange:
+        raise ccxt.InvalidOrder(f'paper venue book is for {book_symbol} on {book_exchange}, '
+                                f'not {symbol} on {exchange}')
     bids, asks = _levels(book, 'bids'), _levels(book, 'asks')
     if any(lower[0] >= higher[0] for higher, lower in zip(bids, bids[1:])) or any(
             higher[0] <= lower[0] for lower, higher in zip(asks, asks[1:])):
@@ -217,6 +276,21 @@ def _check_range(value: Decimal, low: Decimal | None, high: Decimal | None, what
         unchecked.append(f'maximum {what} not published')
     elif value > high:
         raise ccxt.InvalidOrder(f'{what} {money.text(value)} is above the venue maximum {money.text(high)}')
+
+
+def _check_storable(row: dict) -> None:
+    """Refuse a figure the read path (``money.from_text``) would refuse.
+
+    A stored value outside the money bounds would be committed and then make
+    every later listing of this exchange's orders raise, so the order is a
+    definite rejection instead and nothing is stored.
+    """
+    for column in DECIMAL_COLUMNS:
+        try:
+            money.from_text(row[column], field=column, allow_negative=False)
+        except money.MoneyError:
+            raise ccxt.InvalidOrder(f'paper venue cannot record {column} {row[column]} within the money bounds; '
+                                    f'the order is refused') from None
 
 
 class MicroPaperVenue:
@@ -277,21 +351,29 @@ class MicroPaperVenue:
                 'info': info}
 
     def amount_to_precision(self, symbol, amount) -> str:
-        """``amount`` truncated to the quantity step; like CCXT, a result of zero is InvalidOrder."""
+        """``amount`` truncated (never rounded up) to the quantity step; like CCXT, zero is InvalidOrder.
+
+        With no published step there is nothing to truncate to: the amount is
+        returned as given, as a sell then fills it and lists the step as unchecked.
+        """
         step = self._rules_for(symbol).amount_step
-        if step is None:
-            raise ccxt.InvalidOrder(f'{symbol} quantity step is unknown')
-        value = money.q_down(self._number(amount, 'amount', allow_zero=True), step)
+        value = self._number(amount, 'amount', allow_zero=True)
+        if step is not None:
+            value = _floor_step(value, step)
         if value == 0:
-            raise ccxt.InvalidOrder(f'{symbol} amount is below the quantity step {money.text(step)}')
+            raise ccxt.InvalidOrder(f'{symbol} amount is below the quantity step '
+                                    f'{money.text(step) if step is not None else "(unpublished)"}')
         return money.text(value)
 
     def cost_to_precision(self, symbol, cost) -> str:
-        """``cost`` truncated to the quote-amount step of a market buy."""
+        """``cost`` truncated (never rounded up) to the quote-amount step of a market buy.
+
+        With no published step, the sizing fallback step is used, as by the buy itself.
+        """
         step = self._rules_for(symbol).cost_step
         if step is None:
-            raise ccxt.InvalidOrder(f'{symbol} quote-amount step is unknown')
-        return money.text(money.q_down(self._number(cost, 'cost', allow_zero=True), step))
+            step = SIZING_FALLBACK_COST_STEP
+        return money.text(_floor_step(self._number(cost, 'cost', allow_zero=True), step))
 
     # --------------------------------------------------------------- account
     def fetch_balance(self, params=None) -> dict:
@@ -383,25 +465,31 @@ class MicroPaperVenue:
         if not ok:
             raise ccxt.InvalidOrder(f'{code}: {detail}')
         book = params.get('book')
-        bids, asks = _read_book(book, side)
+        bids, asks = _read_book(book, side, symbol=symbol, exchange=self.exchange_name)
         adverse_bps = self._number(params.get('adverse_bps') if params.get('adverse_bps') is not None else 0,
                                    'adverse_bps', allow_zero=True)
         if adverse_bps >= money.BPS:
             raise ccxt.InvalidOrder('paper venue adverse_bps must be below 10000')
         adverse = money.bps(adverse_bps)
         amount_step, cost_step = rules.amount_step, rules.cost_step
-        if amount_step is None:
-            raise ccxt.InvalidOrder(f'{symbol} quantity step is unknown; the paper venue cannot fill in whole steps')
         unchecked: list[str] = []
         if side == 'buy':
+            if amount_step is None:
+                raise ccxt.InvalidOrder(f'{symbol} quantity step is unknown; the paper venue cannot fill a buy '
+                                        f'in whole steps')
             if cost_step is None:
-                raise ccxt.InvalidOrder(f'{symbol} quote-amount step is unknown; the order amount cannot be checked')
-            if money.q_down(requested, cost_step) != requested:
+                cost_step = SIZING_FALLBACK_COST_STEP
+                unchecked.append(f'quote-amount step not published; checked against the sizing fallback '
+                                 f'{money.text(cost_step)}')
+            if _floor_step(requested, cost_step) != requested:
                 raise ccxt.InvalidOrder(f'cost {money.text(requested)} is not a multiple of the quote-amount step '
                                         f'{money.text(cost_step)}')
             _check_range(requested, rules.market_min_cost(), rules.market_max_cost(), 'market order amount', unchecked)
         else:
-            if money.q_down(requested, amount_step) != requested:
+            if amount_step is None:
+                # An exit must stay possible: the quantity is filled as given and the record says so.
+                unchecked.append('quantity step not published; the quantity is filled as given')
+            elif _floor_step(requested, amount_step) != requested:
                 raise ccxt.InvalidOrder(f'amount {money.text(requested)} is not a multiple of the quantity step '
                                         f'{money.text(amount_step)}')
             _check_range(requested, rules.min_amount, rules.max_amount, 'quantity', unchecked)
@@ -414,6 +502,7 @@ class MicroPaperVenue:
             fee_kind = fee_kind if fee_kind in _FEE_KINDS else 'quote'
         elif fee_kind not in _FEE_KINDS:
             raise ccxt.InvalidOrder("paper venue fee_currency must be 'quote' or 'base'")
+        self._check_funds(rules, side, requested, fee_rate, fee_kind, unchecked)
 
         def walk(limit: Decimal) -> _Fill:
             if side == 'buy':
@@ -422,8 +511,9 @@ class MicroPaperVenue:
 
         def share(fill: _Fill, fraction: Decimal) -> Decimal:
             if side == 'buy':
-                return money.q_down(money.mul(fill.quote, fraction), cost_step)
-            return money.q_down(money.mul(fill.base, fraction), amount_step)
+                return _floor_step(money.mul(fill.quote, fraction), cost_step)
+            portion = money.mul(fill.base, fraction)
+            return portion if amount_step is None else _floor_step(portion, amount_step)
 
         full = walk(requested)
         limit = injected.partial if injected.partial is not None else injected.late_fill
@@ -436,8 +526,10 @@ class MicroPaperVenue:
         figures = self._figures(rules, side, requested, fill, 'canceled' if canceled else 'closed', fee_rate, fee_kind)
         first_report = None
         if injected.late_fill is not None:
-            first_report = self._figures(rules, side, requested, walk(share(fill, LATE_FILL_FIRST_SHARE)),
-                                         'canceled', fee_rate, fee_kind)
+            first_fill = walk(share(fill, LATE_FILL_FIRST_SHARE))
+            first_report = self._figures(rules, side, requested, first_fill, 'canceled', fee_rate, fee_kind)
+            # The first answer describes its own walk, not the larger fill stored for later reads.
+            first_report.update(levels_used=first_fill.levels_used, depth_exhausted=first_fill.exhausted)
         now = float(self._clock())
         generation, sequence = _int_or_none(getattr(book, 'generation', None)), _int_or_none(
             getattr(book, 'venue_sequence', None))
@@ -461,7 +553,35 @@ class MicroPaperVenue:
                'created_at': _iso(now), 'updated_at': _iso(now), 'timestamp_ms': int(now * 1000),
                'book_generation': generation, 'book_sequence': sequence,
                'info': json.dumps(info, sort_keys=True, allow_nan=False)}
+        _check_storable(row)
         return row, first_report
+
+    def _check_funds(self, rules: venue_rules.VenueRules, side: str, requested: Decimal, fee_rate: Decimal,
+                     fee_kind: str, unchecked: list[str]) -> None:
+        """Refuse what the paper ledger's free balance cannot cover, as a venue would.
+
+        A buy spends the quote asset and a sell the base asset; a fee billed in
+        the spent asset is added at its maximum (the whole request at the
+        charged rate). A balance the ledger does not report is unknown, not
+        zero: the order is not refused for it and the record says so.
+        """
+        asset = rules.quote if side == 'buy' else rules.base
+        needed = requested
+        if (side == 'buy') == (fee_kind == 'quote'):
+            needed = money.add(requested, money.mul(requested, fee_rate))
+        balances = self._balances()
+        raw = balances.get(asset) if isinstance(balances, dict) else None
+        if raw is None:
+            unchecked.append(f'free {asset} balance not known')
+            return
+        try:
+            free = money.parse(raw, field=f'free {asset} balance', allow_negative=True)
+        except money.MoneyError:
+            unchecked.append(f'free {asset} balance is malformed and not checked')
+            return
+        if needed > free:
+            raise ccxt.InsufficientFunds(f'{side} needs {money.text(needed)} {asset} including the maximum fee; '
+                                         f'the paper balance has {money.text(free)} {asset} free')
 
     @staticmethod
     def _fee_rate(rules: venue_rules.VenueRules, configured) -> tuple[Decimal, str]:
@@ -513,6 +633,7 @@ class MicroPaperVenue:
     def _view(self, record: dict, *, report: dict | None = None) -> dict:
         """The CCXT-shaped order; ``report`` replaces the fill figures for a late-fill first answer."""
         side = record['side']
+        first_answer = report is not None
         if report is None:
             requested = record['requested_cost'] if side == 'buy' else record['requested_amount']
             report = {'status': record['status'], 'filled': record['filled'], 'cost': record['cost'],
@@ -529,6 +650,11 @@ class MicroPaperVenue:
             amount = filled if status == 'closed' else None
             remaining = money.ZERO if status == 'closed' else None
         info = {key: value for key, value in record['info'].items() if key != 'late_fill'}
+        if first_answer:
+            # A late-fill first answer gives no hint of the later fill: its own
+            # walk's figures, and no mention of the injection.
+            info.update(levels_used=report['levels_used'], depth_exhausted=report['depth_exhausted'],
+                        injected=[name for name in info.get('injected', ()) if name != 'late_fill_next'])
         info['exact'] = {key: money.text(report[key]) for key in ('filled', 'cost', 'average', 'fee_cost')}
         info['exact'].update(fee_currency=report['fee_currency'], remaining=money.text(report['remaining']),
                              remaining_cost=money.text(report['remaining_cost']),

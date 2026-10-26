@@ -119,7 +119,15 @@
     if (status.checked_at) return 'Up to date · checked ' + formatTime(status.checked_at);
     return '';
   }
-  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter};
+  // What a click on "Check for updates" reports. A check that never ran is not "up to date".
+  function updateToast(status) {
+    if (!status) return {text: 'Could not check for updates.', error: true};
+    if (status.disabled) return {text: 'Update checks are turned off (CRYPTOPILOT_NO_UPDATE_CHECK=1).', error: false};
+    if (status.error) return {text: String(status.error), error: true};
+    if (status.available) return {text: `CryptoPilot ${String(status.latest_version || '')} is available.`, error: false};
+    return {text: 'CryptoPilot is up to date.', error: false};
+  }
+  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CryptoPilotUI = api;
 })(typeof window === 'undefined' ? globalThis : window);

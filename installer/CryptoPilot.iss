@@ -71,6 +71,13 @@ var
   HasInstallLock: Boolean;
   StageToken: String;
   BackupRoot: String;
+  { The previous runtime and maintenance helper wait in BackupRoot until the new source is active. }
+  PreviousRuntimeKept: Boolean;
+  SourceActivated: Boolean;
+  { Set when restoring the previous source failed; the new runtime then finishes the swap at next start. }
+  KeepNewRuntime: Boolean;
+  RestoreFailed: Boolean;
+  UpdateFailure: String;
 
 function CreateFileW(FileName: String; Access, ShareMode: Cardinal;
   Security: Integer; Disposition, Attributes: Cardinal; Template: THandle): THandle;
@@ -172,6 +179,11 @@ end;
 function InitializeSetup: Boolean;
 begin
   HasInstallLock := False;
+  PreviousRuntimeKept := False;
+  SourceActivated := False;
+  KeepNewRuntime := False;
+  RestoreFailed := False;
+  UpdateFailure := '';
   StageToken := GetDateTimeString('yyyymmddhhnnss', '-', ':');
   Result := True;
 end;
@@ -237,9 +249,84 @@ begin
     Result := 'Choose an empty folder or an existing editable CryptoPilot installation. Other files will not be overwritten.';
 end;
 
+function RenameWithRetry(const Source, Target: String): Boolean;
+var
+  Attempt: Integer;
+begin
+  { Antivirus scanners, indexers and a just-exited runtime hold files briefly. A window
+    whose working folder is inside the installation holds it until it closes. }
+  Result := RenameFile(Source, Target);
+  Attempt := 1;
+  while (not Result) and (Attempt < 20) do begin
+    Sleep(500);
+    Result := RenameFile(Source, Target);
+    Attempt := Attempt + 1;
+  end;
+  if not Result then Log('Could not rename ' + Source + ' to ' + Target + '.');
+end;
+
+function SetupJournalToken(const Journal: String): String;
+var
+  Text: AnsiString;
+  S, Prefix: String;
+  Start, Finish, I: Integer;
+  C: Char;
+begin
+  { Only the exact record ActivateSource writes is recognised; anything else is left for the app. }
+  Result := '';
+  if not LoadStringFromFile(Journal, Text) then exit;
+  S := String(Text);
+  Prefix := '"backup":"backups/setup-';
+  Start := Pos(Prefix, S);
+  if Start = 0 then exit;
+  Start := Start + Length(Prefix);
+  Finish := Start;
+  while (Finish <= Length(S)) and (S[Finish] <> '"') do Finish := Finish + 1;
+  if (Finish > Length(S)) or (Finish = Start) or (Finish - Start > 64) then exit;
+  S := Copy(S, Start, Finish - Start);
+  for I := 1 to Length(S) do begin
+    C := S[I];
+    if not (((C >= '0') and (C <= '9')) or ((C >= 'A') and (C <= 'Z')) or
+            ((C >= 'a') and (C <= 'z')) or (C = '-') or (C = '_')) then exit;
+  end;
+  if Pos('"staging":".setup-' + S + '"', String(Text)) = 0 then exit;
+  Result := S;
+end;
+
+function RecoverInterruptedSetup(const Token: String): Boolean;
+var
+  Root, Backup, Stage: String;
+begin
+  { An earlier Setup stopped while swapping the source, for example on a power cut.
+    Put a complete source and installation record back; this Setup then backs them
+    up and installs over them, so nothing has to start the app first. }
+  Result := False;
+  Root := ExpandConstant('{app}');
+  Backup := Root + '\backups\setup-' + Token;
+  Stage := Root + '\.setup-' + Token;
+  if (not SafeTree(Backup)) or (not SafeTree(Stage)) then exit;
+  if not DirExists(Root + '\app') then begin
+    if DirExists(Backup + '\app') then begin
+      if not RenameWithRetry(Backup + '\app', Root + '\app') then exit;
+    end else if DirExists(Stage + '\app') then begin
+      if not RenameWithRetry(Stage + '\app', Root + '\app') then exit;
+    end;
+  end;
+  if not FileExists(Root + '\installation.json') then begin
+    if FileExists(Backup + '\installation.json') then
+      FileCopy(Backup + '\installation.json', Root + '\installation.json', False)
+    else if FileExists(Stage + '\installation.json') then
+      FileCopy(Stage + '\installation.json', Root + '\installation.json', False);
+  end;
+  if not (DirExists(Root + '\app') and FileExists(Root + '\installation.json')) then exit;
+  Result := DeleteFile(Root + '\update-transaction.json');
+  if Result then Log('Recovered the source swap that stopped in ' + Backup + '.');
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Suffix, Waited: Integer;
+  Token: String;
 begin
   Result := DestinationError;
   if Result <> '' then exit;
@@ -259,9 +346,12 @@ begin
     exit;
   end;
   if FileExists(ExpandConstant('{app}\update-transaction.json')) then begin
-    Result := 'A previous update needs recovery. Start CryptoPilot once to recover it, close it, then run Setup again.';
-    ReleaseInstallLock;
-    exit;
+    Token := SetupJournalToken(ExpandConstant('{app}\update-transaction.json'));
+    if (Token = '') or (not RecoverInterruptedSetup(Token)) then begin
+      Result := 'A previous update needs recovery. Start CryptoPilot once to recover it, close it, then run Setup again.';
+      ReleaseInstallLock;
+      exit;
+    end;
   end;
   Suffix := 0;
   while DirExists(GetStageRoot('')) or DirExists(ExpandConstant('{app}\backups\setup-') + StageToken) do begin
@@ -283,12 +373,12 @@ begin
   Root := ExpandConstant('{app}');
   if HadApp and DirExists(BackupRoot + '\app') then begin
     if DirExists(Root + '\app') then
-      RequireSuccess(RenameFile(Root + '\app', GetStageRoot('') + '\app'),
+      RequireSuccess(RenameWithRetry(Root + '\app', GetStageRoot('') + '\app'),
         'Could not preserve the interrupted source. Recovery will run at next startup.');
-    RequireSuccess(RenameFile(BackupRoot + '\app', Root + '\app'),
+    RequireSuccess(RenameWithRetry(BackupRoot + '\app', Root + '\app'),
       'Could not restore the previous source. Recovery will run at next startup.');
   end else if (not HadApp) and DirExists(Root + '\app') then
-    RequireSuccess(RenameFile(Root + '\app', GetStageRoot('') + '\app'),
+    RequireSuccess(RenameWithRetry(Root + '\app', GetStageRoot('') + '\app'),
       'Could not restore the staged source.');
   if HadApp and FileExists(BackupRoot + '\installation.json') then
     RequireSuccess(FileCopy(BackupRoot + '\installation.json', Root + '\installation.json', False),
@@ -296,9 +386,71 @@ begin
   if HadApp then DeleteFile(Root + '\update-transaction.json');
 end;
 
+procedure SetPreviousRuntimeAside;
+var
+  Root: String;
+begin
+  { [Files] then writes a complete new runtime and maintenance helper. If the new
+    source cannot be activated, the previous runtime goes back next to the previous
+    source, so the two always match: a new runtime may require modules an old
+    source does not have, and would refuse to start it. }
+  Root := ExpandConstant('{app}');
+  if (not DirExists(Root + '\runtime')) and (not DirExists(Root + '\maintenance')) then exit;
+  RequireSuccess(ForceDirectories(BackupRoot), 'Could not create the backup folder.');
+  { Each folder counts as kept once moved, so DeinitializeSetup puts back whatever moved. }
+  if DirExists(Root + '\runtime') then begin
+    RequireSuccess(RenameWithRetry(Root + '\runtime', BackupRoot + '\runtime'),
+      'Could not set the current runtime aside. Close any program or window using the CryptoPilot folder, then try again.');
+    PreviousRuntimeKept := True;
+  end;
+  if DirExists(Root + '\maintenance') then begin
+    RequireSuccess(RenameWithRetry(Root + '\maintenance', BackupRoot + '\maintenance'),
+      'Could not set the current maintenance files aside. Close any program or window using the CryptoPilot folder, then try again.');
+    PreviousRuntimeKept := True;
+  end;
+  Log('The previous runtime waits in ' + BackupRoot + ' until the new version is active.');
+end;
+
+procedure RestoreFolder(const Name: String);
+var
+  Root, Rejected: String;
+begin
+  Root := ExpandConstant('{app}');
+  if not DirExists(BackupRoot + '\' + Name) then exit;
+  Rejected := BackupRoot + '\rejected-' + Name;
+  if DirExists(Root + '\' + Name) then
+    RequireSuccess(RenameWithRetry(Root + '\' + Name, Rejected), 'Could not remove the new ' + Name + '.');
+  if not RenameWithRetry(BackupRoot + '\' + Name, Root + '\' + Name) then begin
+    if DirExists(Rejected) then RenameWithRetry(Rejected, Root + '\' + Name);
+    RaiseException('Could not restore the previous ' + Name + '.');
+  end;
+  if DirExists(Rejected) and SafeTree(Rejected) then DelTree(Rejected, True, True, True);
+end;
+
+procedure RestorePreviousRuntime;
+begin
+  if not PreviousRuntimeKept then exit;
+  RestoreFolder('runtime');
+  RestoreFolder('maintenance');
+  PreviousRuntimeKept := False;
+  Log('Restored the previous runtime and maintenance files.');
+end;
+
+procedure DiscardPreviousRuntime;
+begin
+  { The new version is active; the previous runtime is not kept, as before. Its source stays backed up. }
+  if not PreviousRuntimeKept then exit;
+  PreviousRuntimeKept := False;
+  if DirExists(BackupRoot + '\runtime') and SafeTree(BackupRoot + '\runtime') then
+    DelTree(BackupRoot + '\runtime', True, True, True);
+  if DirExists(BackupRoot + '\maintenance') and SafeTree(BackupRoot + '\maintenance') then
+    DelTree(BackupRoot + '\maintenance', True, True, True);
+  RemoveDir(BackupRoot);
+end;
+
 procedure ActivateSource;
 var
-  Root, Journal: String;
+  Root, Journal, Failure: String;
   ExitCode: Integer;
   HadApp: Boolean;
 begin
@@ -322,30 +474,85 @@ begin
   end;
   try
     if HadApp then
-      RequireSuccess(RenameFile(Root + '\app', BackupRoot + '\app'), 'Could not back up the previous source.');
-    RequireSuccess(RenameFile(GetStageRoot('') + '\app', Root + '\app'), 'Could not activate the new source.');
+      RequireSuccess(RenameWithRetry(Root + '\app', BackupRoot + '\app'),
+        'Could not back up the previous source. Close any program or window using the CryptoPilot folder, then try again.');
+    RequireSuccess(RenameWithRetry(GetStageRoot('') + '\app', Root + '\app'), 'Could not activate the new source.');
     RequireSuccess(MoveFileExW(GetStageRoot('') + '\installation.json', Root + '\installation.json',
       ReplaceExistingWriteThrough), 'Could not activate the installation record.');
     if HadApp then
       RequireSuccess(DeleteFile(Root + '\update-transaction.json'), 'Could not finish the update transaction.');
   except
-    RollBackApp(HadApp);
-    RaiseException(GetExceptionMessage);
+    Failure := GetExceptionMessage;
+    try
+      RollBackApp(HadApp);
+    except
+      { The new runtime stays with the new source; its maintenance helper finishes the swap. }
+      KeepNewRuntime := True;
+      Log('Could not restore the previous source: ' + GetExceptionMessage);
+    end;
+    RaiseException(Failure);
   end;
   RemoveDir(GetStageRoot(''));
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if CurStep = ssPostInstall then ActivateSource;
+  if CurStep = ssInstall then
+    try
+      SetPreviousRuntimeAside;
+    except
+      { Nothing has been written yet; stopping here leaves the installation as it was. }
+      UpdateFailure := GetExceptionMessage;
+      RaiseException(UpdateFailure);
+    end;
+  if CurStep = ssPostInstall then begin
+    try
+      ActivateSource;
+      SourceActivated := True;
+    except
+      UpdateFailure := GetExceptionMessage;
+      Log('The new version was not activated: ' + UpdateFailure);
+      if not RelaunchAfterSetup then
+        SuppressibleMsgBox('CryptoPilot could not finish installing: ' + UpdateFailure, mbError, MB_OK, IDOK);
+    end;
+    if SourceActivated then DiscardPreviousRuntime;
+  end;
+end;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  { Exit code 9: files were copied but the new version was not activated. }
+  if UpdateFailure <> '' then Result := 9 else Result := 0;
 end;
 
 procedure DeinitializeSetup;
 var
-  Runtime: String;
+  Runtime, Advice: String;
   ExitCode: Integer;
 begin
+  { Covers a failed activation and a failed or interrupted file copy alike. }
+  if PreviousRuntimeKept and (not SourceActivated) and (not KeepNewRuntime) then begin
+    if UpdateFailure = '' then UpdateFailure := 'The new files could not be copied.';
+    try
+      RestorePreviousRuntime;
+    except
+      RestoreFailed := True;
+      Log('Could not restore the previous runtime: ' + GetExceptionMessage + ' Run Setup again to repair CryptoPilot.');
+    end;
+  end;
   ReleaseInstallLock;
+  { The in-app updater runs Setup silently, so say why the version did not change. }
+  if RelaunchAfterSetup and (UpdateFailure <> '') then begin
+    if RestoreFailed then
+      Advice := 'Run the CryptoPilot Setup from the releases page again to repair the installation.'
+    else if KeepNewRuntime then
+      Advice := 'CryptoPilot finishes the update when it opens.'
+    else
+      Advice := 'Your previous version was kept and opens again now. Close any program or window that is ' +
+        'using the CryptoPilot folder, then try the update again.';
+    MsgBox('CryptoPilot could not finish the update: ' + UpdateFailure + #13#10#13#10 + Advice +
+      #13#10#13#10 + 'Setup log: ' + ExpandConstant('{log}'), mbError, MB_OK);
+  end;
   { Reopen CryptoPilot after an in-app update, whether or not Setup succeeded. It never starts trading. }
   if RelaunchAfterSetup then
     try

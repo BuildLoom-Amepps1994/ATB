@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -136,8 +137,14 @@ def main():
         assert_data()
     finally:
         stop(child)
+    previous_runtime = installation/'runtime/previous-runtime.marker'
+    previous_runtime.write_text('previous')
     install()  # Same Setup upgrades existing editable source and saves a backup.
     assert any('source-update-B' in p.read_text() for p in (installation/'backups').glob('setup-*/app/app.py'))
+    # Setup writes a complete new runtime and does not keep the old one once the new source is active.
+    assert not previous_runtime.exists()
+    assert not list((installation/'backups').glob('setup-*/runtime'))
+    assert not list((installation/'backups').glob('setup-*/maintenance'))
     assert_data()
     child = start()
     try:
@@ -149,6 +156,60 @@ def main():
             assert exc.code==404
     finally:
         stop(child)
+    # A window whose working folder is inside app\ blocks the source swap. Setup must then put
+    # the previous runtime back next to the previous source and report it with exit code 9.
+    previous_runtime.write_text('previous')
+    add_marker(installation/'app','kept-after-failed-update-C')
+    record = (installation/'installation.json').read_bytes()
+    holder = subprocess.Popen([getattr(sys,'_base_executable',sys.executable),'-c','import time; time.sleep(900)'],
+                              cwd=installation/'app',creationflags=creation)
+    try:
+        time.sleep(1)
+        failed = run([setup,'/TESTINSTALL=1','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOICONS','/TASKS=',
+                      f'/DIR={installation}',f'/LOG={scratch}/failed-setup.log'],timeout=600)
+    finally:
+        holder.terminate()
+        holder.wait(15)
+        time.sleep(.5)
+    assert failed.returncode==9, f'Expected exit code 9, got {failed.returncode}; {scratch}/failed-setup.log'
+    assert previous_runtime.read_text()=='previous'
+    assert (installation/'installation.json').read_bytes()==record
+    assert not (installation/'update-transaction.json').exists()
+    assert 'Restored the previous runtime' in (scratch/'failed-setup.log').read_text(errors='replace')
+    child = start()
+    try:
+        prove('kept-after-failed-update-C')
+    finally:
+        stop(child)
+    # A Setup that stopped mid-swap (power cut) left a journal and no app\ folder. The next Setup
+    # recovers it itself instead of asking for an app start that cannot work.
+    token = 'setup-20990101000000'
+    interrupted = installation/'backups'/token
+    interrupted.mkdir()
+    shutil.copy2(installation/'installation.json',interrupted/'installation.json')
+    os.replace(installation/'app',interrupted/'app')
+    journal = {'format':1,'product':'CryptoPilot','backup':'backups/'+token,'staging':'.'+token}
+    (installation/'update-transaction.json').write_text(json.dumps(journal,separators=(',',':')))
+    install()
+    assert not (installation/'update-transaction.json').exists()
+    assert any('kept-after-failed-update-C' in p.read_text() for p in (installation/'backups').glob('setup-*/app/app.py'))
+    assert_data()
+    # The same stop with the new runtime already in place: starting the app finishes the swap.
+    token = 'setup-20990101000001'
+    staged, interrupted = installation/('.'+token), installation/'backups'/token
+    interrupted.mkdir()
+    shutil.copy2(installation/'installation.json',interrupted/'installation.json')
+    shutil.copytree(installation/'app',staged/'app')
+    shutil.copy2(installation/'installation.json',staged/'installation.json')
+    add_marker(staged/'app','rolled-forward-D')
+    journal = {'format':1,'product':'CryptoPilot','backup':'backups/'+token,'staging':'.'+token}
+    (installation/'update-transaction.json').write_text(json.dumps(journal,separators=(',',':')))
+    child = start()
+    try:
+        prove('rolled-forward-D')
+    finally:
+        stop(child)
+    assert not (installation/'update-transaction.json').exists() and (interrupted/'app/app.py').is_file()
     # In-app update path: Setup starts while the app runs and waits for it to exit.
     child = start()
     waiting = subprocess.Popen([str(setup),'/TESTINSTALL=1','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
@@ -178,6 +239,10 @@ def main():
                        'direct installed Python edit applied on restart','running app blocks source update and Setup',
                        'local edits require explicit replacement','source update applies without executable change',
                        'backup contains prior edits','Setup upgrade preserves prior source backup',
+                       'Setup installs a fresh runtime and drops the old one once active',
+                       'blocked source swap keeps the previous runtime and source (exit 9)',
+                       'Setup recovers a swap interrupted before the runtime changed',
+                       'app start finishes a swap interrupted after the runtime changed',
                        'portfolio/settings survive update and upgrade',
                        'Setup started by the in-app updater waits for the app to exit','uninstall preserves source/backups/data'],
               'live_orders':0,'exchange_requests':0,'credential_backend':'disabled'}

@@ -118,3 +118,6 @@ def test_installer_preserves_safeguards():
     assert "LockFile(InstallLock, 0, 0, 1, 0)" in script
     assert 'CreateUninstallRegKey=not TestInstall' in script
     assert 'uninsneveruninstall' in script
+    # A failed activation must restore a runtime that matches the previous source.
+    assert 'SetPreviousRuntimeAside' in script and 'RestorePreviousRuntime' in script
+    assert 'function GetCustomSetupExitCode' in script and 'RecoverInterruptedSetup' in script

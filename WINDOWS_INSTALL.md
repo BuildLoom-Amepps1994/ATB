@@ -74,7 +74,7 @@ The **Windows installer** GitHub Actions workflow builds Setup on a Windows runn
 
 ## Upgrade and uninstall
 
-Close CryptoPilot before running Setup again. Setup backs up the previous editable app before activating the new source. It refuses to stop a running bot for you and does not add startup tasks. The installer also rejects portfolio-data locations, drive roots, unrelated non-empty folders, symbolic links and junctions as installation targets.
+Close CryptoPilot before running Setup again. Setup backs up the previous editable app before activating the new source. It refuses to stop a running bot for you and does not add startup tasks. Setup keeps the previous runtime aside until the new source is active. If the new source cannot be activated, for example because a Command Prompt or editor has its working folder inside `app`, Setup puts the previous runtime and source back, says why, and exits with code 9; close that window and try again. If an update was cut off partway, for example by a power cut, the next start of CryptoPilot or the next run of Setup finishes it. The installer also rejects portfolio-data locations, drive roots, unrelated non-empty folders, symbolic links and junctions as installation targets.
 
 Uninstall through Windows Apps or the Start menu. Runtime files and shortcuts are removed; **editable source/backups and portfolio/settings/OS credentials are preserved**. This prevents uninstalling from destroying local work or trading records. Remove those manually only if you intend to discard them, after reconciling any exchange holdings. Uninstalling does not liquidate positions.
 

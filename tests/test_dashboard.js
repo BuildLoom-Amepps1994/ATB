@@ -2,7 +2,7 @@
 // Run with Node 22+ (24 LTS recommended): node --test tests/test_dashboard.js. No exchange/network access.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter} = require('../static/dashboard-core.js');
+const {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast} = require('../static/dashboard-core.js');
 
 test('untrusted server strings and validation details are safe for display', () => {
   assert.equal(escapeHtml('<img src=x onerror="alert(1)">\''), '&lt;img src=x onerror=&quot;alert(1)&quot;&gt;&#39;');
@@ -116,4 +116,13 @@ test('a copy run from source is told how to get in-app updates', () => {
   assert.match(source.text, /installer from the releases page once/);
   assert.equal(updateSummary({available: true, can_install: true, latest_version: '1.5.29', current_version: '1.4.0'}).install, true);
   assert.equal(updateSummary({available: false, error: 'No published release was found.'}), null);
+});
+
+test('checking for updates never reports up to date when no check ran', () => {
+  assert.deepEqual(updateToast({disabled: true, available: false, error: null}),
+    {text: 'Update checks are turned off (CRYPTOPILOT_NO_UPDATE_CHECK=1).', error: false});
+  assert.deepEqual(updateToast({error: 'Could not reach GitHub to check for updates.'}),
+    {text: 'Could not reach GitHub to check for updates.', error: true});
+  assert.equal(updateToast({available: true, latest_version: '1.5.31'}).text, 'CryptoPilot 1.5.31 is available.');
+  assert.equal(updateToast({available: false, checked_at: 1}).text, 'CryptoPilot is up to date.');
 });

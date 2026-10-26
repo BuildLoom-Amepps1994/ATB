@@ -257,18 +257,63 @@ def _transaction_paths(root: Path, transaction: dict) -> tuple[Path, Path]:
     return backup, staging
 
 
-def recover_if_needed(root: str | Path) -> bool:
-    """Restore the previous source after an interrupted update.
+def _finish_setup_activation(root: Path, marker: Path, backup: Path, staging: Path) -> bool:
+    """Complete a Setup source swap that was interrupted, for example by a power cut.
 
-    Caller MUST hold InstallationLock for the complete recovery and launch.
-    Old code and failed new code remain in the backup folder for inspection.
+    Setup records this journal only after it has installed the new runtime and this
+    helper, so the new source is the one that matches them. Restoring the previous
+    source would pair it with a runtime that may require modules it does not have.
+    The previous source stays in the backup folder.
+    """
+    application, staged_app, staged_record = root / 'app', staging / 'app', staging / 'installation.json'
+    for path in (application, staged_app, staged_record, backup / 'app'):
+        _plain_path(path)
+    try:
+        if staged_app.is_dir():
+            # Check the new record before anything moves.
+            _validate_manifest(_load_json(staged_record))
+            if application.exists():
+                kept = backup / 'app'
+                if kept.exists():
+                    kept = backup / ('interrupted-app-' + uuid.uuid4().hex)
+                backup.mkdir(parents=True, exist_ok=True)
+                os.replace(application, kept)
+            os.replace(staged_app, application)
+        if staged_record.exists():
+            _validate_manifest(_load_json(staged_record))
+            os.replace(staged_record, root / 'installation.json')
+        if not application.is_dir():
+            raise UpdateError('Interrupted Setup left no application to activate. Run CryptoPilot Setup again; '
+                              'your previous source is kept in the backups folder.')
+        _validate_manifest(_load_json(root / 'installation.json'))
+        marker.unlink()
+    except OSError as exc:
+        raise UpdateError('Cannot finish the interrupted Setup update. Close CryptoPilot, run Setup again, '
+                          'and preserve the backup folder.') from exc
+    try:
+        staging.rmdir()
+    except OSError:
+        pass
+    return True
+
+
+def recover_if_needed(root: str | Path) -> bool:
+    """Repair an installation whose last update was interrupted.
+
+    A source update (backups/update-*) is rolled back to the previous source. A
+    Setup activation (backups/setup-*) is rolled forward, because Setup had already
+    replaced the runtime. Caller MUST hold InstallationLock for the complete
+    recovery and launch. Old code and failed new code remain in the backup folder.
     """
     root = _installation_root(root)
     marker = root / JOURNAL
     _plain_path(marker)
     if not marker.exists():
         return False
-    backup, _ = _transaction_paths(root, _load_json(marker))
+    transaction = _load_json(marker)
+    backup, staging = _transaction_paths(root, transaction)
+    if transaction['backup'].startswith('backups/setup-'):
+        return _finish_setup_activation(root, marker, backup, staging)
     previous = _validate_manifest(_load_json(backup / 'installation.json'))
     application = root / 'app'
     old_application = backup / 'app'

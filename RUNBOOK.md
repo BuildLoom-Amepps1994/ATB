@@ -208,16 +208,17 @@ the exchange knows an order with that client order id and what state it is in.
   `risk.drawdown_stop_cleared`, `risk.realized_stop`,
   `risk.realized_stop_cleared`, `risk.unauthorized_submit`; `feed.state`,
   `feed.connected`, `feed.symbols_unlisted`; `decision.withheld`;
-  `ledger.accounted`, `ledger.failure`.
+  `ledger.accounted`, `ledger.failure`, `ledger.post_commit_error`.
 * **Decision lines.** `decision.entry` is written for every `enter` decision
   and whenever a symbol's action, status or reasons change; an unchanged
   repeat is counted (`decision.entry_unchanged`) and kept only in
   `GET /api/decisions`, so a fast scan cannot rotate the order trail out of
   the log. `decision.withheld` names why an `enter` decision did not become an
   order (`per_scan_cap`, `max_positions`, `held`, `same_candle`,
-  `requote_unavailable` (for the rest of the pass too when the re-quote's
-  connection failed after its retries; the pass then ends and the scan
-  reports the error), `requote_liquidity`, `requote_moved`, `budget`,
+  `requote_unavailable` (for the rest of the pass too when the re-quote
+  fails with a network-class error: a transport failure after its retries,
+  a rate limit or the exchange being unavailable; the pass then ends and the
+  scan reports the error), `requote_liquidity`, `requote_moved`, `budget`,
   `stale_marks`, `protective_exit_pending`, `daily_loss_guard`,
   `settings_review`, `orders_not_allowed`, `risk_gate` when the risk gate
   refused it (the matching `risk.blocked` event carries the same
@@ -235,7 +236,10 @@ the exchange knows an order with that client order id and what state it is in.
   is passed to the authorization, the submit and the journal row. One `grep`
   over the `intent_id` (the journal and `recovery.py` list it) gives the
   `execution.submitted` line, the fill, and the `ledger.accounted` line, or
-  `ledger.failure` and `execution.halt` when something went wrong. The
+  `ledger.failure` and `execution.halt` when something went wrong. A booked
+  fill always has its `ledger.accounted` line; `ledger.post_commit_error`
+  next to it means a report written after the booking failed, and the fill
+  still counts. The
   authorization is written before the intent exists, so it carries no intent
   id: the `token` on `execution.submitted` finds its `risk.authorize` line,
   and the `decision_id` on all of them leads back to the `decision.entry` /

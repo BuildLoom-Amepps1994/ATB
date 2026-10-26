@@ -1467,9 +1467,14 @@ class TradingEngine:
             if mode == 'live':
                 with self.lock:
                     self.balance_updated_at = None
-            storage.audit('trade', f'{mode.upper()} BUY {symbol}: {qty:.7g} at {fill_price:.7g}; cost {cost:.2f} USDT.')
-            observability.event('ledger.accounted', intent_id=intent, decision_id=decision_id, mode=mode, symbol=symbol,
-                                side='BUY', order_id=order_id, qty=qty, price=fill_price, cost=cost, fee=fee)
+            # Reports first, each failure contained, then the safety checks,
+            # which run whatever happened to the reports.
+            try:
+                observability.event('ledger.accounted', intent_id=intent, decision_id=decision_id, mode=mode, symbol=symbol,
+                                    side='BUY', order_id=order_id, qty=qty, price=fill_price, cost=cost, fee=fee)
+                storage.audit('trade', f'{mode.upper()} BUY {symbol}: {qty:.7g} at {fill_price:.7g}; cost {cost:.2f} USDT.')
+            except Exception as exc:
+                self._after_booking_failed(mode, 'BUY', symbol, exc, intent)
             self._observe_fills(mode)
             return True
         except Exception as exc:
@@ -1597,10 +1602,15 @@ class TradingEngine:
             if mode == 'live':
                 with self.lock:
                     self.balance_updated_at = None
-            storage.audit('trade', f'{mode.upper()} SELL {symbol}: {filled:.7g} at {fill_price:.7g}; P/L {pnl:+.2f} USDT ({reason}).')
-            observability.event('ledger.accounted', intent_id=intent, decision_id=decision_id, mode=mode, symbol=symbol,
-                                side='SELL', order_id=order_id, qty=filled, price=fill_price, proceeds=proceeds, fee=fee,
-                                realized=pnl, remaining=remaining, reason=reason)
+            # Reports first, each failure contained, then the safety checks,
+            # which run whatever happened to the reports.
+            try:
+                observability.event('ledger.accounted', intent_id=intent, decision_id=decision_id, mode=mode, symbol=symbol,
+                                    side='SELL', order_id=order_id, qty=filled, price=fill_price, proceeds=proceeds, fee=fee,
+                                    realized=pnl, remaining=remaining, reason=reason)
+                storage.audit('trade', f'{mode.upper()} SELL {symbol}: {filled:.7g} at {fill_price:.7g}; P/L {pnl:+.2f} USDT ({reason}).')
+            except Exception as exc:
+                self._after_booking_failed(mode, 'SELL', symbol, exc, intent)
             # Every booked exit is checked against the realised-loss limit at
             # once: a manual close runs with the worker stopped, so no later
             # valuation may see the crossing before a profit or the UTC day hides it.
@@ -1608,8 +1618,8 @@ class TradingEngine:
                 cash_after = (cash if mode == 'paper' else float(balance['free'].get('USDT', 0) or 0)) + proceeds
                 self.risk.observe_realized(mode, self._equity(mode, cash_after, self._active_positions(mode)))
             except Exception as exc:
-                storage.audit('warning', f'Realised-loss check after the {symbol} exit failed ({type(exc).__name__}); '
-                                         'it runs again at the next valuation.')
+                self._quiet_audit(f'Realised-loss check after the {symbol} exit failed ({type(exc).__name__}); '
+                                  'it runs again at the next valuation.')
             self._observe_fills(mode)
             # Reentry cooldown and fill were committed together above.
             return True
@@ -1621,14 +1631,13 @@ class TradingEngine:
             return False
 
     def _after_booking_failed(self, mode: str, side: str, symbol: str, exc: Exception, intent: str | None) -> bool:
-        """A report or check after the ledger commit failed: the fill stays booked and counts as done."""
+        """A report after the ledger commit failed: the fill stays booked and counts as done."""
         try:
             observability.event('ledger.post_commit_error', level='warning', mode=mode, side=side, symbol=symbol,
                                 intent_id=intent, error=type(exc).__name__)
-            storage.audit('warning', f'{mode.upper()} {side} {symbol} is booked; a report after it failed '
-                                     f'({type(exc).__name__}).')
         except Exception:
             pass
+        self._quiet_audit(f'{mode.upper()} {side} {symbol} is booked; a report after it failed ({type(exc).__name__}).')
         return True
 
     def _observe_fills(self, mode: str) -> None:
@@ -1641,8 +1650,15 @@ class TradingEngine:
         try:
             self.risk.observe_fills(mode)
         except Exception as exc:
-            storage.audit('warning', f'Slippage check after a fill failed ({type(exc).__name__}); '
-                                     'the next entry checks it again.')
+            self._quiet_audit(f'Slippage check after a fill failed ({type(exc).__name__}); the next entry checks it again.')
+
+    @staticmethod
+    def _quiet_audit(message: str) -> None:
+        """A warning line that can never raise into the booking that wrote it."""
+        try:
+            storage.audit('warning', message)
+        except Exception:
+            pass
 
     def _protect_positions(self, symbol: str, price: float):
         """Stored stop/target check at an observed bid; no trailing update here."""

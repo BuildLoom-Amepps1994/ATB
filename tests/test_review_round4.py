@@ -543,6 +543,32 @@ def test_a_report_failing_after_the_ledger_commit_leaves_the_fill_booked(engine,
     assert client is engine.private
 
 
+@pytest.mark.parametrize('mode', ['paper', 'live'])
+def test_a_failed_trade_audit_line_does_not_skip_the_loss_and_slippage_checks(engine, monkeypatch, mode):
+    events = capture_events(monkeypatch)
+    if mode == 'live':
+        client = arm_fake_live(engine)
+        client.fill = {**client.fill, 'filled': 8., 'cost': 800., 'average': 100.}
+    assert engine._buy('BTC/USDT', 800, 100, .04)
+    if mode == 'live':
+        client.fill = {**client.fill, 'filled': 8., 'cost': 320., 'average': 40.}
+    real_audit, checked = storage.audit, []
+
+    def audit(level, message, *args, **kwargs):
+        if level in ('trade', 'warning'):
+            raise storage.sqlite3.OperationalError('database is locked')
+        return real_audit(level, message, *args, **kwargs)
+    monkeypatch.setattr(storage, 'audit', audit)
+    real_fills = engine.risk.observe_fills
+    monkeypatch.setattr(engine.risk, 'observe_fills', lambda m: checked.append(m) or real_fills(m))
+    assert engine._sell(engine._active_positions(mode)[0], 40, 'test exit')
+    assert engine.risk._realized_today(mode) < -300
+    assert engine.risk.realized_stop(mode), 'the latch must not depend on the audit line'
+    assert checked == [mode]
+    kinds = [kind for kind, fields in events if fields.get('intent_id') == journal(mode)[-1]['intent_id']]
+    assert 'ledger.accounted' in kinds and 'ledger.post_commit_error' in kinds
+
+
 def test_a_live_exit_that_crosses_the_realised_loss_limit_latches_at_once(engine):
     client = arm_fake_live(engine)
     client.fill = {**client.fill, 'filled': 8., 'cost': 800., 'average': 100.}

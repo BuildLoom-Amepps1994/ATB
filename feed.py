@@ -14,11 +14,21 @@ Continuity checks
   not ``healthy`` and callers use REST.
 * **Monotonic timestamps**: a quote whose exchange timestamp is older than
   the one already held for that symbol is dropped and counted.
-* **Backpressure**: CCXT Pro resolves ``watch_bids_asks`` with the newest
-  update per symbol, so a slow consumer sees the latest quote rather than a
-  growing queue; the feed keeps exactly one quote per symbol and counts how
-  many it overwrote without anyone reading them.
+* **Backpressure**: CCXT Pro resolves each watch with the newest update, so
+  a slow consumer sees the latest quote rather than a growing queue; the
+  feed keeps exactly one quote per symbol and counts how many it overwrote
+  without anyone reading them.
 * **Reconnects** back off exponentially with jitter up to ``max_backoff``.
+
+Channels
+--------
+MEXC spot sends top-of-book updates only as protobuf ``aggre.bookTicker``
+pushes, and CCXT routes those to the per-symbol ticker channel: a combined
+``watch_bids_asks`` subscription is accepted but never resolves. On MEXC the
+feed therefore keeps one ``watch_ticker`` subscription per symbol (decoding
+needs the ``protobuf`` package, which the installer ships) and caps the set
+at MEXC's 30 subscriptions per connection, held positions first. Kraken uses
+the combined ``watch_bids_asks`` channel.
 
 The feed never touches credentials, orders or balances: it builds a public
 CCXT Pro client and subscribes to top-of-book channels only.
@@ -65,6 +75,8 @@ def default_client_factory(exchange_name: str):
 
 class QuoteFeed:
     STATES = ('idle', 'connecting', 'live', 'stalled', 'reconnecting', 'stopped', 'failed')
+    # Per-connection subscription limits the exchanges document (MEXC spot: 30).
+    MAX_SUBSCRIPTIONS = {'mexc': 30}
 
     def __init__(self, exchange_name: str, symbols, *, client_factory: Callable | None = None,
                  clock: Callable[[], float] = time.time, heartbeat_seconds: float = 20.0,
@@ -77,7 +89,8 @@ class QuoteFeed:
         self.metrics = metrics if metrics is not None else observability.METRICS
         self._rng = rng or random.Random()
         self.lock = threading.Lock()
-        self.symbols: tuple[str, ...] = tuple(dict.fromkeys(symbols))
+        self.requested = 0
+        self.symbols: tuple[str, ...] = self._capped(symbols)
         self.quotes: dict[str, dict] = {}
         self.counters = {'messages': 0, 'quotes': 0, 'out_of_order': 0, 'coalesced': 0, 'rejected': 0,
                          'reconnects': 0, 'stalls': 0}
@@ -116,9 +129,20 @@ class QuoteFeed:
         with self.lock:
             self.state = 'stopped'
 
-    def set_symbols(self, symbols) -> None:
+    def _capped(self, symbols) -> tuple[str, ...]:
+        """Unique symbols in the caller's order, cut to the exchange's subscription limit.
+
+        Callers list held positions first, so the cap drops watchlist and
+        discovery symbols, which then simply keep using REST.
+        """
         wanted = tuple(dict.fromkeys(symbols))
+        self.requested = len(wanted)
+        limit = self.MAX_SUBSCRIPTIONS.get(self.exchange_name)
+        return wanted[:limit] if limit else wanted
+
+    def set_symbols(self, symbols) -> None:
         with self.lock:
+            wanted = self._capped(symbols)
             if wanted == self.symbols:
                 return
             self.symbols = wanted
@@ -167,7 +191,7 @@ class QuoteFeed:
         with self.lock:
             now = self.clock()
             return {'state': self.state, 'exchange': self.exchange_name, 'symbols': len(self.symbols),
-                    'quoted': len(self.quotes), 'last_message_age_s': (round(now - self.last_message_at, 1)
+                    'unsubscribed': max(0, self.requested - len(self.symbols)), 'quoted': len(self.quotes), 'last_message_age_s': (round(now - self.last_message_at, 1)
                                                                        if self.last_message_at is not None else None),
                     'connected_at': self.connected_at, 'last_error': self.last_error, 'backoff_s': self.backoff,
                     'heartbeat_seconds': self.heartbeat_seconds, **self.counters}
@@ -244,6 +268,8 @@ class QuoteFeed:
 
     def _watch_method(self, client) -> str:
         has = getattr(client, 'has', {}) or {}
+        if self.exchange_name == 'mexc' and has.get('watchTicker'):
+            return 'watch_ticker'      # see "Channels" above: MEXC's bid/ask watch never resolves
         if has.get('watchBidsAsks'):
             return 'watch_bids_asks'
         if has.get('watchTickers'):
@@ -260,21 +286,31 @@ class QuoteFeed:
             await self._sleep(1.0)
             raise Resubscribe('no symbols to watch')
         first = True
-        while not self._stop.is_set():
-            updates = await self._next_update(client, method, symbols, changed)
-            received = self.clock()
-            if first:
-                first = False
-                self.backoff = 1.0
+        pending: dict[str, asyncio.Future] = {}
+        try:
+            while not self._stop.is_set():
+                if method == 'watch_ticker':
+                    updates = await self._next_ticker_updates(client, symbols, pending, changed)
+                else:
+                    updates = await self._next_update(client, method, symbols, changed)
+                received = self.clock()
+                if first:
+                    first = False
+                    self.backoff = 1.0
+                    with self.lock:
+                        self.connected_at = received
+                    observability.event('feed.connected', exchange=self.exchange_name, symbols=len(symbols),
+                                        method=method)
+                self._ingest(updates, received, client)
+                self._set_state('live')
                 with self.lock:
-                    self.connected_at = received
-                observability.event('feed.connected', exchange=self.exchange_name, symbols=len(symbols), method=method)
-            self._ingest(updates, received, client)
-            self._set_state('live')
-            with self.lock:
-                wanted_changed = self._wanted_changed
-            if wanted_changed:
-                raise Resubscribe('symbol set changed')
+                    wanted_changed = self._wanted_changed
+                if wanted_changed:
+                    raise Resubscribe('symbol set changed')
+        finally:
+            for future in pending.values():
+                if not future.done():
+                    future.cancel()
 
     async def _next_update(self, client, method: str, symbols: list[str], changed: asyncio.Event):
         """The next message, a stall after the heartbeat window, or a wake-up to resubscribe."""
@@ -292,6 +328,43 @@ class QuoteFeed:
             for future in (watch, waiter):
                 if not future.done():
                     future.cancel()
+
+    async def _next_ticker_updates(self, client, symbols: list[str], pending: dict, changed: asyncio.Event):
+        """Per-symbol watches: whatever arrived first, a stall, or a wake-up to resubscribe.
+
+        One ``watch_ticker`` future per symbol stays open across calls; only
+        the ones that resolved are re-armed, so a busy symbol cannot starve a
+        quiet one and nothing is resubscribed on every message.
+        """
+        for symbol in symbols:
+            if symbol not in pending:
+                pending[symbol] = asyncio.ensure_future(client.watch_ticker(symbol))
+        waiter = asyncio.ensure_future(changed.wait())
+        try:
+            done, _ = await asyncio.wait({*pending.values(), waiter}, timeout=self.heartbeat_seconds,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            updates, error = {}, None
+            for symbol, future in list(pending.items()):
+                if future not in done:
+                    continue
+                del pending[symbol]
+                if future.cancelled():
+                    continue
+                exc = future.exception()
+                if exc is not None:
+                    error = error or exc
+                else:
+                    updates[symbol] = future.result()
+            if error is not None:
+                raise error
+            if updates:
+                return updates
+            if waiter in done:
+                raise Resubscribe('symbol set changed')
+            raise FeedStalled(f'no message for {self.heartbeat_seconds:g}s')
+        finally:
+            if not waiter.done():
+                waiter.cancel()
 
     def _ingest(self, updates, received: float, client=None) -> None:
         if not isinstance(updates, dict):

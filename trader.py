@@ -82,6 +82,10 @@ class TradingEngine:
         self.last_asks: dict[str, float] = {}
         self.last_price_times: dict[str, float] = {}
         self.price_times = self.last_price_times
+        # What each stored quote's time is measured from ('exchange' or
+        # 'receipt') and when it arrived here, so ordering compares like with like.
+        self.last_quote_basis: dict[str, str] = {}
+        self.last_received_at: dict[str, float] = {}
         self.latest_balance = self.balance_updated_at = None
         self.last_universe_update = 0.0
         self.discovered: list[str] = []
@@ -422,6 +426,8 @@ class TradingEngine:
                 self.last_prices.clear()
                 self.last_asks.clear()
                 self.last_price_times.clear()
+                self.last_quote_basis.clear()
+                self.last_received_at.clear()
                 self.market_rows, self.discovered = [], []
                 self.last_universe_update = self.markets_loaded_at = 0
                 self.live_halted = self._durable_live_block()
@@ -634,7 +640,8 @@ class TradingEngine:
             return exited
         started = time.monotonic()
         held = [p['symbol'] for p in positions]
-        streamed = self.feed is not None and self.feed.covers(held, max_age=self.STREAM_MAX_AGE_SECONDS)
+        current = self.feed          # read once: the settings thread can stop and clear it meanwhile
+        streamed = current is not None and current.covers(held, max_age=self.STREAM_MAX_AGE_SECONDS)
         if streamed:
             # Every held asset has a live stream quote: no REST round trip, and
             # the protective check repeats every second instead of every poll.
@@ -666,7 +673,8 @@ class TradingEngine:
                     if saved is not None and not saved.empty:
                         # Trail with already validated ATR; monitoring never
                         # downloads candles or weakens a persisted stop.
-                        self._mark_positions(symbol, price, finite_positive(saved.iloc[-1]['atr']), False)
+                        self._mark_positions(symbol, price, finite_positive(saved.iloc[-1]['atr']), False,
+                                             stored_checked_at=price)
                 if not any(p['symbol'] == symbol for p in self._active_positions(self.mode)):
                     exited.add(symbol)
             except Exception:
@@ -795,6 +803,8 @@ class TradingEngine:
             with self.lock:
                 self.last_price_times.pop(symbol, None)
                 self.last_asks.pop(symbol, None)
+                self.last_quote_basis.pop(symbol, None)
+                self.last_received_at.pop(symbol, None)
             raise ValueError(message)
         if not isinstance(ticker, dict):
             invalid('Invalid ticker response')
@@ -804,23 +814,36 @@ class TradingEngine:
             invalid('Missing or crossed bid-ask quotes')
         observed = time.time()
         raw_timestamp = ticker.get('timestamp')
+        received = finite_positive(ticker.get('_received_at'))
+        received = received if received and received <= observed else observed
         if raw_timestamp is None:
-            # Exchanges without ticker timestamps (Kraken) are aged from the
-            # moment the response arrived, not from this later observation.
-            received = finite_positive(ticker.get('_received_at'))
-            timestamp = received if received and received <= observed else observed
+            # Exchanges without ticker timestamps (Kraken, MEXC's book ticker)
+            # are aged from the moment the response arrived, not from this
+            # later observation.
+            timestamp, basis = received, 'receipt'
         else:
-            timestamp = finite_positive(raw_timestamp) / 1000 + self._clock_offset()
+            timestamp, basis = finite_positive(raw_timestamp) / 1000 + self._clock_offset(), 'exchange'
         if (not timestamp or timestamp > observed + 30
                 or observed - timestamp > self.cfg['data_max_age_seconds']):
             invalid('Ticker timestamp is stale or invalid')
         with self.lock:
             previous = self.last_price_times.get(symbol)
+            previous_basis, previous_received = self.last_quote_basis.get(symbol), self.last_received_at.get(symbol)
             stored_bid, stored_ask = self.last_prices.get(symbol), self.last_asks.get(symbol)
             # A bulk snapshot taken before a later observation (a protective
-            # poll or the stream) must not roll the mark back in time.
-            keep_stored = bool(previous is not None and timestamp < previous - self.QUOTE_REGRESSION_SECONDS
-                               and finite_positive(stored_bid) and (stored_ask or not for_buy))
+            # poll or the stream) must not roll the mark back in time. Two
+            # exchange timestamps compare directly; otherwise arrival order
+            # decides, because an exchange clock that runs ahead of this PC
+            # would make every receipt-stamped quote look older than it is.
+            if previous is None:
+                older = False
+            elif basis == previous_basis == 'exchange':
+                older = timestamp < previous - self.QUOTE_REGRESSION_SECONDS
+            elif previous_received is not None:
+                older = received < previous_received - self.QUOTE_REGRESSION_SECONDS
+            else:
+                older = timestamp < previous - self.QUOTE_REGRESSION_SECONDS
+            keep_stored = bool(older and finite_positive(stored_bid) and (stored_ask or not for_buy))
             if keep_stored:
                 bid, ask = stored_bid, stored_ask
             else:
@@ -830,6 +853,8 @@ class TradingEngine:
                 else:
                     self.last_asks.pop(symbol, None)
                 self.last_price_times[symbol] = timestamp
+                self.last_quote_basis[symbol] = basis
+                self.last_received_at[symbol] = received
         if keep_stored:
             self.metrics.incr('quotes.superseded')
         spread = 100 * (ask - bid) / ((ask + bid) / 2) if ask else None
@@ -1492,7 +1517,15 @@ class TradingEngine:
                                         highest=float(position['highest']), source='protective')
                     self._sell(position, price, verdict['reason'], decision_id=exit_id)
 
-    def _mark_positions(self, symbol: str, price: float, atr: float, trend_broken: bool):
+    def _mark_positions(self, symbol: str, price: float, atr: float, trend_broken: bool, *,
+                        stored_checked_at: float | None = None):
+        """Ratchet and persist the trailing levels, then exit on the trailing stop or a trend break.
+
+        ``stored_checked_at`` is the bid :meth:`_protect_positions` already
+        judged in this pass. A stored stop or target at that same bid was
+        tried there, so it is not submitted a second time in the same tick
+        (a rejected exit would otherwise produce two orders per poll).
+        """
         for position in self._active_positions(self.mode):
             if position['symbol'] != symbol:
                 continue
@@ -1509,7 +1542,8 @@ class TradingEngine:
                 except Exception as exc:
                     self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
                     return
-            if verdict['action'] == 'exit' and self._orders_allowed():
+            already_tried = verdict['trigger'] == 'stored' and stored_checked_at is not None and price == stored_checked_at
+            if verdict['action'] == 'exit' and not already_tried and self._orders_allowed():
                 exit_id = observability.new_id('exit')
                 observability.event('decision.exit', decision_id=exit_id, symbol=symbol, reason=verdict['reason'],
                                     price=price, stop=stop, target=float(position['target']), highest=highest, source='scan')
@@ -1556,8 +1590,9 @@ class TradingEngine:
                 held = [p['symbol'] for p in self._active_positions(self.mode)]
                 symbols = list(dict.fromkeys(held + self.cfg['watchlist']))
                 storage.audit('warning', f'Market catalogue refresh unavailable: {type(exc).__name__}.')
-            if self.feed is not None:
-                self.feed.set_symbols(symbols)
+            current = self.feed
+            if current is not None:
+                current.set_symbols(symbols)
             try:
                 tickers = self.data.tickers(symbols)
             except Exception:
@@ -1592,8 +1627,10 @@ class TradingEngine:
                     price = self.last_asks.get(symbol, mark)
                     # These exits deliberately precede *all* candle downloads.
                     held_before = any(p['symbol'] == symbol for p in self._active_positions(self.mode))
+                    protected_at = None
                     if allow_orders and self._orders_allowed():
-                        self._protect_positions(symbol, self.last_prices[symbol])
+                        protected_at = self.last_prices[symbol]
+                        self._protect_positions(symbol, protected_at)
                     primary = self.data.candles(symbol, primary_tf, limit=175)
                     if allow_orders:
                         exited_symbols.update(self._monitor_if_due())
@@ -1602,7 +1639,8 @@ class TradingEngine:
                     last = primary.iloc[-1]
                     atr = finite_positive(last['atr'])
                     if allow_orders and self._orders_allowed():
-                        self._mark_positions(symbol, self.last_prices[symbol], atr, bool(last['close'] < last['ema50']))
+                        self._mark_positions(symbol, self.last_prices[symbol], atr, bool(last['close'] < last['ema50']),
+                                             stored_checked_at=protected_at)
                     if held_before and not any(p['symbol'] == symbol for p in self._active_positions(self.mode)):
                         exited_symbols.add(symbol)
                     # HTF data gates entries only. Stops and trend exits above
@@ -2052,6 +2090,7 @@ class TradingEngine:
 
     def snapshot(self) -> dict:
         """Only local state and cached balances. Polling never contacts an exchange."""
+        current_feed = self.feed
         with self.lock:
             mode, exchange = self.mode, self.exchange_name
             positions = self._active_positions(mode)
@@ -2103,7 +2142,7 @@ class TradingEngine:
                                           for symbol in self.last_price_times},
                     'metrics': dict(self.data.metrics.copy()),
                     'risk': self.risk.status(),
-                    'feed': self.feed.status() if self.feed is not None else {
+                    'feed': current_feed.status() if current_feed is not None else {
                         'state': 'off', 'enabled': bool(self.cfg.get('streaming_quotes'))},
                     'unresolved_orders': len(unresolved), 'unresolved_probe': list(self.unresolved_probe),
                     'legacy_live_records': storage.legacy_live_records(),

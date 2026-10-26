@@ -146,11 +146,15 @@ def test_every_abstention_names_the_failed_check(changes, status, reason):
     assert any(not c['passed'] for c in verdict.checks)
 
 
-def test_low_volume_outranks_spread_and_price_move_in_the_dashboard_status():
+def test_dashboard_status_keeps_the_scans_original_precedence():
+    # A signal that ran away from its candle says so first, as the inline scan
+    # logic did before the decision module; otherwise volume outranks spread.
     verdict = decide(volume=10., spread_pct=5., price=120.)
-    assert verdict.status == decision.STATUS_LOW_VOLUME
+    assert verdict.status == decision.STATUS_MOVED and verdict.action == 'abstain'
     assert set(verdict.reasons) == {decision.STATUS_LOW_VOLUME, decision.STATUS_WIDE_SPREAD, decision.STATUS_MOVED}
-    assert decide(spread_pct=5., price=120.).status == decision.STATUS_WIDE_SPREAD
+    assert decide(spread_pct=5., price=120.).status == decision.STATUS_MOVED
+    assert decide(volume=10., spread_pct=5.).status == decision.STATUS_LOW_VOLUME
+    assert decide(spread_pct=5.).status == decision.STATUS_WIDE_SPREAD
 
 
 def test_held_symbol_is_a_hold_not_an_entry():

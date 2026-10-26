@@ -43,3 +43,9 @@ def test_launchers_only_try_supported_interpreters():
         assert all(bootstrap.supported_python(version) is None for version in tried), (name, tried)
         assert max(tried) == bootstrap.NEWEST_PYTHON, name
         assert bootstrap.RECOMMENDED_PYTHON in text, name
+
+
+def test_a_missing_dotted_dependency_counts_as_not_installed():
+    # google.protobuf is checked by its dotted name; a machine without the
+    # google namespace must get an install, not a ModuleNotFoundError.
+    assert bootstrap.installed('json') and not bootstrap.installed('cryptopilot_missing_pkg.sub')

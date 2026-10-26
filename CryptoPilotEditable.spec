@@ -20,6 +20,10 @@ for source in root.glob('*.py'):
             if node.module.split('.')[0] not in local_modules:
                 hidden.add(node.module)
 hidden.update(collect_submodules('uvicorn'))
+# CCXT imports MEXC's protobuf message classes and google.protobuf lazily,
+# inside its websocket decoder; without them MEXC streaming never goes live.
+hidden.update(collect_submodules('ccxt.protobuf'))
+hidden.update(collect_submodules('google.protobuf', filter=lambda name: '.testdata' not in name and '_test' not in name))
 hidden.update(collect_submodules('keyring.backends'))
 hidden.update({'keyring.backends.Windows', 'keyring.backends.fail'})
 data = collect_data_files('ccxt') + collect_data_files('certifi') + copy_metadata('keyring')

@@ -4,3 +4,5 @@ ccxt>=4.4,<5
 pandas>=2.2,<4
 numpy>=2.0,<3
 keyring>=25,<27
+# Decodes MEXC websocket frames (protobuf-only) for the optional streaming quotes.
+protobuf>=5.29,<8

@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -154,14 +155,15 @@ def evaluate_entry(*, symbol: str, last, regime_ok: bool, market_ok: bool | None
     check('quote_fresh', fresh, STATUS_STALE, age_s=quote_age_s, threshold=cfg['data_max_age_seconds'])
     check('not_held', not held, STATUS_HELD)
     check('no_reentry_same_candle', not exited_this_candle, STATUS_EXITED)
-    # Dashboard status precedence, unchanged from the previous inline logic.
+    # Dashboard status precedence, as the inline scan logic had it before this
+    # module existed: a signal that ran away says so even on a thin or wide market.
     if not liquid:
         status = STATUS_LOW_VOLUME
     elif not spread_ok:
         status = STATUS_WIDE_SPREAD
-    if signal and liquid and spread_ok and not close_enough:
+    if signal and not close_enough:
         status = STATUS_MOVED
-    elif signal and liquid and spread_ok and close_enough and not held:
+    elif signal and liquid and spread_ok and not held:
         # A passing setup that is withheld says why, not 'BUY setup'.
         if not fresh:
             status = STATUS_STALE
@@ -190,27 +192,32 @@ def evaluate_exit(position: dict, price: float, *, atr: float | None = None, tre
                   dust: bool = False, trailing_multiple: float = 2.5) -> dict:
     """Exit policy for one tracked position at an observed executable bid.
 
-    Returns ``{'action': 'exit'|'hold'|'skip', 'reason': str, 'highest': float,
-    'stop': float}`` where ``highest``/``stop`` are the trailing levels to
-    persist (unchanged unless ``atr`` is supplied). The order of checks is the
-    one the engine has always used: a stored stop or target first, then the
-    updated trailing stop, then a completed-candle trend reversal. A verified
-    sub-minimum remainder is skipped (``skip``) rather than ordered.
+    Returns ``{'action': 'exit'|'hold'|'skip', 'reason': str, 'trigger': str|None,
+    'highest': float, 'stop': float}``. ``highest``/``stop`` are the trailing
+    levels to persist, ratcheted on every outcome (the stop only rises, and
+    only when ``atr`` is supplied), so an exit that then fails to fill still
+    leaves the raised stop in place. The order of checks is the one the engine
+    has always used: a stored stop or target first (``trigger='stored'``),
+    then the updated trailing stop (``'trailing'``), then a completed-candle
+    trend reversal (``'trend'``). A verified sub-minimum remainder is skipped
+    (``skip``) rather than ordered.
     """
     highest, stop, target = float(position['highest']), float(position['stop']), float(position['target'])
-    if dust:
-        return {'action': 'skip', 'reason': 'Below exchange minimum; retained', 'highest': highest, 'stop': stop}
-    if price <= stop:
-        return {'action': 'exit', 'reason': 'Stored stop / trailing stop (software monitored)', 'highest': highest, 'stop': stop}
-    if price >= target:
-        return {'action': 'exit', 'reason': 'Stored profit target (software monitored)', 'highest': highest, 'stop': stop}
+    trailing = atr is not None and math.isfinite(atr) and atr > 0
     new_highest = max(highest, price)
-    new_stop = max(stop, new_highest - trailing_multiple * atr) if atr and math.isfinite(atr) and atr > 0 else stop
-    if atr is not None and price <= new_stop:
-        return {'action': 'exit', 'reason': 'Updated trailing stop (software monitored)', 'highest': new_highest, 'stop': new_stop}
+    new_stop = max(stop, new_highest - trailing_multiple * atr) if trailing else stop
+    levels = {'highest': new_highest, 'stop': new_stop}
+    if dust:
+        return {'action': 'skip', 'reason': 'Below exchange minimum; retained', 'trigger': None, **levels}
+    if price <= stop:
+        return {'action': 'exit', 'reason': 'Stored stop / trailing stop (software monitored)', 'trigger': 'stored', **levels}
+    if price >= target:
+        return {'action': 'exit', 'reason': 'Stored profit target (software monitored)', 'trigger': 'stored', **levels}
+    if trailing and price <= new_stop:
+        return {'action': 'exit', 'reason': 'Updated trailing stop (software monitored)', 'trigger': 'trailing', **levels}
     if trend_broken:
-        return {'action': 'exit', 'reason': 'Completed-candle trend reversal', 'highest': new_highest, 'stop': new_stop}
-    return {'action': 'hold', 'reason': '', 'highest': new_highest, 'stop': new_stop}
+        return {'action': 'exit', 'reason': 'Completed-candle trend reversal', 'trigger': 'trend', **levels}
+    return {'action': 'hold', 'reason': '', 'trigger': None, **levels}
 
 
 class DecisionLog:
@@ -221,14 +228,20 @@ class DecisionLog:
         self.limit = limit
         self._items: Any = deque(maxlen=limit)
         self.latest: dict[str, Decision] = {}
+        # The scan thread adds while dashboard requests read; iterating a
+        # deque that another thread appends to raises RuntimeError.
+        self._lock = threading.Lock()
 
     def add(self, decision: Decision) -> None:
-        self._items.append(decision)
-        self.latest[decision.symbol] = decision
+        with self._lock:
+            self._items.append(decision)
+            self.latest[decision.symbol] = decision
 
     def recent(self, symbol: str | None = None, limit: int = 50) -> list[dict]:
-        items = [d for d in reversed(self._items) if symbol is None or d.symbol == symbol]
+        with self._lock:
+            items = [d for d in reversed(self._items) if symbol is None or d.symbol == symbol]
         return [d.as_dict() for d in items[:max(1, min(limit, self.limit))]]
 
     def __len__(self) -> int:
-        return len(self._items)
+        with self._lock:
+            return len(self._items)

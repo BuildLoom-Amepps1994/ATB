@@ -1,6 +1,7 @@
 """Loopback-only dashboard. Never return credentials or service exception text."""
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import mimetypes
@@ -34,6 +35,11 @@ STATIC = Path(__file__).resolve().parent / 'static'
 async def lifespan(application):
     yield
     engine.stop()
+    # Give an order that is being confirmed time to reach the ledger before
+    # the process ends; the journal covers anything that still does not.
+    if not await asyncio.to_thread(engine.wait_idle, 30.0):
+        storage.audit('error', 'Shutdown proceeded while an exchange operation was still in flight; '
+                               'inspect the order journal and exchange account before the next start.')
 
 
 app = FastAPI(title='CryptoPilot Local', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)

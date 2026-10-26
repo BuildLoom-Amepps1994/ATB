@@ -465,6 +465,29 @@ class TradingEngine:
             thread.join(timeout=2)
         self._stop_feed()
 
+    def wait_idle(self, timeout: float = 30.0) -> bool:
+        """Block until the worker and any manual order have finished, or ``timeout`` passes.
+
+        Used at process shutdown so an order that is being confirmed is
+        recorded before the interpreter exits. The durable journal still
+        covers a hard kill: an unconfirmed intent halts live trading at the
+        next start until it is reconciled.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        while True:
+            with self.lock:
+                worker = self.thread
+                busy = self._manual_order_active or bool(worker and worker.is_alive()
+                                                         and worker is not threading.current_thread())
+            if not busy:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
     def _loop(self):
         next_scan = 0.0
         try:
@@ -767,15 +790,29 @@ class TradingEngine:
         if (not timestamp or timestamp > observed + 30
                 or observed - timestamp > self.cfg['data_max_age_seconds']):
             invalid('Ticker timestamp is stale or invalid')
-        spread = 100 * (ask - bid) / ((ask + bid) / 2) if ask else None
         with self.lock:
-            self.last_prices[symbol] = bid
-            if ask:
-                self.last_asks[symbol] = ask
+            previous = self.last_price_times.get(symbol)
+            stored_bid, stored_ask = self.last_prices.get(symbol), self.last_asks.get(symbol)
+            # A bulk snapshot taken before a later observation (a protective
+            # poll or the stream) must not roll the mark back in time.
+            keep_stored = bool(previous is not None and timestamp < previous - self.QUOTE_REGRESSION_SECONDS
+                               and finite_positive(stored_bid) and (stored_ask or not for_buy))
+            if keep_stored:
+                bid, ask = stored_bid, stored_ask
             else:
-                self.last_asks.pop(symbol, None)
-            self.last_price_times[symbol] = timestamp
+                self.last_prices[symbol] = bid
+                if ask:
+                    self.last_asks[symbol] = ask
+                else:
+                    self.last_asks.pop(symbol, None)
+                self.last_price_times[symbol] = timestamp
+        if keep_stored:
+            self.metrics.incr('quotes.superseded')
+        spread = 100 * (ask - bid) / ((ask + bid) / 2) if ask else None
         return ask if for_buy else bid, finite_positive(ticker.get('quoteVolume')), spread
+
+    # A quote more than this much older than the one already held is a stale snapshot.
+    QUOTE_REGRESSION_SECONDS = 1.0
 
     def _clock_offset(self) -> float:
         """Seconds to add to an exchange timestamp to compare it with this PC's clock.
@@ -1399,6 +1436,9 @@ class TradingEngine:
                 verdict = decision.evaluate_exit(position, price, dust=self._is_dust(
                     position, self._catalogue().get(symbol), price))
                 if verdict['action'] == 'exit':
+                    observability.event('decision.exit', symbol=symbol, reason=verdict['reason'], price=price,
+                                        stop=float(position['stop']), target=float(position['target']),
+                                        highest=float(position['highest']), source='protective')
                     self._sell(position, price, verdict['reason'])
 
     def _mark_positions(self, symbol: str, price: float, atr: float, trend_broken: bool):
@@ -1419,6 +1459,8 @@ class TradingEngine:
                     self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
                     return
             if verdict['action'] == 'exit' and self._orders_allowed():
+                observability.event('decision.exit', symbol=symbol, reason=verdict['reason'], price=price,
+                                    stop=stop, target=float(position['target']), highest=highest, source='scan')
                 self._sell(position, price, verdict['reason'])
 
     def scan_once(self, allow_orders: bool = False, exited_symbols=None):
@@ -1545,7 +1587,7 @@ class TradingEngine:
                                         action=verdict.action, status=verdict.status, score=verdict.score,
                                         confidence=verdict.confidence, reasons=list(verdict.reasons),
                                         signal_candle_ts_ms=verdict.inputs['signal_candle_ts_ms'],
-                                        quote_age_s=verdict.inputs['quote_age_s'])
+                                        quote_age_s=verdict.inputs['quote_age_s'], record=verdict.as_dict())
                     reason, score, candidate = verdict.status, verdict.score, verdict.action == 'enter'
                     signal_close = float(last['close'])
                     if candidate:
@@ -1855,8 +1897,23 @@ class TradingEngine:
                     with self.lock:
                         self.risk_block = 'Aggregate protective-stop risk cap reached'
                 continue
-            if self._buy(symbol, budget, price, fraction, entry_candle=candle, kind='entry',
-                         signal_close=signal_close, atr=atr, spread=spread, decision_id=decision_id):
+            try:
+                filled = self._buy(symbol, budget, price, fraction, entry_candle=candle, kind='entry',
+                                   signal_close=signal_close, atr=atr, spread=spread, decision_id=decision_id)
+            except Exception as exc:
+                # The order path records its own outcome; anything escaping it is
+                # unexpected. Paper continues with the next candidate, live stops
+                # the pass so no further order is prepared in an unknown state.
+                storage.audit('error', f'{symbol}: entry failed unexpectedly ({type(exc).__name__}); '
+                                       + ('remaining candidates skipped this scan.' if self.mode == 'live'
+                                          else 'continuing with the next candidate.'))
+                observability.event('execution.entry_error', level='error', symbol=symbol,
+                                    error=type(exc).__name__, decision_id=decision_id)
+                self.risk.record_failure('entry_error')
+                if self.mode == 'live':
+                    break
+                continue
+            if filled:
                 count += 1
             if self.mode == 'live' and self.live_halted:
                 break

@@ -25,6 +25,7 @@ from typing import Any
 from strategy import MIN_EFFICIENCY, entry_price_ok, entry_signal, setup_quality
 
 DECISION_VERSION = 'entry-v1'
+FEATURE_KEYS = ('close', 'volume', 'ema20', 'ema50', 'rsi', 'atr', 'vol_avg20', 'prior_high20', 'efficiency')
 
 # Status strings are shown in the dashboard and asserted by tests; keep them stable.
 STATUS_LOW_VOLUME = 'Low or unknown 24h quote volume'
@@ -128,10 +129,13 @@ def evaluate_entry(*, symbol: str, last, regime_ok: bool, market_ok: bool | None
 
     signal_ts = _finite(last['timestamp']) if 'timestamp' in last else None
     signal_close, atr = _finite(last.get('close')), _finite(last.get('atr'))
+    # The indicator values the rule saw, so the record replays on its own and
+    # two different candles never share a decision id.
+    features = {key: _finite(last.get(key)) for key in FEATURE_KEYS}
     inputs = {'signal_candle_ts_ms': int(signal_ts) if signal_ts else None,
               'higher_candle_ts_ms': higher_candle_ts, 'quote_ts': quote_ts, 'quote_age_s': quote_age_s,
               'price': price, 'volume': volume, 'spread_pct': spread_pct, 'regime_ok': bool(regime_ok),
-              'market_ok': market_ok, 'rapid': rapid, 'filters': filters,
+              'market_ok': market_ok, 'rapid': rapid, 'filters': filters, 'features': features,
               'limits': {'min_quote_volume': cfg['min_quote_volume'], 'max_spread_pct': cfg['max_spread_pct'],
                          'data_max_age_seconds': cfg['data_max_age_seconds']}}
     if higher_error:
@@ -157,6 +161,12 @@ def evaluate_entry(*, symbol: str, last, regime_ok: bool, market_ok: bool | None
         status = STATUS_WIDE_SPREAD
     if signal and liquid and spread_ok and not close_enough:
         status = STATUS_MOVED
+    elif signal and liquid and spread_ok and close_enough and not held:
+        # A passing setup that is withheld says why, not 'BUY setup'.
+        if not fresh:
+            status = STATUS_STALE
+        elif exited_this_candle:
+            status = STATUS_EXITED
     enter = signal and liquid and spread_ok and close_enough and fresh and not held and not exited_this_candle
     if held:
         action = 'hold'

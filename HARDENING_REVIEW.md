@@ -144,6 +144,14 @@ impact on live capital or on the integrity of the record.
 | 63 | Low | The kill switch was read once at the start of authorization, so an order authorized just before the switch was engaged was still sent, including an exit the operator meant to block. | **Fixed**: `_submit` re-reads the switch right before sending, under the submission lock, and journals the intent `rejected` with a `risk.blocked_at_submit` event. |
 | 64 | Med. | The documented recovery for a broken source-only update ran `--update-source` on the backup inside the installation folder, which the helper always refuses. | **Fixed** (docs): copy the backup outside the installation first, or run Setup. The reviewer's rehearsal confirmed that the copied backup restores. |
 | 65 | Med. | An interrupted Setup upgrade from 1.4.0 could not be recovered: the new helper checked the 1.4.0 backup record against its own 15-module list and refused it, and Setup refuses to run while that record exists. | **Fixed**: recovery accepts a record from another release (the nine modules every release ships are required, safe module names only); the old app is restored and Setup can run again. The reverse case, a 1.4.0 helper restoring a newer record during a downgrade, cannot be fixed from here and is documented in §G. |
+| 66 | Med. | The slippage breaker never closed: it re-read the last three fills with no time limit, so with no new orders it blocked entries for good, and it was missing from `risk.breakers_open`, which the runbook said would count it down. | **Fixed**: a durable 30-minute hold, after which the fills that tripped it are spent; it and the rejection spike are reported with seconds remaining; the rejection spike counts only requests that reached the exchange. |
+| 67 | Med. | `daily_realized_loss_limit_pct` nets profits against losses, but the runbook called it the sum of today's losses, which overstated the control. | **Fixed** (docs): the runbook says net realised P/L. Counting losses only is a one-line change if you prefer it (H). |
+| 68 | Med. | The one-grep correlation claim failed: the authorization line is written before the intent exists, there was no submit line, and manual orders had no id. | **Fixed**: `execution.submitted` carries the intent and decision ids and the authorization token; manual orders carry `manual_<request id>`; runbook §7 says how the token links the authorization. |
+| 69 | Low | The runbook listed the daily equity guard among the latches cleared with `RESUME TRADING` (it clears at the next UTC day), and did not say that a hand-written `POST /api/risk` is refused without the dashboard's per-session token. | **Fixed** (docs). The realised-stop re-latch and the missing clear button were findings 46. |
+| 70 | Low | The hot-path benchmark's five-position monitor run held one position (later buys were refused for missing marks), and the review explained a tick speed-up by a cause that does not exist. | See section C. |
+| 71 | Low | The latency table compared the old code's cold first call with warm calls on the branch at p99, took p95 and p99 of the warm scan from ten samples, and measured a branch commit seven commits old. | See section C. |
+| 72 | Low | The kill switch is stored per exchange, so changing exchanges silently left an engaged switch behind. | **Fixed**: an engaged switch is carried over to the new exchange with its exit policy; the runbook says it is per exchange. |
+| 73 | Low | The upgrade path said the in-app updater would offer the hardening build to a 1.4.0 installation, but the build was also numbered 1.4.0. | **Resolved by pull request #7**: releases are numbered 1.5.<commits on main>, so every merged build is newer than 1.4.0. |
 
 ---
 
@@ -164,13 +172,13 @@ impact on live capital or on the integrity of the record.
 | `recovery.py` | Reports and `--clear-halt` consider live journal rows only. |
 | `static/index.html`, `static/dashboard.js` | Kill switch button, five hard-limit inputs, streaming toggle, feed status line, risk warnings. |
 | `benchmarks/bench_latency.py`, `benchmarks/replay.py`, `benchmarks/results/` | Latency percentiles (runs on both trees), determinism check, raw results. |
-| `tests/test_risk_gate.py`, `test_order_lifecycle.py`, `test_decisions.py`, `test_quote_feed.py`, `test_hardening_fixes.py`, `test_app_manifest.py`, `test_review_round2.py` (new) | 115 new tests; see D. |
+| `tests/test_risk_gate.py`, `test_order_lifecycle.py`, `test_decisions.py`, `test_quote_feed.py`, `test_hardening_fixes.py`, `test_app_manifest.py`, `test_review_round2.py` (new) | 114 new tests, plus one new parametrized case in `test_engine_integrity.py`; see D. |
 | `tests/test_recovery.py`, `test_execution_speed.py`, `test_quote_protection.py`, `test_review_fixes.py` | Fixture updates for schema version 3, the 12 USDT minimum and client order ids. |
 | `scripts/build_installer.py`, `windows_runtime.py`, `maintenance/update_installation.py` | The six new modules join the installer's staged file list, the frozen runtime's required-module set and the offline source updater's module list. The first Windows build of the branch failed its frozen-runtime smoke test with `No module named 'decision'` because these lists are explicit. |
 | `tests/test_app_manifest.py` (new), `tests/smoke_frozen_orders.py` | A test keeps the three lists equal to the repository's modules and asserts everything the launcher imports is staged. The smoke test stages exactly the installer's file set (read from the builder), imports `ccxt.pro` inside the runtime, and can be rehearsed without the frozen runtime (`--work` alone). |
 | `risk.py`, `storage.py`, `app.py`, `static/dashboard.js` | Realised-loss latch, its release action and warning text; redaction stops at quotes. |
 | `trader.py`, `orders.py`, `recovery.py`, `observability.py`, `launcher.py`, `credentials.py`, `paper_exchange.py` | Review-round fixes 28–38: exit freshness, third-asset fees, exit decision ids and ledger events, operator events, MEXC unknown-order lookup, `acked` in the report, per-exchange halt messages, pre-serialization redaction, start-up failure log, local-only credential persistence, paper fee-asset injection. |
-| `tests/test_review_round2.py` (new) | 16 tests reproducing the review-round findings and asserting the fixes. |
+| `tests/test_review_round2.py` (new) | 15 tests reproducing the review-round findings and asserting the fixes. |
 | `feed.py`, `requirements.txt`, `requirements-lock.txt`, `CryptoPilotEditable.spec`, `scripts/bootstrap.py`, `tests/smoke_frozen_orders.py` | Findings 39, 42, 53, 55: per-symbol MEXC watches, the 30-subscription cap, the cache sweep, reconnect hygiene, unlisted pairs; `protobuf` shipped and checked in the frozen runtime. |
 | `decision.py`, `trader.py`, `risk.py`, `storage.py`, `market_data.py`, `launcher.py` | Findings 40, 41, 43–50, 52, 54, 56–60: exit retry and ratchet, quote clocks, status order, locks, realised-loss latching and clearing, fee P/L, failure correlation, manual-order events, Ctrl+C, single-pair MEXC reads, decision trail. |
 | `static/index.html`, `static/dashboard.js`, `static/dashboard-core.js` | **Clear latched stop** button and warning text (finding 46). |
@@ -178,6 +186,7 @@ impact on live capital or on the integrity of the record.
 | `recovery.py`, `trader.py`, `risk.py`, `RUNBOOK.md` | Findings 61–63: `--prepare-downgrade` for a rollback across the schema change, stream lifecycle on a fast Stop or with streaming off, kill switch re-read at submit. |
 | `tests/test_review_round3.py` | 7 more tests for findings 61–63, also checked to fail with each fix removed. |
 | `maintenance/update_installation.py`, `tests/test_source_updates.py` | Finding 65: interrupted-update recovery accepts another release's backup record; 8 tests, checked to fail without the fix. |
+| `risk.py`, `trader.py`, `storage.py`, `RUNBOOK.md`, `tests/test_review_round3.py` | Findings 66–69 and 72: breakers that close and report, the submit event and manual order ids, the kill switch across an exchange change; 7 tests, each checked to fail without its fix. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -293,7 +302,7 @@ New test files and what they prove:
   frozen runtime's required modules and the source updater's module list all
   equal the repository's top-level modules; everything the launcher imports
   is staged; every dashboard asset is staged.
-* `tests/test_review_round2.py` (16): the realised-loss latch (settings,
+* `tests/test_review_round2.py` (15): the realised-loss latch (settings,
   profit, phrase, API, paper reset), an invalidated quote is stale for the
   gate, third-asset fees booked on the live and paper paths, MEXC unknown
   order code treated as absent, recovery statuses match the journal, the
@@ -301,7 +310,7 @@ New test files and what they prove:
   decision, authorization, journal and ledger events, operator and manual
   order events, redaction keeps lines valid JSON, start-up failures are
   logged safely.
-* `tests/test_review_round3.py` (39): the real CCXT MEXC websocket client fed
+* `tests/test_review_round3.py` (46): the real CCXT MEXC websocket client fed
   protobuf frames goes live, keeps both symbols updating and serves the newest
   quote after a burst; the 30-subscription cap; cache entries a combined watch
   did not return; no pre-outage quotes after a reconnect; an unlisted pair;
@@ -319,7 +328,11 @@ New test files and what they prove:
   engaged after authorization stopping an entry, and an exit only when exits
   are blocked; a rollback prepared by `recovery.py` letting the old positional
   journal insert succeed, with the full copy kept, and refusing open intents
-  or a wrong phrase.
+  or a wrong phrase; the slippage breaker reported, closing on its own,
+  tripping again only on newer fills and cleared by a paper reset; the
+  rejection spike reported and ignoring orders never sent; one intent id
+  finding the submit, whose token finds the authorization; manual order ids;
+  the kill switch carried to the other exchange.
 
 **Not runnable here.**
 
@@ -400,7 +413,7 @@ What the records can and cannot say:
 
 Commits 1–10 below reached `main` through pull request #5 (merged 2026-10-26
 01:07 UTC) and commit 11 through pull request #6 (merged 01:31 UTC). Pull
-request #8 carries commits 12–15, plus documentation updates, on top of
+request #8 carries commits 12–16, plus documentation and benchmark updates, on top of
 `main` after pull request #7 (automatic releases). Oldest first:
 
 1. `a83667d` Add an independent risk gate, kill switch and structured events
@@ -418,8 +431,9 @@ request #8 carries commits 12–15, plus documentation updates, on top of
 13. `db82565` Close the final review: latch on booking, stream cache sweep, clock steps, decision trail
 14. `5ddd2df` Close the concurrency review: safe rollback, stream lifecycle, kill switch at submit
 15. `0d277d4` Recover an interrupted update whose backup came from another release
+16. `be20041` Close the documentation review: breakers that close, one-id order trail, kill switch scope
 
-`git revert` them newest first. Reverting commits 11–15 needs no data step:
+`git revert` them newest first. Reverting commits 11–16 needs no data step:
 their data changes are meta keys that older builds ignore.
 
 Going back past commit 1 (to `7207e82`, v1.4.0) crosses the schema change
@@ -509,9 +523,12 @@ Setup is the simpler fix: it installs the matching app and runtime.
 
 **Explicit approvals requested.**
 
-* Approval to merge pull request #8 (commits 12–15) after its Windows build
+* Approval to merge pull request #8 (commits 12–16) after its Windows build
   is green. Pull requests #5 and #6 (commits 1–11) are already merged.
 * Whether to take the follow-ups above in a further branch.
+* Whether the daily realised-loss stop should count today's losing trades
+  only instead of net realised P/L (finding 67). Net is the current
+  behaviour; losses-only stops sooner after a mixed day.
 * Since pull request #7, every merge to `main` publishes a release
   (`1.5.<commits on main>`) that installed copies offer as an update, so
   merging #8 also ships it to installed copies through Setup.

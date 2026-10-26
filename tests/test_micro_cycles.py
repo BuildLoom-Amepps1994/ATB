@@ -1084,7 +1084,8 @@ def test_exit_all_pressed_while_stopping_waits_for_the_worker_and_sells_or_refus
     assert closed['state'] == 'CLOSED' and closed['last_exit_trigger'] == 'operator'
     assert w.engine.micro.flatten_pending() == 0
     # A worker that does not finish in time gets a refusal, never a request left queued for the next start.
-    stuck = threading.Thread(target=threading.Event().wait, args=(30,), daemon=True, name='TradingEngine')
+    unstick = threading.Event()
+    stuck = threading.Thread(target=unstick.wait, args=(30,), daemon=True, name='TradingEngine')
     stuck.start()
     w.engine.thread, w.engine.running = stuck, True
     w.engine.stop_event.set()
@@ -1095,6 +1096,8 @@ def test_exit_all_pressed_while_stopping_waits_for_the_worker_and_sells_or_refus
             w.engine.micro.flatten()
     finally:
         micro.FLATTEN_STOP_WAIT_S = monkeypatched
+        unstick.set()                       # the stand-in worker ends, so teardown does not wait for it
+        stuck.join(timeout=2)
     assert w.engine.micro.flatten_pending() == 0
 
 

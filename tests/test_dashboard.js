@@ -2,7 +2,7 @@
 // Run with Node 22+ (24 LTS recommended): node --test tests/test_dashboard.js. No exchange/network access.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml} = require('../static/dashboard-core.js');
+const {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter} = require('../static/dashboard-core.js');
 
 test('untrusted server strings and validation details are safe for display', () => {
   assert.equal(escapeHtml('<img src=x onerror="alert(1)">\''), '&lt;img src=x onerror=&quot;alert(1)&quot;&gt;&#39;');
@@ -97,4 +97,23 @@ test('research scenarios distinguish holdout, full-period stress and missing dat
 test('unavailable research metrics are not displayed as positive or zero returns', () => {
   const html = researchReportHtml({development:{available:true,return_pct:null,max_drawdown_pct:Infinity,closed_trades:NaN},holdout:{available:false},double_cost:{available:false}});
   assert.match(html,/—%/); assert.ok(!html.includes('Infinity')); assert.ok(!html.includes('NaN'));
+});
+
+test('the footer always says what the last update check found', () => {
+  const time = () => '01:32';
+  assert.equal(updateFooter(null, time), '');
+  assert.equal(updateFooter({disabled: true}, time), 'Update checks are turned off');
+  assert.equal(updateFooter({error: 'No published release was found.', checked_at: 1}, time), 'Update check: No published release was found.');
+  assert.equal(updateFooter({available: true, latest_version: '1.5.29', checked_at: 1}, time), 'Version 1.5.29 available');
+  assert.equal(updateFooter({available: false, checked_at: 1}, time), 'Up to date · checked 01:32');
+  assert.equal(updateFooter({phase: 'installing', available: true}, time), 'Updating…');
+});
+
+test('a copy run from source is told how to get in-app updates', () => {
+  const source = updateSummary({available: true, can_install: false, latest_version: '1.5.29', current_version: '1.5.0'});
+  assert.equal(source.install, false);
+  assert.match(source.text, /runs from source/);
+  assert.match(source.text, /installer from the releases page once/);
+  assert.equal(updateSummary({available: true, can_install: true, latest_version: '1.5.29', current_version: '1.4.0'}).install, true);
+  assert.equal(updateSummary({available: false, error: 'No published release was found.'}), null);
 });

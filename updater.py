@@ -25,13 +25,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Bump together with a release tag vX.Y.Z; the release workflow refuses a mismatch.
-APP_VERSION = '1.4.0'
+# The release series. Every merge to main publishes MAJOR.MINOR.<commits on main>
+# (scripts/build_installer.release_version) and stamps it into installation.json,
+# which is what an installed copy reports. Source runs report this value.
+APP_VERSION = '1.5.0'
 REPOSITORY = 'BuildLoom-Amepps1994/ATB'
 LATEST_URL = f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
 RELEASES_PAGE = f'https://github.com/{REPOSITORY}/releases'
 DOWNLOAD_PREFIX = f'https://github.com/{REPOSITORY}/releases/download/'
-CHECK_SECONDS = 6 * 3600
+CHECK_SECONDS = 3600
 MAX_METADATA_BYTES = 2 * 1024 * 1024
 MAX_INSTALLER_BYTES = 400 * 1024 * 1024
 LOCK_WAIT_SECONDS = 180

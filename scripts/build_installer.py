@@ -39,6 +39,20 @@ def app_version(source: Path = ROOT) -> str:
     raise ValueError('updater.py does not define APP_VERSION.')
 
 
+def release_version(commits: int, source: Path = ROOT) -> str:
+    """MAJOR.MINOR from APP_VERSION plus the number of commits on main.
+
+    The commit count only grows on main, so every merge publishes a release
+    that installed copies see as newer, with no manual version bump or tag.
+    """
+    if not isinstance(commits, int) or isinstance(commits, bool) or commits < 1:
+        raise ValueError('The commit count must be a positive integer.')
+    match = re.fullmatch(r'(\d+)\.(\d+)\.\d+', app_version(source))
+    if match is None:
+        raise ValueError('APP_VERSION must be MAJOR.MINOR.PATCH.')
+    return f'{match.group(1)}.{match.group(2)}.{commits}'
+
+
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

@@ -44,6 +44,7 @@ const root = require('node:path').resolve(__dirname, '..');
  assert.equal(await page.locator('#installUpdate').isVisible(),true);
  assert.equal(await page.locator('#updateBanner img').count(),0);
  assert.equal(await page.locator('#appVersion').textContent(),'CryptoPilot 1.4.0');
+ assert.equal(await page.locator('#updateState').textContent(),' · Version 1.5.0 available');
  await page.selectOption('#btSymbol','ETH/USDT');
  await page.click('#backtestBtn');
  await page.waitForFunction(()=>document.getElementById('backtestResults').textContent.includes('ETH/USDT'));

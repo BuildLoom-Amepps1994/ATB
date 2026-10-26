@@ -183,6 +183,29 @@ def test_installer_version_matches_app_version():
     assert f'#define AppVersion "{updater.APP_VERSION}"' in iss
 
 
+def test_every_merge_gets_a_newer_release_version():
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    import build_installer
+    major, minor, _ = updater.parse_version(updater.APP_VERSION)
+    assert build_installer.release_version(27) == f'{major}.{minor}.27'
+    versions = [updater.parse_version(build_installer.release_version(n)) for n in (1, 2, 27, 28, 400)]
+    assert versions == sorted(versions) and len(set(versions)) == len(versions)
+    # Copies installed before automatic releases report 1.4.0 and must see the first one as newer.
+    assert updater.parse_version(build_installer.release_version(1)) > updater.parse_version('1.4.0')
+    for bad in (0, -3, '12', 2.0, True):
+        with pytest.raises(ValueError):
+            build_installer.release_version(bad)
+
+
+def test_merges_to_main_publish_releases_stamped_with_that_version():
+    workflow = (ROOT / '.github/workflows/windows-installer.yml').read_text(encoding='utf-8')
+    assert 'branches: [main]' in workflow and 'fetch-depth: 0' in workflow
+    assert "--version ${{ steps.version.outputs.version }}" in workflow
+    assert "if: needs.build.outputs.publish == 'true'" in workflow
+    # Releases are never replaced: a re-run of a published commit leaves it alone.
+    assert 'gh release view "v$VERSION"' in workflow
+
+
 def test_setup_supports_waiting_for_the_app_and_reopening_it():
     iss = (ROOT / 'installer/CryptoPilot.iss').read_text(encoding='utf-8')
     assert '{param:WAITLOCK|0}' in iss and '{param:RELAUNCH|0}' in iss

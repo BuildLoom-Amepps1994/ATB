@@ -1,0 +1,59 @@
+{
+  "cpu": {
+    "symbol_pipeline_175_candles": {
+      "median_ms": 4.179,
+      "min_ms": 4.04
+    },
+    "research_report_900_candles": {
+      "median_ms": 49.917,
+      "min_ms": 49.619
+    }
+  },
+  "scan": [
+    {
+      "symbols": 8,
+      "rtt_ms": 150.0,
+      "rate_limit_ms": 50,
+      "horizon": "balanced",
+      "cold_scan_s": 1.069,
+      "cold_requests": 17,
+      "max_concurrent_requests": 3,
+      "warm_scan_s": 0.174,
+      "warm_requests": 1
+    },
+    {
+      "symbols": 20,
+      "rtt_ms": 150.0,
+      "rate_limit_ms": 50,
+      "horizon": "rapid",
+      "cold_scan_s": 2.289,
+      "cold_requests": 41,
+      "max_concurrent_requests": 3,
+      "warm_scan_s": 0.213,
+      "warm_requests": 1
+    },
+    {
+      "symbols": 8,
+      "rtt_ms": 150.0,
+      "rate_limit_ms": 1000,
+      "horizon": "balanced",
+      "cold_scan_s": 17.002,
+      "cold_requests": 17,
+      "max_concurrent_requests": 1,
+      "warm_scan_s": 1.018,
+      "warm_requests": 1
+    }
+  ],
+  "monitor": [
+    {
+      "positions": 1,
+      "median_ms": 1.959,
+      "min_ms": 1.753
+    },
+    {
+      "positions": 5,
+      "median_ms": 1.921,
+      "min_ms": 1.758
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, latchedStops} = CryptoPilotUI;
+const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops} = CryptoPilotUI;
 let state = null, online = false, chartSymbol = 'BTC/USDT', chartTF = '1h', chartData = [], btData = [];
 let lastSuccess = 0, pollTimer = null, modalFocus = null;
 let orderDraft = null, orderFocus = null;
@@ -317,7 +317,7 @@ async function checkUpdates(force) {
   try {
     const status = await api(force ? '/update/check' : '/update', force ? 'POST' : 'GET', force ? {force: true} : undefined, {timeoutMs: 30000});
     showUpdate(status);
-    if (force) toast(status.error ? status.error : status.available ? 'CryptoPilot ' + status.latest_version + ' is available.' : 'CryptoPilot is up to date.', !!status.error);
+    if (force) { const result = updateToast(status); toast(result.text, result.error); }
   } catch (error) { if (force) toast(error.message, true); }
 }
 $('checkUpdates').onclick = () => checkUpdates(true);

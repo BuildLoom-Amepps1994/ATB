@@ -53,6 +53,18 @@ def release_version(commits: int, source: Path = ROOT) -> str:
     return f'{match.group(1)}.{match.group(2)}.{commits}'
 
 
+def build_version(commits: int, publish: bool, source: Path = ROOT) -> str:
+    """The version a CI build stamps into its installer.
+
+    Only builds that publish a release use the commit count. Pull-request and
+    branch builds report MAJOR.MINOR.0, which is older than every release in
+    the series, so a copy installed from a test artifact is always offered the
+    next real release instead of being told it is up to date.
+    """
+    version = release_version(commits, source)
+    return version if publish else version.rsplit('.', 1)[0] + '.0'
+
+
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

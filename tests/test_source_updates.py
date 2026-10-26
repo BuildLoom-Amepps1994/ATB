@@ -148,6 +148,83 @@ def test_interrupted_update_restores_previous_source(installation,phase):
     assert not (root/update.JOURNAL).exists()
 
 
+# Modules shipped by earlier releases that Setup upgrades in place (same AppId and folder).
+RELEASE_1_3_0 = ('app.py', 'credentials.py', 'launcher.py', 'market_data.py',
+                 'recovery.py', 'storage.py', 'strategy.py', 'trader.py')
+RELEASE_1_4_0 = (*RELEASE_1_3_0, 'updater.py')
+
+
+def interrupted_setup(root, source, phase, previous_modules=RELEASE_1_4_0):
+    """Lay out an install as Setup leaves it when it stops partway through its source swap.
+
+    The previous record comes from an earlier release with fewer modules.
+    """
+    token = 'setup-20261026010000'
+    backup, staging = root/'backups'/token, root/('.' + token)
+    backup.mkdir(parents=True)
+    previous = json.loads((root/'installation.json').read_text())
+    previous['installed_version'] = '1.4.0'
+    previous['app_files'] = {k: v for k, v in previous['app_files'].items()
+                             if not k.endswith('.py') or k in previous_modules}
+    (root/'installation.json').write_text(json.dumps(previous))
+    shutil.copy2(root/'installation.json', backup/'installation.json')
+    (staging/'app').parent.mkdir()
+    shutil.copytree(source, staging/'app')
+    (staging/'app/app.py').write_text('VALUE = 2\n')
+    record = {'format':1,'product':'CryptoPilot','installed_version':'1.5.31',
+              'requirements_sha256':hashlib.sha256((source/'requirements-lock.txt').read_bytes()).hexdigest(),
+              'app_files':update._inventory(staging/'app')}
+    (staging/'installation.json').write_text(json.dumps(record))
+    if phase in ('after_old_move', 'after_new_move', 'after_record_move'):
+        os.replace(root/'app', backup/'app')
+    if phase in ('after_new_move', 'after_record_move'):
+        os.replace(staging/'app', root/'app')
+    if phase == 'after_record_move':
+        os.replace(staging/'installation.json', root/'installation.json')
+    (root/update.JOURNAL).write_text(json.dumps({'format':1,'product':'CryptoPilot',
+        'backup':'backups/' + token,'staging':'.' + token}))
+    return backup, staging
+
+
+@pytest.mark.parametrize('previous_modules', [RELEASE_1_3_0, RELEASE_1_4_0])
+@pytest.mark.parametrize('phase', ['before_old_move', 'after_old_move', 'after_new_move', 'after_record_move'])
+def test_interrupted_setup_finishes_with_the_new_source(installation, phase, previous_modules):
+    # Setup replaced the runtime before the swap, so only the new source matches it.
+    root, source, _ = installation
+    backup, staging = interrupted_setup(root, source, phase, previous_modules)
+    with update.InstallationLock(root):
+        assert update.recover_if_needed(root)
+    assert (root/'app/app.py').read_text() == 'VALUE = 2\n'
+    assert update.read_manifest(root)['installed_version'] == '1.5.31'
+    assert (backup/'app/app.py').read_text() == 'VALUE = 1\n'
+    assert not (root/update.JOURNAL).exists() and not staging.exists()
+    with update.InstallationLock(root):
+        assert not update.recover_if_needed(root)
+
+
+def test_interrupted_setup_whose_record_was_already_activated_finishes(installation):
+    # An older Setup moved the new record into place, then failed and moved the source back to staging.
+    root, source, _ = installation
+    backup, staging = interrupted_setup(root, source, 'before_old_move')
+    os.replace(staging/'installation.json', root/'installation.json')
+    with update.InstallationLock(root):
+        assert update.recover_if_needed(root)
+    assert (root/'app/app.py').read_text() == 'VALUE = 2\n'
+    assert update.read_manifest(root)['installed_version'] == '1.5.31'
+    assert (backup/'app/app.py').read_text() == 'VALUE = 1\n' and not (root/update.JOURNAL).exists()
+
+
+def test_interrupted_setup_with_a_damaged_new_record_changes_nothing(installation):
+    root, source, _ = installation
+    _, staging = interrupted_setup(root, source, 'before_old_move')
+    (staging/'installation.json').write_text('{"format": 1}')
+    with update.InstallationLock(root), pytest.raises(update.UpdateError):
+        update.recover_if_needed(root)
+    assert (root/'app/app.py').read_text() == 'VALUE = 1\n'
+    assert (staging/'app/app.py').read_text() == 'VALUE = 2\n'
+    assert (root/update.JOURNAL).exists()
+
+
 @pytest.mark.parametrize('badpath',['../trader.py','static/../../settings.json','static/CON.png','static/x:stream.js'])
 def test_unsafe_manifest_paths_rejected(installation,badpath):
     root,_,_ = installation

@@ -48,10 +48,11 @@ jobs:
           import build_installer
           commits = int(subprocess.run(['git', 'rev-list', '--count', 'HEAD'], check=True,
                                        capture_output=True, text=True).stdout)
-          version = build_installer.release_version(commits)
-          # Only main publishes; pull requests and other branches build an artifact only.
+          # Only main publishes; pull requests and other branches build an artifact only,
+          # stamped X.Y.0 so an installed test build never outranks a real release.
           publish = (os.environ['GITHUB_EVENT_NAME'] in ('push', 'workflow_dispatch')
                      and os.environ['GITHUB_REF'] == 'refs/heads/main')
+          version = build_installer.build_version(commits, publish)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write(f'version={version}\npublish={str(publish).lower()}\n')
           print('CryptoPilot', version, '(publish)' if publish else '(artifact only)')
@@ -138,9 +139,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
+          set -euo pipefail
+          # Any GitHub error stops the job: guessing "no release" could publish over a newer one.
+          releases=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+          matches=$(jq -r --arg tag "v$VERSION" '.[] | select(.tag_name == $tag) | "\(.id) \(.draft)"' <<<"$releases")
           # A re-run of the same commit has the same version; never replace a published release.
-          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          if grep -q ' false$' <<<"$matches"; then
             echo "Release v$VERSION already exists."
+            exit 0
+          fi
+          # An interrupted upload leaves a draft; installed copies never see drafts, so start again.
+          for id in $(awk '$2 == "true" { print $1 }' <<<"$matches"); do
+            echo "Removing an unfinished draft of v$VERSION."
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" > /dev/null
+          done
+          # Re-running an older main build must not replace a newer Latest release.
+          if latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" 2> latest.err); then
+            latest=$(jq -r .tag_name <<<"$latest")
+          elif grep -q 'HTTP 404' latest.err; then
+            latest=''
+          else
+            cat latest.err >&2
+            exit 1
+          fi
+          if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "${latest#v}" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
+            echo "$latest is newer than v$VERSION and already includes this commit; nothing to publish."
             exit 0
           fi
           gh release create "v$VERSION" release/* \

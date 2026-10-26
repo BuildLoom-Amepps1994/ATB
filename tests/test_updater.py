@@ -197,13 +197,120 @@ def test_every_merge_gets_a_newer_release_version():
             build_installer.release_version(bad)
 
 
+def test_test_builds_never_outrank_a_release():
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    import build_installer
+    major, minor, _ = updater.parse_version(updater.APP_VERSION)
+    assert build_installer.build_version(31, publish=True) == f'{major}.{minor}.31'
+    # A pull-request artifact, whatever its commit count, is older than the first release.
+    artifact = updater.parse_version(build_installer.build_version(400, publish=False))
+    assert artifact == (major, minor, 0)
+    assert artifact < updater.parse_version(build_installer.release_version(1))
+
+
 def test_merges_to_main_publish_releases_stamped_with_that_version():
     workflow = (ROOT / '.github/workflows/windows-installer.yml').read_text(encoding='utf-8')
     assert 'branches: [main]' in workflow and 'fetch-depth: 0' in workflow
     assert "--version ${{ steps.version.outputs.version }}" in workflow
     assert "if: needs.build.outputs.publish == 'true'" in workflow
-    # Releases are never replaced: a re-run of a published commit leaves it alone.
-    assert 'gh release view "v$VERSION"' in workflow
+    assert 'build_installer.build_version(commits, publish)' in workflow
+
+
+def publish_script():
+    lines = (ROOT / '.github/workflows/windows-installer.yml').read_text(encoding='utf-8').splitlines()
+    start = lines.index('      - name: Publish GitHub Release')
+    run = next(i for i in range(start, len(lines)) if lines[i].strip() == 'run: |')
+    body = []
+    for line in lines[run + 1:]:
+        if line.strip() and not line.startswith(' ' * 10):
+            break
+        body.append(line[10:])
+    return '\n'.join(body) + '\n'
+
+
+FAKE_GH = """import json, os, sys
+state_path = os.environ['FAKE_GH_STATE']
+state = json.load(open(state_path))
+args = sys.argv[1:]
+state['calls'].append(args)
+releases = state['releases']
+def save():
+    json.dump(state, open(state_path, 'w'))
+def fail(code, text):
+    save()
+    print(json.dumps({'message': text}))
+    print(f'gh: {text} (HTTP {code})', file=sys.stderr)
+    sys.exit(1)
+path = next((a for a in args[1:] if a.startswith('repos/')), '')
+if args[0] == 'api' and state.get('broken') and state['broken'] in path:
+    fail(502, 'Bad Gateway')
+if args[0] == 'api' and '-X' not in args and path.endswith('/releases?per_page=100'):
+    save()
+    print(json.dumps([{'id': i, 'tag_name': r['tag'], 'draft': r['draft']} for i, r in enumerate(releases)][::-1]))
+elif args[0] == 'api' and '-X' not in args and path.endswith('/releases/latest'):
+    published = [r for r in releases if not r['draft']]
+    if not published:
+        fail(404, 'Not Found')
+    save()
+    print(json.dumps({'tag_name': published[-1]['tag']}))
+elif args[:3] == ['api', '-X', 'DELETE']:
+    index = int(path.rsplit('/', 1)[1])
+    releases[index]['deleted'] = True
+    state['releases'] = [r for r in releases if not r.get('deleted')]
+    save()
+elif args[:2] == ['release', 'create']:
+    assert '--latest' in args
+    releases.append({'tag': args[2], 'draft': False})
+    save()
+else:
+    save()
+    sys.exit(2)
+"""
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='the publish job runs on Linux')
+@pytest.mark.parametrize('releases, version, broken, outcome', [
+    ([], '1.5.29', None, 'published'),
+    ([{'tag': 'v1.5.29', 'draft': False}], '1.5.29', None, 'skipped'),
+    ([{'tag': 'v1.5.29', 'draft': True}], '1.5.29', None, 'published'),
+    ([{'tag': 'v1.5.31', 'draft': False}], '1.5.29', None, 'skipped'),
+    ([{'tag': 'v1.5.9', 'draft': False}], '1.5.10', None, 'published'),
+    # A GitHub error must stop the job, never be read as "there is no release".
+    ([{'tag': 'v1.5.31', 'draft': False}], '1.5.29', '/releases/latest', 'failed'),
+    ([{'tag': 'v1.5.29', 'draft': False}], '1.5.29', '/releases?', 'failed'),
+])
+def test_publish_job_never_replaces_or_outranks_a_release(tmp_path, releases, version, broken, outcome):
+    import os
+    import shutil
+    import subprocess
+    bash, jq = shutil.which('bash'), shutil.which('jq')
+    if bash is None or jq is None:
+        pytest.skip('bash and jq are not available')
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    gh = bin_dir / 'gh'
+    gh.write_text(f'#!{sys.executable}\n' + FAKE_GH, encoding='utf-8')
+    gh.chmod(0o755)
+    state = tmp_path / 'state.json'
+    state.write_text(json.dumps({'releases': releases, 'calls': [], 'broken': broken}))
+    (tmp_path / 'release').mkdir()
+    (tmp_path / 'release' / f'CryptoPilot-Setup-{version}.exe').write_bytes(b'MZ')
+    # The jq found here may live outside /usr/bin, for example from Homebrew or conda.
+    path = os.pathsep.join([str(bin_dir), os.path.dirname(jq), '/usr/bin', '/bin'])
+    env = {**os.environ, 'PATH': path, 'FAKE_GH_STATE': str(state),
+           'VERSION': version, 'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_SHA': 'abc123', 'GH_TOKEN': 'x'}
+    result = subprocess.run([bash, '-c', publish_script()], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert (result.returncode != 0) == (outcome == 'failed'), result.stdout + result.stderr
+    if outcome == 'failed':
+        # Stopped by the GitHub error itself, not by a missing tool.
+        assert 'HTTP 502' in result.stderr, result.stderr
+    calls = json.loads(state.read_text())['calls']
+    created = [call for call in calls if call[:2] == ['release', 'create']]
+    assert bool(created) == (outcome == 'published'), calls
+    if created:
+        assert created[0][2] == f'v{version}' and '--target' in created[0]
+    tags = [r['tag'] for r in json.loads(state.read_text())['releases']]
+    assert len(tags) == len(set(tags))
 
 
 def test_setup_supports_waiting_for_the_app_and_reopening_it():

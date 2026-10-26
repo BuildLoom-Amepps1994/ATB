@@ -118,3 +118,14 @@ def test_installer_preserves_safeguards():
     assert "LockFile(InstallLock, 0, 0, 1, 0)" in script
     assert 'CreateUninstallRegKey=not TestInstall' in script
     assert 'uninsneveruninstall' in script
+    # A failed activation must restore a runtime that matches the previous source.
+    assert 'SetPreviousRuntimeAside' in script and 'RestorePreviousRuntime' in script
+    assert 'function GetCustomSetupExitCode' in script and 'RecoverInterruptedSetup' in script
+    # A runtime set aside by a Setup that stopped goes back before the next Setup sets one aside.
+    assert script.index('if not RecoverSavedRuntime then') < script.index('BackupRoot := ExpandConstant')
+    # A first install that did not finish must not leave a folder Setup refuses.
+    assert 'not SetupLeftoversOnly(Folder)' in script
+    # The Inno preprocessor reads any line starting with '#' as a directive, so Pascal
+    # character codes such as #13#10 must never begin a line of code.
+    code = script.split('[Code]', 1)[1]
+    assert not [line for line in code.splitlines() if line.lstrip().startswith('#')]

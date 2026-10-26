@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary} = CryptoPilotUI;
+const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter} = CryptoPilotUI;
 let state = null, online = false, chartSymbol = 'BTC/USDT', chartTF = '1h', chartData = [], btData = [];
 let lastSuccess = 0, pollTimer = null, modalFocus = null;
 let orderDraft = null, orderFocus = null;
@@ -294,6 +294,8 @@ let updateStatus = null;
 function showUpdate(status) {
   updateStatus = status;
   $('appVersion').textContent = 'CryptoPilot ' + (status?.current_version || '');
+  const footer = updateFooter(status);
+  $('updateState').textContent = footer ? ' · ' + footer : '';
   const summary = updateSummary(status);
   $('updateBanner').hidden = !summary;
   if (!summary) return;
@@ -324,5 +326,7 @@ $('installUpdate').onclick = async () => {
 window.addEventListener('resize', draw);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { clearTimeout(pollTimer); poll(); } });
 connectionStatus(); draw(); poll(); checkUpdates(false);
+// The server caches the release check for an hour, so this asks GitHub at most hourly.
+setInterval(() => { if (!busy.has('update')) checkUpdates(false); }, 3600000);
 
 

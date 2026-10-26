@@ -107,9 +107,19 @@
     if (status.phase === 'installing') return {text: `Installing CryptoPilot ${latest}. This window will stop responding; CryptoPilot reopens in a new tab when Setup finishes.`, install: false};
     if (!status.available) return null;
     if (status.can_install) return {text: `CryptoPilot ${latest} is available (you have ${current}). Stop the bot, then install: the app closes, updates and reopens. Portfolio, settings and saved keys are kept.`, install: true};
-    return {text: `CryptoPilot ${latest} is available (you have ${current}). Download the installer from the releases page.`, install: false};
+    return {text: `CryptoPilot ${latest} is available (you have ${current}). This copy runs from source, so it cannot install updates itself. Download and run the installer from the releases page once; after that, updates install from here.`, install: false};
   }
-  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary};
+  // The footer's standing answer to "did the last update check work?", so a result never only flashes by in a toast.
+  function updateFooter(status, formatTime = seconds => new Date(seconds * 1000).toLocaleTimeString()) {
+    if (!status) return '';
+    if (status.disabled) return 'Update checks are turned off';
+    if (status.phase === 'downloading' || status.phase === 'installing') return 'Updating…';
+    if (status.error) return 'Update check: ' + String(status.error);
+    if (status.available) return `Version ${String(status.latest_version || '')} available`;
+    if (status.checked_at) return 'Up to date · checked ' + formatTime(status.checked_at);
+    return '';
+  }
+  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CryptoPilotUI = api;
 })(typeof window === 'undefined' ? globalThis : window);

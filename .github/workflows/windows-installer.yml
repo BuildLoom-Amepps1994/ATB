@@ -1,12 +1,13 @@
 # Builds CryptoPilot-Setup-X.Y.Z.exe on Windows and tests it in an isolated folder.
-# Pull requests and manual runs upload the installer as a workflow artifact.
-# Pushing a tag vX.Y.Z (matching updater.APP_VERSION) also publishes a GitHub
-# Release, which is what the in-app updater installs from.
+# Every run uploads the installer as a workflow artifact. Every push to main (a
+# merged pull request) also publishes it as GitHub Release vX.Y.Z, which is what
+# the in-app updater installs from. X.Y comes from updater.APP_VERSION and Z is
+# the number of commits on main, so each merge is newer than the last.
 name: Windows installer
 
 on:
   push:
-    tags: ['v*.*.*']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -27,27 +28,33 @@ jobs:
       PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
     outputs:
       version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The release version counts the commits on main.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
           python-version: '3.14'
 
-      - name: Read app version
+      - name: Choose release version
         id: version
         shell: python
         run: |
-          import os, sys
+          import os, subprocess, sys
           sys.path.insert(0, 'scripts')
           import build_installer
-          version = build_installer.app_version()
-          ref = os.environ['GITHUB_REF']
-          if ref.startswith('refs/tags/') and ref != f'refs/tags/v{version}':
-              sys.exit(f'Tag {ref} does not match updater.APP_VERSION {version}. Bump APP_VERSION first.')
+          commits = int(subprocess.run(['git', 'rev-list', '--count', 'HEAD'], check=True,
+                                       capture_output=True, text=True).stdout)
+          version = build_installer.release_version(commits)
+          # Only main publishes; pull requests and other branches build an artifact only.
+          publish = (os.environ['GITHUB_EVENT_NAME'] in ('push', 'workflow_dispatch')
+                     and os.environ['GITHUB_REF'] == 'refs/heads/main')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f'version={version}\n')
-          print('CryptoPilot', version)
+              out.write(f'version={version}\npublish={str(publish).lower()}\n')
+          print('CryptoPilot', version, '(publish)' if publish else '(artifact only)')
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -72,7 +79,7 @@ jobs:
 
       - name: Compile installer
         run: |
-          .build-venv\Scripts\python.exe scripts\build_installer.py --runtime-dir dist\editable-runtime\CryptoPilotRuntime --stage dist\editable-stage --output dist\installer
+          .build-venv\Scripts\python.exe scripts\build_installer.py --runtime-dir dist\editable-runtime\CryptoPilotRuntime --stage dist\editable-stage --output dist\installer --version ${{ steps.version.outputs.version }}
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Smoke test frozen runtime (simulated exchange)
@@ -117,7 +124,7 @@ jobs:
 
   publish:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.build.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -131,6 +138,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
+          # A re-run of the same commit has the same version; never replace a published release.
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release v$VERSION already exists."
+            exit 0
+          fi
           gh release create "v$VERSION" release/* \
-            --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "CryptoPilot $VERSION" --generate-notes
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "CryptoPilot $VERSION" --generate-notes --latest

@@ -37,6 +37,7 @@ class PaperExchange:
         # ``ambiguous`` raises it *after* the order was accepted and filled, like
         # a timeout on the response leg; ``partial`` scales the next fill.
         self.fail_next: Exception | None = None
+        self.fee_currency: str | None = None     # bill the fee in another asset (tests the MX-style fee path)
         self.ambiguous_next = False
         self.partial_next: float | None = None
         self.latency_s = 0.0
@@ -90,17 +91,18 @@ class PaperExchange:
     def _accept(self, symbol: str, side: str, filled: float, gross: float, average: float, params: dict | None) -> dict:
         settings = self._settings()
         fee = gross * float(settings['fee_pct']) / 100
+        fee_currency = self.fee_currency or symbol.split('/')[1]
         order_id = 'paper-' + uuid.uuid4().hex[:12]
         order = {'id': order_id, 'clientOrderId': (params or {}).get('clientOrderId'), 'symbol': symbol,
                  'type': 'market', 'side': side, 'status': 'closed', 'filled': filled, 'remaining': 0.0,
                  'amount': filled, 'cost': gross, 'average': average, 'price': average,
-                 'fee': {'currency': symbol.split('/')[1], 'cost': fee}, 'fees': [],
+                 'fee': {'currency': fee_currency, 'cost': fee}, 'fees': [],
                  'timestamp': int(time.time() * 1000), 'info': {'simulated': True}}
         if self.partial_next is not None:
             ratio = max(0.0, min(1.0, float(self.partial_next)))
             self.partial_next = None
             order.update({'status': 'canceled', 'filled': filled * ratio, 'remaining': filled * (1 - ratio),
-                          'cost': gross * ratio, 'fee': {'currency': symbol.split('/')[1], 'cost': fee * ratio}})
+                          'cost': gross * ratio, 'fee': {'currency': fee_currency, 'cost': fee * ratio}})
         with self.lock:
             self.orders[order_id] = order
         if self.latency_s:

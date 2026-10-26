@@ -211,8 +211,11 @@ def test_daily_realized_loss_limit_blocks_new_entries(engine):
         db.execute('INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,realized,reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                    (trader.now(), 'mexc', 'paper', 'SOL/USDT', 'SELL', 100, 1, 100, .1, -400, 'loss'))
     assert not engine._buy('BTC/USDT', 200, 100, .04)
-    assert 'realized-loss limit' in engine.risk_block
+    assert 'Realised-loss stop latched' in engine.risk_block
+    # The stop is a latch: a looser setting does not lift it, only the release phrase does.
     engine.cfg['daily_realized_loss_limit_pct'] = 5
+    assert not engine._buy('BTC/USDT', 200, 100, .04)
+    engine.risk.clear_realized_stop('paper', 'RESUME TRADING')
     assert engine._buy('BTC/USDT', 200, 100, .04)
 
 

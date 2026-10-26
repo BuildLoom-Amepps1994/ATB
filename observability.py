@@ -84,6 +84,17 @@ class bind:
             _correlation.reset(self.token)
 
 
+def _redacted(value):
+    """Redact every string inside a JSON-shaped value before it is serialized."""
+    if isinstance(value, str):
+        return storage.redact(value)
+    if isinstance(value, dict):
+        return {key: _redacted(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redacted(item) for item in value]
+    return value
+
+
 def event(kind: str, level: str = 'info', **fields) -> dict:
     """Write one structured, redacted event line and return the record."""
     record = {'ts': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
@@ -93,13 +104,17 @@ def event(kind: str, level: str = 'info', **fields) -> dict:
             continue
         if isinstance(value, float):
             record[key] = round(value, 6)
-        elif isinstance(value, (int, bool, str)):
+        elif isinstance(value, (int, bool)):
             record[key] = value
+        elif isinstance(value, str):
+            record[key] = storage.redact(value)
         else:
+            # Strings are redacted before serialization, so a masked value can
+            # never run into a JSON delimiter and break the line.
             try:
-                record[key] = json.loads(json.dumps(value, default=str))
+                record[key] = _redacted(json.loads(json.dumps(value, default=str)))
             except (TypeError, ValueError):
-                record[key] = str(value)
+                record[key] = storage.redact(str(value))
     try:
         text = json.dumps(record, separators=(',', ':'), default=str)
     except (TypeError, ValueError):

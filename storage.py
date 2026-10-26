@@ -435,7 +435,9 @@ def redact(message: object) -> str:
     with LOCK:
         for value in sorted(_SECRETS, key=len, reverse=True):
             text = text.replace(value, '[REDACTED]')
-    text = re.sub(r'(?i)((?:api[_-]?(?:key|secret)|signature|authorization|password|token)\s*[:=]\s*)[^\s,;}&]+', r'\1[REDACTED]', text)
+    # Quotes and backslashes end the value, so a redaction applied to a serialized JSON
+    # line never eats a closing quote or the escape in front of one.
+    text = re.sub(r'(?i)((?:api[_-]?(?:key|secret)|signature|authorization|password|token)\s*[:=]\s*["\']?)[^\s,;}&"\'\\]+', r'\1[REDACTED]', text)
     return text
 
 
@@ -558,5 +560,5 @@ def reset_paper(exchange: str):
         db.execute("DELETE FROM positions WHERE mode='paper' AND exchange=?", (exchange,))
         db.execute("DELETE FROM trades WHERE mode='paper' AND exchange=?", (exchange,))
         db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (scope_key('paper_cash', exchange), str(paper_start)))
-        db.execute("DELETE FROM meta WHERE (key LIKE 'last_entry.paper.%' OR key LIKE 'last_exit.paper.%' OR key LIKE 'manual_request.paper.%' OR key LIKE 'baseline.paper.%' OR key LIKE 'breached.paper.%' OR key LIKE 'peak_equity.paper.%' OR key LIKE 'drawdown_stop.paper.%') AND key LIKE ?", ('%.' + exchange,))
+        db.execute("DELETE FROM meta WHERE (key LIKE 'last_entry.paper.%' OR key LIKE 'last_exit.paper.%' OR key LIKE 'manual_request.paper.%' OR key LIKE 'baseline.paper.%' OR key LIKE 'breached.paper.%' OR key LIKE 'peak_equity.paper.%' OR key LIKE 'drawdown_stop.paper.%' OR key LIKE 'realized_stop.paper.%') AND key LIKE ?", ('%.' + exchange,))
         db.execute("DELETE FROM order_journal WHERE mode='paper' AND exchange=?", (exchange,))

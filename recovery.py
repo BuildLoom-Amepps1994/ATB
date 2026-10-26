@@ -18,7 +18,7 @@ from pathlib import Path
 from launcher import AlreadyRunning, InstanceLock, data_directory
 
 EXCHANGES = ('mexc', 'kraken')
-STATUSES = {'pending', 'submitted', 'uncertain', 'filled', 'accounted', 'rejected', 'reconciled'}
+STATUSES = {'pending', 'submitted', 'acked', 'uncertain', 'filled', 'accounted', 'rejected', 'reconciled'}
 RESOLVED = ('accounted', 'rejected', 'reconciled')
 
 
@@ -211,16 +211,24 @@ def clear_halt(folder: Path | None, exchange: str, confirmation: str) -> dict:
             for table in ('positions', 'trades'):
                 if table in tables and {'mode', 'exchange'} <= {row[1] for row in connection.execute(f'PRAGMA table_info({table})')}:
                     legacy += connection.execute(f"SELECT COUNT(*) FROM {table} WHERE mode='live' AND exchange='legacy-unassigned'").fetchone()[0]
+            others = connection.execute(
+                f'SELECT COUNT(*) FROM order_journal WHERE exchange<>? AND status NOT IN ({placeholders})' + live_only,
+                (exchange, *RESOLVED)).fetchone()[0]
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
+    if legacy:
+        notice = 'Legacy live records still block live trading; they require a reviewed ledger repair.'
+    elif others:
+        notice = (f'This exchange is no longer halted by the journal, but {others} unresolved live order intent(s) on '
+                  'another exchange still block live trading; reconcile that exchange and run --clear-halt for it.')
+    else:
+        notice = 'Live trading for this exchange is no longer halted by the journal.'
     return {'exchange': exchange, 'reconciled_orders': reconciled, 'halt_flag_removed': bool(removed),
-            'legacy_live_record_count': legacy,
-            'notice': 'Live trading for this exchange is no longer halted by the journal.' if not legacy
-            else 'Legacy live records still block live trading; they require a reviewed ledger repair.'}
+            'legacy_live_record_count': legacy, 'other_exchange_unresolved': others, 'notice': notice}
 
 
 def main(argv=None) -> int:

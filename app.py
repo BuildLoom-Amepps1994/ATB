@@ -37,6 +37,7 @@ async def lifespan(application):
     engine.stop()
     # Give an order that is being confirmed time to reach the ledger before
     # the process ends; the journal covers anything that still does not.
+    print('Stopping CryptoPilot: waiting up to 30 s for any in-flight exchange operation. Do not close this window.')
     if not await asyncio.to_thread(engine.wait_idle, 30.0):
         storage.audit('error', 'Shutdown proceeded while an exchange operation was still in flight; '
                                'inspect the order journal and exchange account before the next start.')
@@ -257,7 +258,7 @@ def reset_paper():
 
 
 class RiskAction(StrictModel):
-    action: str = Field(pattern='^(engage|release|clear_drawdown_stop)$')
+    action: str = Field(pattern='^(engage|release|clear_drawdown_stop|clear_realized_stop)$')
     confirmation: str = Field(default='', max_length=40)
     allow_exits: bool = True
     reason: str = Field(default='', max_length=200)
@@ -271,7 +272,10 @@ def risk_action(req: RiskAction):
             return engine.risk.engage_kill_switch(req.reason or 'Operator kill switch', allow_exits=req.allow_exits)
         if req.action == 'release':
             return engine.risk.release_kill_switch(req.confirmation)
-        engine.risk.clear_drawdown_stop(engine.mode, req.confirmation)
+        if req.action == 'clear_realized_stop':
+            engine.risk.clear_realized_stop(engine.mode, req.confirmation)
+        else:
+            engine.risk.clear_drawdown_stop(engine.mode, req.confirmation)
         return engine.risk.status()
     return ensure_ok(work)
 

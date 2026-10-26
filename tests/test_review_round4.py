@@ -569,6 +569,98 @@ def test_a_failed_trade_audit_line_does_not_skip_the_loss_and_slippage_checks(en
     assert 'ledger.accounted' in kinds and 'ledger.post_commit_error' in kinds
 
 
+
+def failing_audit(*levels):
+    real_audit = storage.audit
+
+    def audit(level, message, *args, **kwargs):
+        if level in levels:
+            raise storage.sqlite3.OperationalError('database is locked')
+        return real_audit(level, message, *args, **kwargs)
+    return audit
+
+
+@pytest.mark.parametrize('mode', ['paper', 'live'])
+def test_a_failed_trade_audit_line_after_a_buy_keeps_its_accounted_line_and_judges_slippage(engine, monkeypatch, mode):
+    # Mutants: the buy's reports not contained on their own (the slippage
+    # check skipped), or the trade audit written before ledger.accounted.
+    events = capture_events(monkeypatch)
+    if mode == 'live':
+        arm_fake_live(engine)
+    checked = []
+    monkeypatch.setattr(storage, 'audit', failing_audit('trade', 'warning'))
+    real_fills = engine.risk.observe_fills
+    monkeypatch.setattr(engine.risk, 'observe_fills', lambda m: checked.append(m) or real_fills(m))
+    assert engine._buy('ETH/USDT', 800, 100, .04)
+    assert checked == [mode]
+    assert not engine.live_halted and journal(mode)[-1]['status'] == 'accounted'
+    kinds = [kind for kind, fields in events if fields.get('intent_id') == journal(mode)[-1]['intent_id']]
+    assert 'ledger.accounted' in kinds and 'ledger.post_commit_error' in kinds
+
+
+@pytest.mark.parametrize('mode', ['paper', 'live'])
+def test_a_failed_loss_check_whose_warning_also_fails_still_judges_slippage(engine, monkeypatch, mode):
+    # Mutant: the realised-loss fallback written with storage.audit, which
+    # can raise past the slippage check that follows it.
+    if mode == 'live':
+        arm_fake_live(engine)
+    assert engine._buy('BTC/USDT', 800, 100, .04)
+    checked = []
+    monkeypatch.setattr(storage, 'audit', failing_audit('warning'))
+    monkeypatch.setattr(engine.risk, 'observe_realized',
+                        lambda *a: (_ for _ in ()).throw(storage.sqlite3.OperationalError('database is locked')))
+    real_fills = engine.risk.observe_fills
+    monkeypatch.setattr(engine.risk, 'observe_fills', lambda m: checked.append(m) or real_fills(m))
+    assert engine._sell(engine._active_positions(mode)[0], 100, 'test exit')
+    assert checked == [mode]
+    assert not engine.live_halted and journal(mode)[-1]['status'] == 'accounted'
+
+
+@pytest.mark.parametrize('side', ['BUY', 'SELL'])
+def test_a_failed_ledger_commit_is_a_ledger_failure_not_a_booked_fill(engine, monkeypatch, side):
+    # Mutant: booked set inside the transaction, before its commit, so a
+    # commit that fails would count as a booked fill with a failed report.
+    import contextlib
+    client = arm_fake_live(engine)
+    if side == 'SELL':
+        assert engine._buy('BTC/USDT', 800, 100, .04)
+    events = capture_events(monkeypatch)
+    real_connection, failed = storage.connection, []
+
+    class Recording:
+        def __init__(self, con):
+            self.con, self.trade = con, False
+
+        def execute(self, sql, *args):
+            self.trade = self.trade or 'INSERT INTO trades' in sql
+            return self.con.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self.con, name)
+
+    @contextlib.contextmanager
+    def connection():
+        with real_connection() as con:
+            db = Recording(con)
+            yield db
+            if db.trade and not failed:       # the body ran; the commit is what fails
+                failed.append(True)
+                raise storage.sqlite3.OperationalError('disk I/O error')
+    monkeypatch.setattr(storage, 'connection', connection)
+    held = len(engine._active_positions('live'))
+    if side == 'BUY':
+        assert not engine._buy('ETH/USDT', 800, 100, .04)
+    else:
+        assert not engine._sell(engine._active_positions('live')[0], 100, 'test exit')
+    assert failed and engine.live_halted
+    assert len(engine._active_positions('live')) == held      # rolled back: nothing booked
+    row = journal('live')[-1]
+    assert row['side'] == side and row['status'] != 'accounted'
+    kinds = [kind for kind, fields in events if fields.get('intent_id') == row['intent_id']]
+    assert 'ledger.failure' in kinds and 'ledger.post_commit_error' not in kinds
+    assert 'ledger.accounted' not in kinds
+    assert client is engine.private
+
 def test_a_live_exit_that_crosses_the_realised_loss_limit_latches_at_once(engine):
     client = arm_fake_live(engine)
     client.fill = {**client.fill, 'filled': 8., 'cost': 800., 'average': 100.}

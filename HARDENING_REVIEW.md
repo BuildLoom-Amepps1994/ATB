@@ -72,9 +72,9 @@ The order of operations for one quote is now:
 Sources: a parallel eight-lens audit of `7207e82` (execution, risk bypass,
 market data, concurrency, strategy leakage, latency, persistence, security)
 whose findings were deduplicated and checked against the code, observations
-made while implementing, and three further adversarial reviews of the branch
-itself (findings 27–38, 39–44 and 45–60), each finding reproduced before it
-was fixed. Severity is the reviewer's judgement of
+made while implementing, and further adversarial reviews of the branch
+itself and of each round's fixes (findings 27–89), each finding reproduced
+before it was fixed. Severity is the reviewer's judgement of
 impact on live capital or on the integrity of the record.
 
 | # | Sev. | Finding | Status on this branch |
@@ -167,6 +167,7 @@ impact on live capital or on the integrity of the record.
 | 86 | Low | An entry whose order path raised before anything was journaled left no `decision.withheld` line in paper, and none for itself in live. | **Fixed**: it is withheld as `entry_error` unless its decision id reached the journal. |
 | 87 | Low | Finding 83 overstated its coverage: three withheld reasons (`held`, `protective_exit_pending`, `settings_review`) and the in-loop Stop, three intent-id sites (both ledger-commit failures and the paper sell's fill accounting), the live branch of the exit latch and the slippage check after a sell could each be removed without a test failing. The runbook's re-latch rule also left out that the loss must be past the current limit. | **Fixed**: a test for each, checked to fail on its mutant; the re-latch wording (runbook and the clear's audit line) is exact. |
 | 88 | Med. | The first fix for finding 85 treated any failure after the commit as a report failure, so a failed trade audit line also skipped the realised-loss and slippage checks that followed it: a manual losing close whose audit write failed did not latch, and a later profit could hide the crossing. | **Fixed**: the reports are contained on their own and the checks always run after them; their own warning lines cannot raise. |
+| 89 | Low | The tests for finding 88 covered only the sell. The buy's own report containment and its `ledger.accounted`-first order, the realised-loss fallback that cannot raise, and the commit boundary itself (`booked` set inside the transaction, so a commit that fails and rolls back would count as a booked fill and not halt live) could each be reverted with the whole suite passing. | **Fixed**: a test for each, checked to fail on its mutant (five mutants). |
 
 ---
 
@@ -201,7 +202,7 @@ impact on live capital or on the integrity of the record.
 | `recovery.py`, `trader.py`, `risk.py`, `RUNBOOK.md` | Findings 61–63: `--prepare-downgrade` for a rollback across the schema change, stream lifecycle on a fast Stop or with streaming off, kill switch re-read at submit. |
 | `tests/test_review_round3.py` | 7 more tests for findings 61–63, checked to fail with each fix removed, except the `allow_exits=True` case of the exit kill-switch test, a guard that passes without the fix. |
 | `risk.py`, `trader.py`, `storage.py`, `RUNBOOK.md`, `tests/test_review_round3.py` | Findings 66–69 and 72: breakers that close and report, the submit event and manual order ids, the kill switch across an exchange change; 7 tests, each checked to fail without its fix. |
-| `trader.py`, `risk.py`, `recovery.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new), `tests/test_dashboard.js` | Findings 74–88: realised-loss latch on every booked exit, withheld records whatever ends the entry pass or the gate refuses, the stream started by Start stopped by reference, the slippage hold capped after a clock step and judged at each fill, the stricter kill switch carried, a rollback not blocked by paper intents, the protective exit trigger, a booked fill that stays booked, a pass that ends on a connection failure, and the test reviews' gaps; 54 + 1 tests. Each fails on the mutation it targets (the reviewer's 16 mutants and 30 more), except the small-manual-loss test, a guard against latching too eagerly. |
+| `trader.py`, `risk.py`, `recovery.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new), `tests/test_dashboard.js` | Findings 74–89: realised-loss latch on every booked exit, withheld records whatever ends the entry pass or the gate refuses, the stream started by Start stopped by reference, the slippage hold capped after a clock step and judged at each fill, the stricter kill switch carried, a rollback not blocked by paper intents, the protective exit trigger, a booked fill that stays booked, a pass that ends on a connection failure, and the test reviews' gaps; 60 + 1 tests. Each fails on the mutation it targets (the reviewer's 16 mutants and 35 more), except the small-manual-loss test, a guard against latching too eagerly. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -398,7 +399,7 @@ measurements should be repeated on the Windows machine with Python 3.14
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **652 passed** |
+| `python -m pytest tests -q` | 434 passed | **658 passed** |
 | `node --test tests/test_dashboard.js` | 11 passed | 15 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
 | `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
@@ -469,7 +470,7 @@ New test files and what they prove:
   rejection spike reported and ignoring orders never sent; one intent id
   finding the submit, whose token finds the authorization; manual order ids;
   the kill switch carried to the other exchange.
-* `tests/test_review_round4.py` (54): a manual close that crosses the
+* `tests/test_review_round4.py` (60): a manual close that crosses the
   realised-loss limit latches before a later profitable close, and a small
   one does not, also on the live path; a connection failure on a re-quote
   withholds the rest and ends the pass, while bad data for one pair skips
@@ -485,7 +486,9 @@ New test files and what they prove:
   hold is listed as soon as the third bad fill is booked; and one test for
   each coverage gap in findings 83 and 87; a report failing after the ledger
   commit leaves the fill booked with no halt, and still latches the loss and
-  judges the slippage; an entry that raised before the
+  judges the slippage, after a buy as after a sell, and so does a failed loss
+  check whose warning line also fails; a ledger commit that fails is a ledger
+  failure that halts live, not a booked fill; an entry that raised before the
   journal is withheld, one that reached it is not. `tests/test_dashboard.js` also checks that
   every element id the dashboard script looks up exists in the page.
 
@@ -659,6 +662,12 @@ want.
    introduces. Hashing the top-level modules actually present (with the
    fixed list as the required minimum) would let later additions flow through
    `--update-source` as well as Setup.
+9. Latch records (risk.py): the kill switch, the realised-loss and drawdown
+   stops and the slippage breaker store their state first, then write the
+   audit line, then the event. A failed audit write right after a latch is
+   stored leaves the latch in force but skips its event, and the caller may
+   then report the step as failed although the latch holds. Writing the event first,
+   as `ledger.accounted` now is (finding 85), would keep it.
 
 **Upgrade path for an existing installation.** Upgrade an installed copy with
 Setup (the in-app updater downloads and runs it), not with

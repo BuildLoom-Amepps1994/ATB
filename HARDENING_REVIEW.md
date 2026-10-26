@@ -97,7 +97,7 @@ impact on live capital or on the integrity of the record.
 | 16 | Med. | Decision id omitted indicator features, so two different candles could share an id. | **Fixed**: features are part of the record and the id. |
 | 17 | Med. | A withheld setup (stale quote, same-candle re-entry) showed `BUY setup` in the dashboard. | **Fixed**. |
 | 18 | Med. | In a cold scan, decisions use the start-of-scan snapshot; by the last symbol the quote can be about one second old on MEXC and up to ~17 s on Kraken. The entry itself re-reads a fresh ticker, so orders are not affected, but the record's quote age says so. | **Mitigated**: every record carries `quote_age_s`; with streaming on the freshest quote is overlaid at decision time. |
-| 19 | Med. | Paper orders now cost ~12 ms instead of ~3 ms (four journal writes with `synchronous=FULL`, authorization, events). | **Accepted**; orders are rare. Batching the journal writes is a possible follow-up. |
+| 19 | Med. | Paper orders now cost about 15 ms to buy and 11 ms to sell instead of about 3 ms (four journal writes with `synchronous=FULL`, authorization, events; section C). | **Accepted**; orders are rare. Batching the journal writes is a possible follow-up. |
 | 20 | Low | Switching to paper with open live positions hides them without a warning. | **Open**. |
 | 21 | Low | The manual-order idempotent replay has no caller in the dashboard. | **Open**. |
 | 22 | Low | Candle prefetch threads can outlive Stop. | **Open**. |
@@ -148,8 +148,8 @@ impact on live capital or on the integrity of the record.
 | 67 | Med. | `daily_realized_loss_limit_pct` nets profits against losses, but the runbook called it the sum of today's losses, which overstated the control. | **Fixed** (docs): the runbook says net realised P/L. Counting losses only is a one-line change if you prefer it (H). |
 | 68 | Med. | The one-grep correlation claim failed: the authorization line is written before the intent exists, there was no submit line, and manual orders had no id. | **Fixed**: `execution.submitted` carries the intent and decision ids and the authorization token; manual orders carry `manual_<request id>`; runbook §7 says how the token links the authorization. |
 | 69 | Low | The runbook listed the daily equity guard among the latches cleared with `RESUME TRADING` (it clears at the next UTC day), and did not say that a hand-written `POST /api/risk` is refused without the dashboard's per-session token. | **Fixed** (docs). The realised-stop re-latch and the missing clear button were findings 46. |
-| 70 | Low | The hot-path benchmark's five-position monitor run held one position (later buys were refused for missing marks), and the review explained a tick speed-up by a cause that does not exist. | See section C. |
-| 71 | Low | The latency table compared the old code's cold first call with warm calls on the branch at p99, took p95 and p99 of the warm scan from ten samples, and measured a branch commit seven commits old. | See section C. |
+| 70 | Low | The hot-path benchmark's five-position monitor run held one position (later buys were refused for missing marks), and the review explained a tick speed-up by a cause that does not exist. | **Fixed** (section C): both scripts reset the paper ledger, seed fresh marks before every buy and assert the position count; the speed-up claim is withdrawn, because the branch tick is about 1 ms slower. |
+| 71 | Low | The latency table compared the old code's cold first call with warm calls on the branch at p99, took p95 and p99 of the warm scan from ten samples, and measured a branch commit seven commits old. | **Fixed** (section C): five discarded warm-up iterations and 100 samples for every row, p99 only from at least 100 samples, reservoirs cleared per row, and the branch measured at `18a2fdc` and rechecked at `31d13bd`. |
 | 72 | Low | The kill switch is stored per exchange, so changing exchanges silently left an engaged switch behind. | **Fixed**: an engaged switch is carried over to the new exchange with its exit policy; the runbook says it is per exchange. |
 | 73 | Low | The upgrade path said the in-app updater would offer the hardening build to a 1.4.0 installation, but the build was also numbered 1.4.0. | **Resolved by pull request #7**: releases are numbered 1.5.<commits on main>, so every merged build is newer than 1.4.0. |
 | 74 | Med. | A loss booked by a manual exit never latched the realised-loss stop. Manual orders need a stopped bot, and the latch ran only at a valuation (monitor, scan, Start, entry authorization), so a later profitable close or the UTC rollover could hide the crossing and the bot resumed entries. | **Fixed**: every booked exit checks the day's realised P/L against the limit straight after the ledger commit, valued from the cash the sale left (no extra exchange read). |
@@ -176,7 +176,7 @@ impact on live capital or on the integrity of the record.
 | `app.py` | `POST /api/risk`, `GET /api/metrics`, `GET /api/decisions`; shutdown waits for in-flight work. |
 | `recovery.py` | Reports and `--clear-halt` consider live journal rows only. |
 | `static/index.html`, `static/dashboard.js` | Kill switch button, five hard-limit inputs, streaming toggle, feed status line, risk warnings. |
-| `benchmarks/bench_latency.py`, `benchmarks/replay.py`, `benchmarks/results/` | Latency percentiles (runs on both trees), determinism check, raw results. |
+| `benchmarks/bench_latency.py`, `benchmarks/bench_hot_path.py`, `benchmarks/replay.py`, `benchmarks/results/` | Latency percentiles (the same files run on both trees, with warm-up, equal sample counts and real positions; findings 70 and 71), determinism check, raw results. |
 | `tests/test_risk_gate.py`, `test_order_lifecycle.py`, `test_decisions.py`, `test_quote_feed.py`, `test_hardening_fixes.py`, `test_app_manifest.py`, `test_review_round2.py` (new) | 114 new tests, plus one new parametrized case in `test_engine_integrity.py`; see D. |
 | `tests/test_recovery.py`, `test_execution_speed.py`, `test_quote_protection.py`, `test_review_fixes.py` | Fixture updates for schema version 3, the 12 USDT minimum and client order ids. |
 | `scripts/build_installer.py`, `windows_runtime.py`, `maintenance/update_installation.py` | The six new modules join the installer's staged file list, the frozen runtime's required-module set and the offline source updater's module list. The first Windows build of the branch failed its frozen-runtime smoke test with `No module named 'decision'` because these lists are explicit. |
@@ -212,54 +212,175 @@ argument.
 
 ## C. Measurements
 
-**Setup.** Linux container, 4 CPUs, Python 3.13.17, pandas 3.x, CCXT 4.5.90.
-`benchmarks/bench_latency.py --repeat 40` was run unchanged on a checkout of
-`main` (`7207e82`) and on this branch (`17ca0e9`, before the last two commits,
-which do not touch the measured paths except for the book-ticker read, which
-the fake exchange does not offer). The fake exchange sleeps a fixed round-trip
-time per request; "stream" uses a stub feed that always has a fresh quote.
-Values are milliseconds, p50 / p95 / p99.
+**Setup.** Linux container, 4 CPUs, Python 3.13.17, pandas 3.0.5, CCXT 4.5.90.
+The corrected `benchmarks/bench_latency.py` and `benchmarks/bench_hot_path.py`
+(see "What changed" below) were copied unchanged into a clean export of `main`
+(`7207e82`) and of this branch (`18a2fdc`), and each script was run three
+times on each tree, one run at a time. The fake exchange sleeps a fixed
+round-trip time per request; "stream" uses a stub feed that always has a fresh
+quote. Every row first runs 5 warm-up iterations that are discarded and then
+records 100 samples. Values are milliseconds, p50 / p95 / p99 (nearest rank);
+a row with fewer than 100 samples would show its maximum in the last column
+instead, and no row below has fewer. The table is the latency run whose p50s
+sit closest to the three-run median on each tree (run 2 on both); the raw
+files are `benchmarks/results/latency_main_7207e82.json` and
+`latency_branch_18a2fdc.json`.
 
-| Measurement | `main 7207e82` | this branch |
+| Measurement | `main 7207e82` | this branch `18a2fdc` |
 |---|---|---|
-| Indicators + entry rule, one symbol (CPU) | 1.71 / 1.78 / 1.79 | 1.50 / 1.64 / 1.68 |
-| One decision record (`evaluate_entry`) (CPU) | n/a | 0.04 / 0.05 / 0.07 |
-| Warm scan, 8 symbols, 150 ms REST | 169.3 / 172.2 / 172.2 | 174.7 / 185.0 / 185.0 |
-| Protective tick, 1 position, REST 0 ms | 1.56 / 1.77 / 3.59 | 1.82 / 2.02 / 2.17 |
-| Protective tick, 5 positions, REST 0 ms | 3.07 / 3.31 / 4.80 | 3.48 / 3.74 / 4.01 |
-| Protective tick, 1 position, REST 150 ms | 152.2 / 152.5 / 155.0 | 152.7 / 152.9 / 152.9 |
-| Protective tick, 5 positions, REST 150 ms | 154.0 / 155.0 / 158.5 | 154.5 / 154.8 / 156.8 |
-| Protective tick, 1 position, **stream** (REST would cost 150 ms) | n/a | 1.65 / 1.85 / 2.06 |
-| Protective tick, 5 positions, **stream** | n/a | 3.84 / 5.55 / 10.73 |
-| Paper buy, decision to ledger | 3.02 / 3.37 / 3.51 | 12.29 / 18.07 / 24.85 |
-| Paper sell, decision to ledger | 2.77 / 2.91 / 3.86 | 10.02 / 13.46 / 15.21 |
-| Websocket ingest, one update | n/a | 0.01 / 0.01 / 0.04 |
+| Indicators + entry rule, one symbol (CPU) | 1.78 / 1.92 / 1.98 | 1.58 / 2.66 / 2.78 |
+| One decision record (`evaluate_entry`) (CPU) | n/a | 0.05 / 0.07 / 0.09 |
+| Warm scan, 8 symbols, 150 ms REST | 173.1 / 173.9 / 182.2 | 179.9 / 194.2 / 195.1 |
+| Protective tick, 1 position, REST 0 ms | 1.82 / 2.02 / 2.43 | 2.76 / 3.27 / 3.37 |
+| Protective tick, 5 positions, REST 0 ms | 3.87 / 4.02 / 4.06 | 4.54 / 4.73 / 4.89 |
+| Protective tick, 1 position, REST 150 ms | 152.8 / 154.4 / 155.1 | 153.5 / 156.5 / 157.8 |
+| Protective tick, 5 positions, REST 150 ms | 154.7 / 155.7 / 157.0 | 155.2 / 155.6 / 156.0 |
+| Protective tick, 1 position, **stream** (REST would cost 150 ms) | n/a | 2.64 / 3.17 / 3.33 |
+| Protective tick, 5 positions, **stream** | n/a | 4.53 / 4.93 / 5.06 |
+| Paper buy, decision to ledger | 3.27 / 4.29 / 5.29 | 14.77 / 16.02 / 16.39 |
+| Paper sell, decision to ledger | 3.06 / 4.29 / 4.98 | 10.80 / 11.39 / 11.53 |
+| Websocket ingest, one update | n/a | 0.003 / 0.004 / 0.006 |
 
-Engine reservoirs during the same run (branch only): `execution.submit_total_ms`
-p50 5.6 / p95 7.4 / p99 8.6 for paper orders; `decision.quote_to_decision_ms`
-p50 17 ms with a p95 of 665 ms, the tail being the cold scans where candle
-downloads run between the ticker snapshot and the decision (finding 18).
+Between the three runs on one tree, the p50 of the millisecond-scale rows
+moved by up to 17% and the 150 ms rows by under 1%. Tails move more: the
+branch's 2.66 / 2.78 ms tail for the indicator row was 1.76 / 1.82 and
+1.99 / 2.40 in the other two runs, so it is noise. The differences discussed
+below are larger than the spread. Three-run p50 ranges, main against branch:
+one-position tick 1.66–1.86 against 2.63–3.08, five-position tick 3.51–3.87
+against 4.54–4.99, warm scan 170.3–173.1 against 179.9–183.1, paper buy
+3.18–3.75 against 14.53–17.13, paper sell 2.95–3.48 against 10.57–12.38,
+indicators 1.59–1.89 against 1.54–1.61.
 
-The original hot-path benchmark (`bench_hot_path.py`) is unchanged within
-noise: cold 8-symbol scan 1.07 s → 1.07 s, 20-symbol rapid scan 2.29 s →
-2.29 s, Kraken-paced cold scan 17.0 s → 17.0 s, same request counts; the
-protective tick median improved from 2.7 ms to 2.0 ms (one position) because
-the monitor no longer re-evaluates unchanged trailing levels.
+Engine reservoirs in the same branch run, cleared after each row's warm-up so
+that they hold only the timed calls: `execution.submit_total_ms` p50 6.2 /
+p95 6.6 / p99 7.0 over 200 paper submits (a buy and a sell per round trip);
+`decision.quote_to_decision_ms` p50 17.0 / p95 31.5 / p99 38.5 over the 100
+timed warm scans (the reservoir keeps the last 512 of their 800 per-symbol
+samples). Over the seven untimed scans of that row (two set-up scans, the
+first of them cold, and five warm-up scans) the same reservoir reads p50 20.2 /
+p95 766 / max 919 from 56 samples. The long tail is therefore confined to the
+untimed scans, which include the cold one with its candle downloads between
+the ticker snapshot and the decision (finding 18).
 
-**Reading the table.** The engine's own cost per protective tick and per
-decision is unchanged within a fraction of a millisecond; the extra 5–10 ms on
-a warm scan is the decision records and events for eight symbols. The real
-latency change is structural: with streaming on and every holding quoted, a
-protective check costs about 2 ms instead of a REST round trip, and runs
-every second instead of every five. Paper orders are four times slower
-because they now do what live orders do (authorization, journal, events).
+The hot-path benchmark (`bench_hot_path.py`, same two exports, three runs
+each; the figures are from run 3 on both, `hot_path_main_7207e82.json` and
+`hot_path_branch_18a2fdc.json`) shows cold scans unchanged: 8 symbols 1.069 s
+→ 1.076 s, 20-symbol rapid scan 2.288 s → 2.295 s, Kraken-paced 8 symbols
+17.00 s → 17.00 s, with the same request counts (17, 41, 17) and the same
+peak concurrency (3, 3, 1). Single warm scans are slower on the branch: 8
+symbols 171 → 185 ms and 20 symbols 193 → 219 ms (three runs: 170–172 against
+178–185 ms, and 192–201 against 215–221 ms). The per-symbol indicator
+pipeline is unchanged within noise (median 4.00 against 4.04 ms). The
+protective tick is slower on the branch: median 1.52 → 2.73 ms with one
+position and 3.34 → 4.43 ms with five (three runs: 1.50–1.72 against
+2.50–3.20 ms, and 3.30–3.44 against 4.38–5.60 ms). Both trees now hold the
+number of positions each row names; the script asserts it before and after
+the timed ticks.
+
+After the final review's fixes (`31d13bd`, which adds one realised-P/L check
+to every booked exit), one more run of each script on the branch gave values
+within the run-to-run spread above: one-position tick 2.44 ms, five
+positions 4.28 ms, warm scan 178.2 / 180.0 ms, paper buy 14.68 ms and paper
+sell 12.07 ms at p50; hot-path tick medians 2.78 and 4.67 ms. The stored
+branch results are the `18a2fdc` runs. The replay check on `31d13bd`
+(`benchmarks/results/replay_branch_31d13bd.json`) reports 240 comparisons and
+no mismatches.
+
+**Reading the table.** Cold scans and request pacing are unchanged. The branch
+spends more engine time on the order path and on every protective tick, and
+it is not hidden by the network: the 150 ms REST rows carry about the same
+0.5 to 1.5 ms difference.
+
+* Protective tick: about 1 ms more with one position and 0.7 to 1 ms more with
+  five. A profile of 300 one-position ticks on each tree (cProfile) shows the
+  branch tick opening 12 SQLite connections and making 36 `execute` calls
+  where `main` opens 7 and makes 21; about four fifths of the extra profiled
+  time is
+  in `_daily_allowed`, which on the branch also calls the risk module's
+  equity (drawdown) and realised-loss observers. One run of the corrected
+  latency script on `17ca0e9`, the commit the earlier table measured, gave a
+  2.16 ms one-position tick, between the two trees above; part of the extra
+  cost therefore arrived after that commit. The individual commits were not
+  measured.
+* Streaming: with every holding quoted by the stream, a protective check
+  makes no REST request and costs the same engine time as a REST tick with a
+  0 ms round trip (2.64 against 2.76 ms with one position, 4.53 against
+  4.54 ms with five), instead of about 153 to 156 ms against a 150 ms REST
+  round trip. The engine also schedules it every second instead of every
+  `protective_poll_seconds` (5 by default); that interval comes from the code
+  (`STREAM_MONITOR_SECONDS`), the benchmark forces each tick.
+* Warm scan: 7 ms more at p50 and 20 ms more at p95 for eight symbols. One
+  `evaluate_entry` record measures 0.05 ms, so the records' own computation
+  accounts for under half a millisecond of it; the rest was not isolated.
+* Paper orders: about 4.5 times slower to buy and 3.5 times slower to sell.
+  The paper path now goes through the risk gate, the order journal and the
+  paper exchange adapter, the same submit and confirm path as live orders.
+  The engine's own submit timer (`execution.submit_total_ms`, buys and sells
+  together) reads 6.2 ms at p50, under half of either order's total; the
+  rest of the split was not profiled.
+
+**What changed in the measurement, and why.**
+
+1. *Positions are now really opened (finding 70).* The hot-path monitor rows
+   bought positions without giving any symbol a mark. On the branch the risk
+   gate refuses an entry while any held asset has a stale or missing mark, so
+   every buy after the first was refused; and because every engine in one
+   process shares the paper ledger and the five-position row did not reset
+   it, that row held one position, the one left over from the one-position
+   row. Reproduced with the original script: after the "5 positions" row,
+   `18a2fdc` had one open position and `7207e82` had five. Both scripts now
+   reset the paper ledger, give every symbol a fresh bid/ask through the
+   engine's own `_observe_ticker` before each buy (present on both trees),
+   assert that each buy succeeds and that the requested number of positions
+   is open before and after timing.
+2. *Warm-up (finding 71).* No iteration was discarded, so a cold first call
+   was one of the samples, and with 40 samples the "p99" was the maximum.
+   Rerunning the original sampling twice on `7207e82`, the first protective
+   tick was the slowest of the 40 every time, about twice the p50 (one
+   position: 3.74 against 1.74 ms, and 3.45 against 1.53 ms). On `17ca0e9`
+   the first tick was not the slowest. Every row now discards 5 warm-up
+   iterations.
+3. *Equal sample counts and an honest tail (finding 71).* Rows used 10, 20,
+   40, 200 or 800 samples. Every row now records 100, and a p99 is reported
+   only with at least 100 samples; below that the script labels the tail as
+   the maximum.
+4. *Reservoirs per row.* The engine reservoirs are one per process, so the
+   branch's reservoir figures mixed in samples from earlier rows (cold scans
+   in `quote_to_decision`, the monitor rows' buys in `submit_total`). They are
+   now cleared after each row's warm-up, and the set-up scans are reported
+   separately.
+5. *The branch head.* The branch is measured at `18a2fdc`, not `17ca0e9`. An
+   exported tree has no git metadata, so the scripts take `--revision` to
+   label their output.
+
+**The earlier figures that were wrong.** The previous table measured
+`17ca0e9` rather than the branch head. Its p99 column compared `main`'s cold
+first call with warm calls on the branch: `main`'s 3.59 and 4.80 ms
+protective-tick "p99" values were each the slowest of 40 samples, which on
+`main` is the cold first call (item 2), against p50s of 1.56 and 3.07 ms.
+Its warm-scan p95 and p99 came from ten samples, so both were the slowest
+scan of the ten.
+
+The previous hot-path sentence said the one-position protective tick median
+improved from 2.7 ms to 2.0 ms because the monitor no longer re-evaluates
+unchanged trailing levels. Both the result and the reason were wrong. With a
+warm-up and 100 samples the branch tick is slower, not faster: 1.52 → 2.73 ms
+at `18a2fdc`, and a corrected run on `17ca0e9` gives 2.16 ms against `main`'s
+1.66–1.86 ms. `main`'s 2.7 ms median from that run sat beside a 1.35 ms
+minimum and does not reproduce; three corrected runs give 1.50–1.72 ms. The
+stated cause could not have acted either: in this benchmark the tick never
+reaches the trailing code on either tree, because no candles are cached, and
+`_mark_positions` was called zero times in 50 five-position ticks on both.
+Separately, the branch's "5 positions" figure in that run (1.92 ms) was a
+one-position tick (item 1).
 
 **Limitations.** No real network, no real exchange pacing beyond the fake's
-fixed sleep, CPU timings depend on the host, and the stream numbers show the
-engine's cost once a quote has arrived, not the exchange's publication delay.
-`feed.exchange_to_receipt_ms` will report that delay once the feed runs
-against a real exchange. The measurements should be repeated on the Windows
-machine with Python 3.14 (section H).
+fixed sleep, and a shared container whose CPU timings vary by up to 17% at
+p50 between runs. The stream numbers show the engine's cost once a quote has
+arrived, not the exchange's publication delay; `feed.exchange_to_receipt_ms`
+will report that delay once the feed runs against a real exchange. The
+measurements should be repeated on the Windows machine with Python 3.14
+(section H).
 
 ---
 
@@ -428,7 +549,7 @@ What the records can and cannot say:
 
 Commits 1–10 below reached `main` through pull request #5 (merged 2026-10-26
 01:07 UTC) and commit 11 through pull request #6 (merged 01:31 UTC). Pull
-request #8 carries commits 12–15, plus documentation and benchmark updates, on top of
+request #8 carries commits 12–16, plus documentation and benchmark updates, on top of
 `main` after pull request #7 (automatic releases). Oldest first:
 
 1. `a83667d` Add an independent risk gate, kill switch and structured events
@@ -446,12 +567,13 @@ request #8 carries commits 12–15, plus documentation and benchmark updates, on
 13. `db82565` Close the final review: latch on booking, stream cache sweep, clock steps, decision trail
 14. `5ddd2df` Close the concurrency review: safe rollback, stream lifecycle, kill switch at submit
 15. `be20041` Close the documentation review: breakers that close, one-id order trail, kill switch scope
+16. `31d13bd` Close the final engine review: manual-exit latch, withheld entries, stream start, clock-capped hold, stricter carry
 
 Commit `0d277d4` (recovery of an interrupted update from another release) and
 its revert `196f2da` cancel out; pull request #9 carries that fix instead
 (finding 65).
 
-`git revert` them newest first. Reverting commits 11–15 needs no data step:
+`git revert` them newest first. Reverting commits 11–16 needs no data step:
 their data changes are meta keys that older builds ignore.
 
 Going back past commit 1 (to `7207e82`, v1.4.0) crosses the schema change
@@ -504,6 +626,9 @@ want.
    frozen runtime that calls `engine.stop()` and waits briefly, so closing the
    window behaves like Ctrl+C instead of a hard kill.
 7. One anchor SQLite connection (25) to stop the per-call WAL checkpoint.
+   It may also take back part of the protective tick's extra millisecond
+   (section C; not measured): the branch tick opens 12 connections where
+   `main` opens 7, mostly for the drawdown and realised-loss observers.
 8. Manifest-driven source updates: `maintenance/update_installation.py`
    packages a fixed module list, so a source-only update applied by an
    *older* installed helper cannot add modules that a newer release
@@ -545,7 +670,7 @@ Setup is the simpler fix: it installs the matching app and runtime.
 
 **Explicit approvals requested.**
 
-* Approval to merge pull request #8 (commits 12–15) after its Windows build
+* Approval to merge pull request #8 (commits 12–16) after its Windows build
   is green. Pull requests #5 and #6 (commits 1–11) are already merged.
 * Whether to take the follow-ups above in a further branch.
 * Whether the daily realised-loss stop should count today's losing trades

@@ -139,6 +139,9 @@ impact on live capital or on the integrity of the record.
 | 58 | Low | `enter` decisions that did not become orders (per-scan cap, positions, re-quote, budget, guards) left no trace. | **Fixed**: one `decision.withheld` event per candidate with a reason code. |
 | 59 | Low | The runbook said exit ids appear in `GET /api/decisions`. | **Fixed** (runbook): exit ids are in `decision.exit` events and the journal. |
 | 60 | Low | Trailing exits decided by the protective monitor were labelled `source='scan'`. | **Fixed**: `source='monitor'`, and every `decision.exit` names its trigger. |
+| 61 | Med. | The documented rollback was unsafe: builds before the schema-3 migration insert journal rows by position into ten columns, so on a migrated database every order they journal fails, and the first live protective exit halts instead of being sent. Reproduced against the real `7207e82` code. | **Fixed**: `recovery.py --prepare-downgrade` (confirmation phrase, refuses open intents, full database copy first) returns the journal to the old layout; rehearsed against `7207e82`, which then journals orders, and the current build migrates forward again. Runbook §9 and §G corrected. |
+| 62 | Low | A Stop that landed while Start was preparing the stream left the websocket thread running with the bot stopped, and it kept serving quotes after **Streaming quotes** was switched off. | **Fixed**: Start re-checks after the stream starts and stops it if a Stop or a worker exit came in between; saving settings with streaming off stops any stream. |
+| 63 | Low | The kill switch was read once at the start of authorization, so an order authorized just before the switch was engaged was still sent, including an exit the operator meant to block. | **Fixed**: `_submit` re-reads the switch right before sending, under the submission lock, and journals the intent `rejected` with a `risk.blocked_at_submit` event. |
 
 ---
 
@@ -170,6 +173,8 @@ impact on live capital or on the integrity of the record.
 | `decision.py`, `trader.py`, `risk.py`, `storage.py`, `market_data.py`, `launcher.py` | Findings 40, 41, 43–50, 52, 54, 56–60: exit retry and ratchet, quote clocks, status order, locks, realised-loss latching and clearing, fee P/L, failure correlation, manual-order events, Ctrl+C, single-pair MEXC reads, decision trail. |
 | `static/index.html`, `static/dashboard.js`, `static/dashboard-core.js` | **Clear latched stop** button and warning text (finding 46). |
 | `tests/test_review_round3.py` (new), `tests/test_dashboard.js` | 32 + 1 tests for findings 39–60. Each new test was checked to fail with its fix removed. |
+| `recovery.py`, `trader.py`, `risk.py`, `RUNBOOK.md` | Findings 61–63: `--prepare-downgrade` for a rollback across the schema change, stream lifecycle on a fast Stop or with streaming off, kill switch re-read at submit. |
+| `tests/test_review_round3.py` | 7 more tests for findings 61–63, also checked to fail with each fix removed. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -245,8 +250,8 @@ machine with Python 3.14 (section H).
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **582 passed** |
-| `node --test tests/test_dashboard.js` | 11 passed | 12 passed |
+| `python -m pytest tests -q` | 434 passed | **591 passed** |
+| `node --test tests/test_dashboard.js` | 11 passed | 14 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
 | `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
 
@@ -293,7 +298,7 @@ New test files and what they prove:
   decision, authorization, journal and ledger events, operator and manual
   order events, redaction keeps lines valid JSON, start-up failures are
   logged safely.
-* `tests/test_review_round3.py` (32): the real CCXT MEXC websocket client fed
+* `tests/test_review_round3.py` (39): the real CCXT MEXC websocket client fed
   protobuf frames goes live, keeps both symbols updating and serves the newest
   quote after a burst; the 30-subscription cap; cache entries a combined watch
   did not return; no pre-outage quotes after a reconnect; an unlisted pair;
@@ -306,7 +311,12 @@ New test files and what they prove:
   on failure and halt events; a filled manual order never logged as failed;
   one MEXC pair read by name with the real adapter; catalogue-only streaming;
   the same-candle rule in the record; unchanged abstentions; withheld reasons;
-  monitor-labelled exits; Ctrl+C stopping the engine first.
+  monitor-labelled exits; Ctrl+C stopping the engine first; no stream left
+  running after a Stop during Start or with streaming off; the kill switch
+  engaged after authorization stopping an entry, and an exit only when exits
+  are blocked; a rollback prepared by `recovery.py` letting the old positional
+  journal insert succeed, with the full copy kept, and refusing open intents
+  or a wrong phrase.
 
 **Not runnable here.**
 
@@ -386,9 +396,9 @@ What the records can and cannot say:
 ## G. Rollback
 
 Commits 1–10 below reached `main` through pull request #5 (merged 2026-10-26
-01:07 UTC); the follow-up pull request #6 carries commits 11–13 on top of that
-merge.
-Oldest first:
+01:07 UTC) and commit 11 through pull request #6 (merged 01:31 UTC). Pull
+request #8 carries commits 12–14, plus a documentation update, on top of
+`main` after pull request #7 (automatic releases). Oldest first:
 
 1. `a83667d` Add an independent risk gate, kill switch and structured events
 2. `185b346` Make order execution an explicit state machine shared by paper and live
@@ -401,16 +411,26 @@ Oldest first:
 9. `030a8f2` Append the event log per write so Windows can delete the data directory
 10. `14033fc` Ship the new modules in the installer, runtime and source updater
 11. `2ea317d` Close the second review round: realised-loss latch, fee assets, correlation, operator events
-12. `e6b32ee` Make MEXC streaming go live; one exit attempt per tick; compare quotes on one clock
-13. (review) Close the final review: latch on booking, stream cache sweep, clock steps, decision trail
+12. `220edcd` Make MEXC streaming go live; one exit attempt per tick; compare quotes on one clock
+13. `db82565` Close the final review: latch on booking, stream cache sweep, clock steps, decision trail
+14. `5ddd2df` Close the concurrency review: safe rollback, stream lifecycle, kill switch at submit
 
-`git revert` them newest first, or check out `7207e82` to go back to v1.4.0
-entirely. Data: the schema change is additive (`PRAGMA user_version = 3`, new
-nullable journal columns); an older build opens the same file and ignores the
-new columns. Stop the bot before downgrading so no paper intent is
-non-terminal, because older builds do not distinguish paper journal rows from
-live ones. The new settings keys are ignored by older builds. The event log and
-decision log are informational and can be deleted.
+`git revert` them newest first. Reverting commits 11–14 needs no data step:
+their data changes are meta keys that older builds ignore.
+
+Going back past commit 1 (to `7207e82`, v1.4.0) crosses the schema change
+(`PRAGMA user_version = 3`, ten new journal columns). Builds from before it
+insert journal rows by position, so on a migrated database every order they
+journal fails, and their first live exit halts instead of being sent
+(finding 61). Before starting such a build, stop the bot, close the app and run
+`python recovery.py --prepare-downgrade --confirm "I AM ROLLING BACK CRYPTOPILOT"`.
+It refuses while any journal intent is open, saves a full copy of the database
+under `backups/` in the data folder, keeps the live journal rows in the old
+layout and drops the paper rows, which older builds would read as live. This
+was rehearsed against the real `7207e82` code: before the step its journal
+insert failed, after it the insert succeeded, and the current build migrated
+the file forward again. The new settings keys are ignored by older builds.
+The event log and decision log are informational and can be deleted.
 
 ---
 
@@ -442,14 +462,14 @@ decision log are informational and can be deleted.
    fixed list as the required minimum) would let later additions flow through
    `--update-source` as well as Setup.
 
-**Upgrade path for an existing installation.** If the 1.4.0 build from CI is
-installed anywhere, upgrade it with the new Setup (the in-app updater does
-this), not with `UPDATE_INSTALLED.bat` / `--update-source`. Commit 12 adds the
-`protobuf` dependency, so a source-only update is refused anyway (the lock file
-differs) and only Setup brings the new runtime. With a source tree from
-before commit 12 (pull request #5 alone) the installed helper would instead
-copy only the nine modules it knows, and the app would then stop at start
-with `No module named 'decision'`. Recovery from that state is
+**Upgrade path for an existing installation.** Upgrade an installed copy with
+Setup (the in-app updater downloads and runs it), not with
+`UPDATE_INSTALLED.bat` / `--update-source`. Commit 12 adds the `protobuf`
+dependency, so a source-only update is refused (the lock file differs) and only
+Setup brings the new runtime. Applied to a 1.4.0 installation, a source-only
+update from a tree before commit 12 (`main` with pull requests #5–#7) would
+instead copy only the nine modules the old helper knows, and the app would
+stop at start with `No module named 'decision'`. Recovery from that state is
 `CryptoPilotRuntime.exe --update-source <installation>\backups\update-<stamp>\app`,
 which restores the backed-up source.
 
@@ -474,10 +494,10 @@ which restores the backed-up source.
 
 **Explicit approvals requested.**
 
-* Approval to merge the follow-up pull request #6 (commits 11–13) after its
-  Windows build is green. Pull request #5 (commits 1–10) is already merged.
+* Approval to merge pull request #8 (commits 12–14) after its Windows build
+  is green. Pull requests #5 and #6 (commits 1–11) are already merged.
 * Whether to take the follow-ups above in a further branch.
-* Whether this should become a tagged release (the app version is still
-  1.4.0; a tag publishes an installer to GitHub Releases, which the app offers
-  as an update).
+* Since pull request #7, every merge to `main` publishes a release
+  (`1.5.<commits on main>`) that installed copies offer as an update, so
+  merging #8 also ships it to installed copies through Setup.
 * No live enablement is requested or implied.

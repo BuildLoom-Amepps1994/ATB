@@ -85,8 +85,10 @@ POST /api/risk  {"action": "engage", "reason": "operator", "allow_exits": true}
 ```
 
 It takes effect immediately, including during a scan, and persists across
-restarts. With `allow_exits` true, protective exits continue; with it false,
-nothing is sent at all.
+restarts. An order the risk gate had already approved is checked against the
+switch again right before it is sent, and is journaled `rejected` with a
+`risk.blocked_at_submit` event if the switch now blocks it. With `allow_exits`
+true, protective exits continue; with it false, nothing is sent at all.
 
 **Release** needs the phrase:
 
@@ -244,11 +246,22 @@ is not part of this procedure.
 Each hardening step is one commit on the feature branch, so a rollback is a
 `git revert` of the commits you do not want, newest first. Data compatibility:
 
-* The database schema change is additive (new nullable columns on
-  `order_journal`, `PRAGMA user_version = 3`). An older build opens the same
-  file; it ignores the new columns. Stop the bot before downgrading so no paper
-  intent is left non-terminal, because older builds do not distinguish paper
-  journal rows from live ones.
+* The database schema change adds columns to `order_journal`
+  (`PRAGMA user_version = 3`). Builds from before it (up to `7207e82`, v1.4.0)
+  open the file but insert journal rows by position, so every order they try
+  fails and their first live exit halts instead of being sent. Before running
+  such a build, stop the bot, close the app and run:
+
+  ```
+  python recovery.py --prepare-downgrade --confirm "I AM ROLLING BACK CRYPTOPILOT"
+  ```
+
+  It refuses while any journal intent is not final. It saves a full copy of
+  the database to `backups/portfolio-before-downgrade-<time>.sqlite3` in the
+  data folder, keeps the live journal rows in the old layout and drops the
+  paper ones, which older builds would read as live. The current build
+  migrates the file forward again at its next start. Reverting only commits
+  from after the schema change needs none of this.
 * New settings keys are optional and have defaults; an older build ignores
   them without requiring a settings review.
 * The event log and the decision log are informational and can be deleted.

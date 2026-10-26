@@ -123,3 +123,12 @@ def test_the_report_renders_every_series_from_the_result_file(tmp_path):
     path.write_text(json.dumps(result, default=str))
     text = micro_report.render(json.loads(path.read_text()))
     assert '### XRP/USDT: flat' in text and 'MECHANICS ONLY' in text and 'Random entries mean' in text
+
+
+def test_every_fixture_market_has_a_tick_and_step_too_fine_to_decide_its_result():
+    # A 0.01 tick on a 0.50 price rounds every exit bid by 200 bps: the fixture would test rounding, not the strategy.
+    for series, _ in r.fixture_suite(120):
+        rules = r.rules_for(series, 1.0)
+        low, high = Decimal(str(min(series.closes))), Decimal(str(max(series.closes)))
+        assert rules.price_tick / low <= Decimal('0.0005'), (series.symbol, rules.price_tick)       # 5 bps or less
+        assert rules.amount_step * high <= Decimal('0.125'), (series.symbol, rules.amount_step)     # 0.5 % of 25 USDT

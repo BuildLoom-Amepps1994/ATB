@@ -526,8 +526,10 @@ def fixture_suite(minutes: int = 2880) -> list[tuple[fx.SeriesMarket, str]]:
     origin = 29_000_000          # a fixed epoch minute (2025-02-19): replays do not depend on today's date
 
     def market(symbol):
-        # Fine quantity steps keep rounding out of the fixtures (docs/ATB_MICRO_ECONOMICS.md shows its cost).
-        return fx.mexc_market(symbol, amount_step=0.000001, price_tick=0.0001 if symbol.startswith('XRP') else 0.01)
+        # Fine quantity steps keep rounding out of the fixtures (docs/ATB_MICRO_ECONOMICS.md shows its cost), and
+        # a sub-dollar pair gets a sub-cent tick: a 0.01 tick on a 0.50 price would round every exit bid by 200 bps.
+        sub_dollar = symbol.startswith(('XRP', 'ADA'))
+        return fx.mexc_market(symbol, amount_step=0.000001, price_tick=0.0001 if sub_dollar else 0.01)
     return [
         (fx.SeriesMarket('ETH/USDT', origin, fx.swings(minutes, base=2500.0, range_bps=80, rise_bars=18, drop_bars=2,
                                                         zigzag_bps=4), market=market('ETH/USDT')),

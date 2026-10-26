@@ -550,8 +550,8 @@ begin
     else
       Advice := 'Your previous version was kept and opens again now. Close any program or window that is ' +
         'using the CryptoPilot folder, then try the update again.';
-    MsgBox('CryptoPilot could not finish the update: ' + UpdateFailure + #13#10#13#10 + Advice +
-      #13#10#13#10 + 'Setup log: ' + ExpandConstant('{log}'), mbError, MB_OK);
+    MsgBox('CryptoPilot could not finish the update: ' + UpdateFailure + #13#10#13#10 + Advice + #13#10#13#10 +
+      'Setup log: ' + ExpandConstant('{log}'), mbError, MB_OK);
   end;
   { Reopen CryptoPilot after an in-app update, whether or not Setup succeeded. It never starts trading. }
   if RelaunchAfterSetup then

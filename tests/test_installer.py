@@ -121,3 +121,7 @@ def test_installer_preserves_safeguards():
     # A failed activation must restore a runtime that matches the previous source.
     assert 'SetPreviousRuntimeAside' in script and 'RestorePreviousRuntime' in script
     assert 'function GetCustomSetupExitCode' in script and 'RecoverInterruptedSetup' in script
+    # The Inno preprocessor reads any line starting with '#' as a directive, so Pascal
+    # character codes such as #13#10 must never begin a line of code.
+    code = script.split('[Code]', 1)[1]
+    assert not [line for line in code.splitlines() if line.lstrip().startswith('#')]

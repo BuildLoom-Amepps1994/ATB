@@ -572,3 +572,129 @@ def test_exit_decisions_from_the_monitor_trail_are_labelled_monitor(engine, monk
     engine._monitor_if_due(force=True)
     exits = [fields for kind, fields in events if kind == 'decision.exit']
     assert exits and exits[-1]['source'] == 'monitor' and exits[-1]['trigger'] == 'trailing'
+
+
+# --- Final review, concurrency lens: lifecycle, kill switch at submit, rollback ---------------
+
+class LifecycleFeed:
+    """Stands in for QuoteFeed: records whether it was ever stopped."""
+    def __init__(self, *args, **kwargs):
+        self.state, self.started, self.stopped = 'starting', False, False
+
+    def start(self):
+        self.started, self.state = True, 'live'
+
+    def stop(self, timeout=None):
+        self.stopped, self.state = True, 'stopped'
+
+    def status(self):
+        return {'state': self.state, 'enabled': True}
+
+
+def test_a_stop_while_start_prepares_the_stream_leaves_no_stream_running(engine, monkeypatch):
+    engine.cfg = {**engine.cfg, 'streaming_quotes': True}
+    created = []
+    monkeypatch.setattr(feed, 'QuoteFeed', lambda *a, **k: created.append(LifecycleFeed()) or created[-1])
+    prepare = engine._feed_symbols
+
+    def stop_meanwhile(symbols=None):
+        engine.stop()                                    # the operator clicks Stop right after Start
+        return prepare(symbols)
+    monkeypatch.setattr(engine, '_feed_symbols', stop_meanwhile)
+    engine.start()
+    assert created and created[0].started
+    assert created[0].stopped and engine.feed is None
+
+
+def test_switching_streaming_off_stops_a_stream_left_running(engine):
+    leftover = LifecycleFeed()
+    leftover.start()
+    engine.feed = leftover
+    engine.update_config({'streaming_quotes': False})
+    assert leftover.stopped and engine.feed is None
+
+
+def test_a_kill_switch_engaged_after_authorization_still_stops_the_entry(engine, monkeypatch):
+    events = capture_events(monkeypatch)
+    client = arm_fake_live(engine)
+    original = storage.create_order_intent
+
+    def engage_then_journal(*args, **kwargs):
+        engine.risk.engage_kill_switch('operator, mid-order')   # lands after the gate said yes
+        return original(*args, **kwargs)
+    monkeypatch.setattr(storage, 'create_order_intent', engage_then_journal)
+    assert not engine._buy('BTC/USDT', 800, 100, .04)
+    assert client.orders == []
+    row = storage.rows("SELECT status,note FROM order_journal WHERE mode='live'")[0]
+    assert row['status'] == 'rejected' and 'kill switch' in row['note']
+    assert any(kind == 'risk.blocked_at_submit' for kind, _ in events)
+    assert not engine.live_halted
+
+
+@pytest.mark.parametrize('allow_exits', [False, True])
+def test_a_kill_switch_engaged_after_authorization_blocks_an_exit_only_when_exits_are_blocked(
+        engine, monkeypatch, allow_exits):
+    assert engine._buy('BTC/USDT', 800, 100, .04)
+    position = engine._active_positions('paper')[0]
+    original = storage.create_order_intent
+
+    def engage_then_journal(*args, **kwargs):
+        engine.risk.engage_kill_switch('operator, mid-exit', allow_exits=allow_exits)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(storage, 'create_order_intent', engage_then_journal)
+    engine._sell(position, 90, 'test exit')
+    still_open = bool(engine._active_positions('paper'))
+    assert still_open is (not allow_exits)
+
+
+def legacy_insert(database):
+    """The positional journal insert of builds before schema 3 (7207e82 storage.create_order_intent)."""
+    import sqlite3
+    with sqlite3.connect(str(database)) as db:
+        db.execute('INSERT INTO order_journal VALUES (?,?,?,?,?,?,?,?,?,?)',
+                   ('legacy-intent', '2026-10-26T00:00:00+00:00', '2026-10-26T00:00:00+00:00', 'mexc',
+                    'BTC/USDT', 'SELL', 1.0, None, 'pending', None))
+
+
+@pytest.fixture
+def data_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(storage, 'DB_PATH', tmp_path / 'portfolio.sqlite3')
+    monkeypatch.setattr(storage, 'CONFIG_PATH', tmp_path / 'settings.json')
+    monkeypatch.setenv('CRYPTOPILOT_DATA_DIR', str(tmp_path))
+    storage.init_db()
+    return tmp_path
+
+
+def test_a_rollback_prepared_by_the_recovery_tool_lets_an_older_build_journal_orders(data_folder):
+    import sqlite3
+    import recovery
+    live = storage.create_order_intent('mexc', 'BTC/USDT', 'BUY', cost=100, mode='live')
+    storage.update_order_intent(live, 'rejected', note='test')
+    paper = storage.create_order_intent('mexc', 'ETH/USDT', 'BUY', cost=50, mode='paper')
+    storage.update_order_intent(paper, 'rejected', note='test')
+    database = data_folder / 'portfolio.sqlite3'
+    with pytest.raises(sqlite3.OperationalError):
+        legacy_insert(database)                            # what the documented rollback ran into
+    result = recovery.prepare_downgrade(data_folder, recovery.DOWNGRADE_PHRASE)
+    assert result['changed'] and result['live_rows_kept'] == 1 and result['paper_rows_removed'] == 1
+    legacy_insert(database)                                # the older build can journal again
+    with sqlite3.connect(str(database)) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert {row[0] for row in db.execute('SELECT intent_id FROM order_journal')} == {live, 'legacy-intent'}
+    with sqlite3.connect(result['backup']) as copy:      # nothing is lost: the full copy keeps the paper row
+        assert copy.execute('SELECT COUNT(*) FROM order_journal WHERE intent_id=?', (paper,)).fetchone()[0] == 1
+    storage.init_db()                                      # the newer build migrates forward again
+    assert storage.order_intent('legacy-intent')['mode'] == 'live'
+
+
+def test_the_rollback_preparation_refuses_open_intents_and_a_wrong_phrase(data_folder):
+    import recovery
+    storage.create_order_intent('mexc', 'BTC/USDT', 'BUY', cost=100, mode='paper')   # still 'intent'
+    before = (data_folder / 'portfolio.sqlite3').read_bytes()
+    with pytest.raises(ValueError, match='phrase'):
+        recovery.prepare_downgrade(data_folder, 'yes')
+    with pytest.raises(ValueError, match='not final'):
+        recovery.prepare_downgrade(data_folder, recovery.DOWNGRADE_PHRASE)
+    assert (data_folder / 'portfolio.sqlite3').read_bytes() == before
+    assert not (data_folder / 'backups').exists()

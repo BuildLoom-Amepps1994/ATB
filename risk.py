@@ -135,6 +135,15 @@ class RiskGate:
         return {'engaged': bool(saved.get('engaged')), 'allow_exits': saved.get('allow_exits') is not False,
                 'engaged_at': saved.get('engaged_at'), 'reason': saved.get('reason')}
 
+    def switch_blocks(self, request: OrderRequest) -> str | None:
+        """The kill switch as it stands now, for the last check before an order leaves."""
+        switch = self.kill_switch()
+        if not switch['engaged']:
+            return None
+        if request.is_entry:
+            return 'Kill switch engaged: new orders blocked'
+        return None if switch['allow_exits'] else 'Kill switch engaged with exits blocked'
+
     def engage_kill_switch(self, reason: str = 'Operator kill switch', *, allow_exits: bool = True) -> dict:
         """Immediate and durable. Needs no confirmation and no idle engine."""
         record = {'engaged': True, 'allow_exits': bool(allow_exits), 'engaged_at': _now_iso(),

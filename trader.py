@@ -417,6 +417,8 @@ class TradingEngine:
             storage.save_settings(revised)
             changed_keys = sorted(key for key in revised if revised.get(key) != self.cfg.get(key))
             self.cfg = revised
+            if not revised.get('streaming_quotes'):
+                self._stop_feed()   # nothing may keep quoting from a stream the operator switched off
             if changed_exchange:
                 self.exchange_name = revised['exchange']
                 self.public, self.data = candidate_public, candidate_data
@@ -474,7 +476,7 @@ class TradingEngine:
                 self.stop_event.clear()
                 self.thread = threading.Thread(target=self._loop, daemon=True, name='TradingEngine')
                 self.thread.start()
-            self._start_feed()
+            self._start_feed(generation)
             storage.audit('warning' if self.mode == 'live' else 'info', f'Bot started in {self.mode.upper()} mode.')
             observability.event('engine.started', level='warning' if self.mode == 'live' else 'info', mode=self.mode,
                                 exchange=self.exchange_name, streaming=bool(self.cfg.get('streaming_quotes')),
@@ -562,13 +564,16 @@ class TradingEngine:
         listed = [symbol for symbol in dict.fromkeys(symbols) if not catalogue or symbol in catalogue]
         return listed[:40]
 
-    def _start_feed(self) -> None:
+    def _start_feed(self, generation: int | None = None) -> None:
         """Start the websocket quote stream when the setting asks for it.
 
         Failure to start is logged and leaves REST polling in charge; the
-        stream is an accelerator, never a dependency.
+        stream is an accelerator, never a dependency. ``generation`` is the
+        start's stop generation: a Stop (or a worker exit) that lands while
+        the stream is being prepared must not leave it running on its own.
         """
         if not self.cfg.get('streaming_quotes'):
+            self._stop_feed()
             return
         try:
             if self.feed is None or self.feed.state in ('stopped', 'failed'):
@@ -578,6 +583,14 @@ class TradingEngine:
         except Exception as exc:
             self.feed = None
             storage.audit('warning', f'Streaming quotes unavailable ({type(exc).__name__}); REST polling remains in use.')
+        if generation is not None:
+            # stop() bumps the generation before its own _stop_feed, and the
+            # worker clears ``running`` before its; either that call sees this
+            # feed, or this check sees the stop.
+            with self.lock:
+                abandoned = generation != self.stop_generation or not self.running
+            if abandoned:
+                self._stop_feed()
 
     def _stop_feed(self) -> None:
         current, self.feed = self.feed, None
@@ -1101,6 +1114,16 @@ class TradingEngine:
                 with self.private_lock:
                     if not self._may_execute():
                         storage.update_order_intent(intent, 'rejected', note='stopped before submission')
+                        return None, None
+                    # The authorization was computed moments ago; a kill switch
+                    # engaged since then still stops this order from leaving.
+                    blocked = self.risk.switch_blocks(authorization.request)
+                    if blocked:
+                        storage.update_order_intent(intent, 'rejected', note='kill switch engaged before submission')
+                        self.metrics.incr('risk.blocked_at_submit')
+                        storage.audit('warning', f'{side} {symbol} not sent: {blocked}.')
+                        observability.event('risk.blocked_at_submit', level='warning', symbol=symbol, side=side,
+                                            reason=blocked)
                         return None, None
                     # The request leaves now; a crash after this point may have an order at the exchange.
                     storage.update_order_intent(intent, 'pending', submitted_at=storage._now())

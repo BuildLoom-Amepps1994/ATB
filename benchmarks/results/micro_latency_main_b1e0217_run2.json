@@ -1,0 +1,217 @@
+{
+  "tree": "/tmp/claude-0/-home-claude-ATB/546c1e56-926a-556e-a30b-6a423158b443/scratchpad/wt-main",
+  "revision": "main-b1e0217-run2",
+  "python": "3.13.17",
+  "has_new_modules": true,
+  "repeat": 100,
+  "warmup": 5,
+  "p99_min_samples": 100,
+  "decision_cpu": {
+    "indicators_plus_rule": {
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 3.21,
+      "p95_ms": 5.125,
+      "p99_ms": 5.925,
+      "max_ms": 6.428,
+      "tail": "p99",
+      "mean_ms": 3.55
+    },
+    "decision_record": {
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 0.105,
+      "p95_ms": 0.188,
+      "p99_ms": 0.527,
+      "max_ms": 0.534,
+      "tail": "p99",
+      "mean_ms": 0.128
+    }
+  },
+  "scan_warm": {
+    "symbols": 8,
+    "rtt_ms": 150.0,
+    "scan": {
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 210.732,
+      "p95_ms": 232.244,
+      "p99_ms": 240.362,
+      "max_ms": 241.722,
+      "tail": "p99",
+      "mean_ms": 213.071
+    },
+    "requests_per_scan": 1.0,
+    "quote_to_decision_per_symbol": {
+      "count": 800,
+      "p50_ms": 32.469,
+      "p95_ms": 57.357,
+      "p99_ms": 69.295,
+      "max_ms": 75.82,
+      "mean_ms": 32.582,
+      "window": 512,
+      "tail": "p99"
+    },
+    "quote_to_decision_setup_scans": {
+      "count": 56,
+      "p50_ms": 38.42,
+      "p95_ms": 796.603,
+      "max_ms": 953.571,
+      "mean_ms": 136.783,
+      "window": 56,
+      "tail": "max"
+    },
+    "sample_decision": {
+      "action": "abstain",
+      "status": "Waiting: trend, RSI, breakout, choppy market",
+      "checks": 7
+    }
+  },
+  "monitor_rest": [
+    {
+      "positions": 1,
+      "open_positions": 1,
+      "rtt_ms": 0.0,
+      "source": "rest",
+      "requests_per_tick": 1.0,
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 5.996,
+      "p95_ms": 9.22,
+      "p99_ms": 11.272,
+      "max_ms": 22.002,
+      "tail": "p99",
+      "mean_ms": 6.524
+    },
+    {
+      "positions": 5,
+      "open_positions": 5,
+      "rtt_ms": 0.0,
+      "source": "rest",
+      "requests_per_tick": 1.0,
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 10.456,
+      "p95_ms": 14.842,
+      "p99_ms": 15.254,
+      "max_ms": 15.627,
+      "tail": "p99",
+      "mean_ms": 11.38
+    },
+    {
+      "positions": 1,
+      "open_positions": 1,
+      "rtt_ms": 150.0,
+      "source": "rest",
+      "requests_per_tick": 1.0,
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 157.691,
+      "p95_ms": 161.589,
+      "p99_ms": 164.212,
+      "max_ms": 168.572,
+      "tail": "p99",
+      "mean_ms": 158.318
+    },
+    {
+      "positions": 5,
+      "open_positions": 5,
+      "rtt_ms": 150.0,
+      "source": "rest",
+      "requests_per_tick": 1.0,
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 162.724,
+      "p95_ms": 169.232,
+      "p99_ms": 175.399,
+      "max_ms": 178.58,
+      "tail": "p99",
+      "mean_ms": 163.919
+    }
+  ],
+  "monitor_stream": [
+    {
+      "positions": 1,
+      "open_positions": 1,
+      "rtt_ms": 150.0,
+      "source": "stream",
+      "requests_per_tick": 0.0,
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 6.411,
+      "p95_ms": 10.58,
+      "p99_ms": 11.268,
+      "max_ms": 12.186,
+      "tail": "p99",
+      "mean_ms": 6.882
+    },
+    {
+      "positions": 5,
+      "open_positions": 5,
+      "rtt_ms": 150.0,
+      "source": "stream",
+      "requests_per_tick": 0.0,
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 11.374,
+      "p95_ms": 16.254,
+      "p99_ms": 21.587,
+      "max_ms": 24.394,
+      "tail": "p99",
+      "mean_ms": 12.254
+    }
+  ],
+  "feed_ingest": {
+    "count": 100,
+    "warmup_discarded": 5,
+    "p50_ms": 0.005,
+    "p95_ms": 0.008,
+    "p99_ms": 0.03,
+    "max_ms": 0.084,
+    "tail": "p99",
+    "mean_ms": 0.006,
+    "out_of_order": 0
+  },
+  "paper_order": {
+    "buy": {
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 33.537,
+      "p95_ms": 46.083,
+      "p99_ms": 50.505,
+      "max_ms": 53.02,
+      "tail": "p99",
+      "mean_ms": 34.966
+    },
+    "sell": {
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 24.958,
+      "p95_ms": 34.424,
+      "p99_ms": 38.326,
+      "max_ms": 40.122,
+      "tail": "p99",
+      "mean_ms": 26.317
+    },
+    "engine_submit_total": {
+      "count": 200,
+      "p50_ms": 12.212,
+      "p95_ms": 17.494,
+      "p99_ms": 23.286,
+      "max_ms": 29.167,
+      "mean_ms": 12.888,
+      "window": 200,
+      "tail": "p99"
+    },
+    "engine_submit_to_ack": {
+      "count": 200,
+      "p50_ms": 0.053,
+      "p95_ms": 0.088,
+      "p99_ms": 0.112,
+      "max_ms": 0.239,
+      "mean_ms": 0.058,
+      "window": 200,
+      "tail": "p99"
+    }
+  }
+}

@@ -12,6 +12,8 @@ The **code review fixes** that follow 1.3.0 close several live-execution gaps: f
 
 **Hardening review** (after 1.4.0): an independent risk gate now authorizes every order on every path, paper or live, automatic or manual, with hard USDT caps per order and per asset, an order-rate limit, a daily realised-loss stop, a drawdown stop from the tracked peak, failure/rejection/slippage breakers and a durable **kill switch** (release phrase `RESUME TRADING`). Orders run through an explicit journaled state machine with client order ids, so an ambiguous submit is looked up and never resent, and paper orders use the same path through an in-process exchange adapter. Every scan records one replayable decision per symbol with all checks and reasons (`GET /api/decisions`), structured events with correlation ids go to `logs/events.jsonl`, and `GET /api/metrics` reports p50/p95/p99 latencies. An optional, off-by-default **Streaming quotes** setting watches best bid/ask over the exchange websocket with heartbeat, ordering and reconnect checks while REST stays the fallback. See the [operations runbook](RUNBOOK.md), the [hardening review](HARDENING_REVIEW.md) and `benchmarks/results/`.
 
+**Micro cycles · PAPER only · 25 USDT all-in** (after the hardening review): a separate strategy profile for small, cost-aware paper cycles on the pairs you select. Choose *Micro* under *Strategy*, list the pairs, save and press **Start bot**; from then on each pair repeats buy, hold, sell and a later, distinct rebuy without per-trade input. 25.00 USDT is the most one entry may take from simulated cash **including fees**; it is reduced by available cash and never raised, and a pair whose exchange minimum needs more is shown as ineligible with the smallest budget that would work. Profit means the net result after every cost, estimated from the order book's bids before an exit and confirmed from the simulated fill after it. Exits also cover a bounded loss, a maximum hold and a turning market, none of which needs a profit or buy-side depth. Every cycle is durable: an order whose outcome is unknown, or a late fill the paper venue reports even after a cycle closed, blocks every new micro entry until you apply a read-only recovery, while the other cycles keep their exits; a venue record the journal does not explain blocks new entries on its pair. Each cycle's stop counts the round-trip cost it carries from the moment it is bought plus an adverse move of two 1-minute ATR, within a per-cycle loss cap (default 120 bps of the budget, 0.30 USDT at 25). The micro mode refuses LIVE at every boundary; there is no setting that changes this. The research on synthetic fixtures shows the mechanics work and shows **no demonstrated edge**; real-market evaluation has not been run. See [operations](docs/ATB_MICRO_OPERATIONS.md), [architecture](docs/ATB_MICRO_ARCHITECTURE.md), [economics](docs/ATB_MICRO_ECONOMICS.md), [research](docs/ATB_MICRO_RESEARCH.md), [performance](docs/ATB_MICRO_PERFORMANCE.md), [validation](docs/ATB_MICRO_VALIDATION.md) and the [release gates](docs/ATB_MICRO_RELEASE_GATES.md).
+
 Live and research signals share bounded indicator windows and an entry-gap guard. The research screen compares fixed-rule earlier/later periods and a full-period double-cost replay, reports insufficient coverage/sample size, and saves a JSON report with assumptions and candle fingerprints. These are descriptive checks, not an independent profitable strategy certification. See [1.3 validation and remaining limits](BOT_IMPROVEMENTS_1.3.0.md).
 
 ## Run on Windows
@@ -97,6 +99,8 @@ Signals execute at the following open. Candle stop/target fills model adverse ga
 node --test tests/test_dashboard.js
 python benchmarks/replay.py                 # decision replay check, exits 1 on any mismatch
 python benchmarks/bench_latency.py          # quote -> decision -> order latency percentiles
+python benchmarks/bench_micro.py            # micro paths: CPU, tick and cycle latency percentiles
+python -m research.micro_research          # frozen-protocol research on the synthetic fixtures
 ```
 
 The dashboard tests need Node.js 22 or newer (24 LTS recommended; 26 becomes LTS on 2026-10-28; Node 18 and 20 are end of life). Optional browser regression checks require Playwright 1.64 or newer, which needs Windows 11 or Server 2019+, and Chromium/Edge: `node tests/test_dashboard_browser.cjs` (`CRYPTOPILOT_BROWSER_CHANNEL=msedge` selects Edge). Those tests intercept all app routes, use fake state, and submit no trading requests.
@@ -123,5 +127,14 @@ Double-click `BUILD_WINDOWS_EXE.bat` to create an isolated build environment and
 | `launcher.py` | Profile lock, exclusive port and browser startup |
 | `recovery.py` | Offline recovery report and the confirmed `--clear-halt` reset |
 | `updater.py` | App version, GitHub Releases update check, verified installer download |
+| `micro.py` | Micro cycles (PAPER only): cadence, decisions, reservations, cycle state machine, recovery, status |
+| `micro_policy.py` | The single PAPER-only rule for the micro mode |
+| `micro_economics.py` | The one sizing, cost and accounting component (25 USDT all-in, book walks, net P/L) |
+| `micro_strategy.py` | Completed-bar features, regime, the two candidate setups and the exit policy |
+| `micro_book.py` | Validated order-book snapshots and the book tracker |
+| `micro_venue.py` | Durable, depth-aware paper venue for micro orders (taker fills only) |
+| `money.py`, `venue_rules.py` | Bounded Decimal money; venue minimums, steps and fees from the market catalogue |
+| `research/` | Fixture markets, the frozen-protocol research harness and the public-data collector |
+| `scripts/micro_soak.py` | Opt-in wall-clock PAPER soak in a new, isolated profile |
 
 Engineering references: [CCXT manual](https://docs.ccxt.com/docs/manual), [keyring security](https://keyring.readthedocs.io/en/stable/#security-considerations), [MEXC spot API](https://www.mexc.com/api-docs/spot-v3/introduction), [Kraken API](https://docs.kraken.com/api/).

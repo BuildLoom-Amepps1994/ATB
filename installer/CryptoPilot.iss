@@ -221,7 +221,8 @@ var
   Locked: Boolean;
 begin
   { A first install that did not finish leaves only Setup's own files: its lock, runtime,
-    uninstaller and staged source, and no app folder or record. Setup may run there again. }
+    uninstaller, staged source and, if it was killed mid-copy, one of Inno's is-*.tmp files.
+    It has no app folder or record. Setup may run there again. }
   Result := True;
   Locked := False;
   if FindFirst(AddBackslash(Folder) + '*', Entry) then begin
@@ -231,7 +232,9 @@ begin
         if Name = 'install.lock' then
           Locked := True
         else if not ((Name = '.') or (Name = '..') or (Name = 'runtime') or (Name = 'maintenance') or
-                     (Name = 'readme.md') or (Pos('unins', Name) = 1) or (Pos('.setup-', Name) = 1)) then begin
+                     (Name = 'readme.md') or (Pos('unins', Name) = 1) or (Pos('.setup-', Name) = 1) or
+                     ((Pos('is-', Name) = 1) and (Pos('.tmp', Name) = Length(Name) - 3) and
+                      ((Entry.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0))) then begin
           Result := False;
           exit;
         end;
@@ -533,11 +536,13 @@ var
   I: Integer;
 begin
   { With no swap recorded, a runtime still saved in backups\setup-* belongs with the source in
-    place if its Setup stopped before backing up the record, or if the record it backed up is
-    the one in place: that Setup was cut off, or could not put the runtime back, before a new
-    source was active. Put the newest such runtime back, so that this Setup keeps it as the
-    previous runtime rather than the partly written one in its place. Any other saved runtime
-    belongs to a source that has since been replaced, and is removed. }
+    place when that Setup never moved the source into its backup (or moved it back), and either
+    stopped before backing up the record or backed up the one in place: it was cut off, or could
+    not put the runtime back, before a new source was active. A completed swap always leaves the
+    previous source in its backup, even when the release, and so the record, is the same. Put
+    the newest such runtime back, so that this Setup keeps it as the previous runtime rather
+    than the partly written one in its place. Any other saved runtime belongs to a source that
+    has since been replaced, or is what was left of deleting it, and is removed. }
   Result := True;
   Root := ExpandConstant('{app}');
   Newest := '';
@@ -549,7 +554,7 @@ begin
       RemoveTree(Saved + '\rejected-runtime');
       RemoveTree(Saved + '\rejected-maintenance');
       if (DirExists(Saved + '\runtime') or DirExists(Saved + '\maintenance')) and DirExists(Root + '\app') and
-          ((not FileExists(Saved + '\installation.json')) or
+          (not DirExists(Saved + '\app')) and ((not FileExists(Saved + '\installation.json')) or
            SameRecord(Saved + '\installation.json', Root + '\installation.json')) and
           ((Newest = '') or (CompareText(Names.Strings[I], Newest) > 0)) then
         Newest := Names.Strings[I];
@@ -592,7 +597,7 @@ begin
   end;
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function PrepareInstallation: String;
 var
   Suffix, Waited: Integer;
   Token: String;
@@ -637,6 +642,13 @@ begin
     StageToken := GetDateTimeString('yyyymmddhhnnss', '-', ':') + '-' + IntToStr(Suffix);
   end;
   BackupRoot := ExpandConstant('{app}\backups\setup-') + StageToken;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := PrepareInstallation;
+  { /SUPPRESSMSGBOXES hides this page's error, so for an in-app update DeinitializeSetup says why. }
+  UpdateFailure := Result;
 end;
 
 procedure ActivateSource;
@@ -736,7 +748,7 @@ begin
   ReleaseInstallLock;
   { The in-app updater runs Setup silently, so say why the version did not change. }
   if RelaunchAfterSetup and (UpdateFailure <> '') then begin
-    if RestoreFailed then
+    if RestoreFailed or (not FileExists(ExpandConstant('{app}\runtime\CryptoPilotRuntime.exe'))) then
       Advice := 'Run the CryptoPilot Setup from the releases page again to repair the installation.'
     else if KeepNewRuntime then
       Advice := 'CryptoPilot finishes the update when it opens.'

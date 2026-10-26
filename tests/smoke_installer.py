@@ -258,6 +258,14 @@ def main():
         prove('rolled-forward-D')
     finally:
         stop(child)
+    # A repair with the same release leaves the same record in its backup as in place. If deleting the
+    # previous runtime there was cut off, what is left is not the runtime to go back: the swap finished.
+    leftover = installation/'backups/setup-20990101000004'
+    shutil.copytree(installation/'app',leftover/'app')
+    shutil.copy2(installation/'installation.json',leftover/'installation.json')
+    for name in ('runtime','maintenance'):
+        (leftover/name).mkdir()
+        (leftover/name/'partly-deleted.marker').write_text('partial')
     # In-app update path: Setup starts while the app runs and waits for it to exit.
     child = start()
     waiting = subprocess.Popen([str(setup),'/TESTINSTALL=1','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
@@ -270,6 +278,7 @@ def main():
         stop(child)
     assert waiting.wait(timeout=180)==0, f'Waiting Setup failed; {scratch}/waiting-setup.log'
     assert_data()
+    assert 'Put back the runtime saved' not in (scratch/'waiting-setup.log').read_text(errors='replace')
     # A successful Setup keeps no saved runtime and no staged source behind.
     assert not list((installation/'backups').glob('setup-*/runtime'))
     assert not list((installation/'backups').glob('setup-*/maintenance'))
@@ -297,6 +306,7 @@ def main():
     stage.mkdir()
     os.replace(unfinished/'app',stage/'app')
     os.replace(unfinished/'installation.json',stage/'installation.json')
+    (unfinished/'is-0A1B2C3D4E.tmp').write_bytes(b'')  # Inno's temp file when it is killed mid-copy.
     retried = run([setup,'/TESTINSTALL=1','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOICONS','/TASKS=',
                    f'/DIR={unfinished}',f'/LOG={scratch}/retried-setup.log'])
     assert retried.returncode==0, f'Setup refused to retry {retried.returncode}; {scratch}/retried-setup.log'
@@ -313,6 +323,7 @@ def main():
                        'app start also finishes such a swap',
                        'a runtime set aside by a Setup that stopped goes back before the next swap',
                        'a saved runtime of a replaced source is removed',
+                       'a partly deleted runtime after a same-release repair is not put back',
                        'portfolio/settings survive update and upgrade',
                        'Setup started by the in-app updater waits for the app to exit','uninstall preserves source/backups/data',
                        'Setup runs again where a first install did not finish'],

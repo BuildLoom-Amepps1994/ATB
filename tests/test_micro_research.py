@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from research import micro_fixtures as fx      # noqa: E402
 from research import micro_report             # noqa: E402
 from research import micro_research as r      # noqa: E402
+import micro_economics as econ                 # noqa: E402
+import money                                   # noqa: E402
 
 MINUTES = 600
 
@@ -161,6 +163,52 @@ def test_a_profit_exit_fills_where_it_first_fires_not_at_the_bar_high():
     assert spiked.target_net <= spiked.realized < Decimal('0.08'), spiked.realized
 
 
+def test_a_protection_band_crossed_below_a_high_in_the_hold_gap_fills_at_the_band_not_the_close():
+    # Protection fires for a net after uncertainty in (0, 0.25 target] once the peak reached 0.75 target, and the
+    # target fires from 1 x target: between the two is a gap where the engine holds. A bar that rises through the
+    # band into the gap crossed the band on the way up, so a ticking engine sold near its bottom.
+    base = 2500.0
+
+    def series_for(changes):
+        rows = [[60000 * (29_000_000 + i), base, base * 1.00002, base * 0.99998, base, 1e3] for i in range(400)]
+        for i, bar in changes.items():
+            rows[i][1:5] = bar
+        return fx.SeriesMarket.from_rows('ETH/USDT', rows, market=fx.mexc_market('ETH/USDT', amount_step=0.000001))
+
+    def run(series):
+        rows_1m, cache = prepared(series)
+        out = r.run(series, cache, rows_1m, start=120, end=len(rows_1m), scenario=r.SCENARIOS['baseline'],
+                    budget=Decimal('25'), policy='always')
+        return out['cycles'][0]
+
+    flat = series_for({})
+    held = run(flat)
+    rules = r.rules_for(flat, 0)
+    cost = r.scenario_cost(rules, r.SCENARIOS['baseline'])
+    uncertainty_bps = money.parse(max(r.params().uncertainty_floor_bps, r.SCENARIOS['baseline'].latency_bps))
+
+    def estimate(price):
+        snapshot = r.book(flat, price, 60000, r.SCENARIOS['baseline'], 1)
+        return econ.estimate_exit(owned_base=held.owned, basis_quote=held.basis, rules=rules, book=snapshot,
+                                  cost=cost, target_net=held.target_net, uncertainty_bps=uncertainty_bps)
+
+    def price_for(net):
+        low, high = base * 0.9, base * 1.1
+        for _ in range(80):
+            middle = (low + high) / 2
+            low, high = (middle, high) if estimate(middle).est_net_pnl < net else (low, middle)
+        return high
+    target, uncertainty = held.target_net, estimate(base).uncertainty
+    band_top = price_for(uncertainty + target / 4)
+    gap_high = (band_top + price_for(uncertainty + target)) / 2
+    peak_bar = (base, price_for(target * Decimal('0.9')), base * 0.99999, base)    # a hold that arms protection
+    e = held.entry_bar
+    for close in (band_top - 0.01, base):              # closes inside the band, or back where it started
+        cycle = run(series_for({e: peak_bar, e + 1: (base, gap_high, base * 0.99999, close)}))
+        assert (cycle.exit_bar, cycle.trigger) == (e + 1, 'profit_protection')
+        assert uncertainty < cycle.realized < uncertainty + target / 16, cycle.realized    # the band's bottom
+
+
 def test_first_profit_exit_finds_the_lowest_firing_price_inside_a_narrow_band():
     seen = []
 
@@ -170,6 +218,7 @@ def test_first_profit_exit_finds_the_lowest_firing_price_inside_a_narrow_band():
     trigger, price = r.first_profit_exit(fires, 100.0, 102.0)
     assert trigger == 'band' and 100.40 <= price < 100.401
     assert r.first_profit_exit(lambda at: ('at low', at), 100.0, 102.0) == ('at low', 100.0)
+    assert r.first_profit_exit(lambda at: None, 100.0, 102.0) is None
 
 
 def test_stress_fees_multiply_the_fee_actually_modeled_in_decimals():

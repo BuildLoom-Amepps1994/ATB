@@ -1,5 +1,6 @@
 """Exact money parsing (brief test 11) and venue-rule normalization."""
 import sys
+import threading
 from decimal import Decimal
 from pathlib import Path
 
@@ -156,6 +157,26 @@ def test_step_rounding_never_crosses_its_input(value, step, down, up):
     value, step = money.parse(value), money.parse(step)
     assert money.q_down(value, step) == D(down) and money.q_down(value, step) <= value
     assert money.q_up(value, step) == D(up) and money.q_up(value, step) >= value
+
+
+@pytest.mark.parametrize('rounding, value', [
+    ('q_up', '100000.00000000000000000000000000001'),
+    ('q_down', '99999.999999999999999999999999999998'),
+])
+def test_a_step_finer_than_34_digits_of_the_value_is_refused_not_looped_on(rounding, value):
+    # 35 digits parse, and 3e-30 is a step venue_rules accepts, but adding it does not move a 34-digit result.
+    outcome = []
+
+    def attempt():
+        try:
+            outcome.append(getattr(money, rounding)(money.parse(value), money.parse('3e-30')))
+        except money.MoneyError as exc:
+            outcome.append(exc)
+    worker = threading.Thread(target=attempt, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), f'{rounding} is still looping'
+    assert isinstance(outcome[0], money.MoneyError) and 'too fine' in str(outcome[0])
 
 
 def test_rules_with_an_unknowable_age_are_stale():

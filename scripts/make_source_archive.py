@@ -48,8 +48,8 @@ FIXED_TIME = (2026, 1, 1, 0, 0, 0)
 FORBIDDEN_NAMES = re.compile(r'''(
       \.(sqlite3?|db)(-wal|-shm|-journal)?       # databases and their write-ahead and journal files
     | \.(pem|key|p12|pfx|kdbx)
-    | (^|/)\.env(\.[^/]*)?                     # .env, .env.local, .env.production
-    | (^|/)settings(\.[^/]*)?\.json            # settings.json, settings.last-good.json, settings.backup.json
+    | \.env(\.[^/]*)?                          # .env, .env.local, prod.env, secrets.env.example
+    | settings(\.[^/]*)?\.json                 # settings.json, settings.last-good.json, app_settings.json
     | \.log(\.\d+)?
     | instance\.lock | id_rsa | id_ed25519 | id_ecdsa
 )$''', re.IGNORECASE | re.VERBOSE)
@@ -158,6 +158,7 @@ def build(out_dir: Path, label: str, root: Path = ROOT) -> dict:
         for name, content in entries:
             info = zipfile.ZipInfo(f'{label}/{name}', date_time=FIXED_TIME)
             info.compress_type = zipfile.ZIP_STORED
+            info.create_system = 3          # ZipInfo picks 0 on Windows and 3 elsewhere; fix it so the hash matches
             info.external_attr = 0o644 << 16
             bundle.writestr(info, content)
     try:

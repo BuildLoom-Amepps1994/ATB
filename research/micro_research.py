@@ -22,9 +22,11 @@ Execution model (fixed before any result was seen; see ``PROTOCOL``):
   pessimistic order: at the bar's low (where only loss, time and regime exits
   may act), then at its high (where profit exits may act), then at its close.
   A bar that touched both a stop and a target is a stop. A profit exit that
-  fires at the high is filled at the LOWEST price in the bar's range at which
-  it fires (a ticking engine sells at the first such price on the way up),
-  never at the high itself.
+  fires anywhere on the way from the low to the high is filled at the LOWEST
+  price in that range at which it fires (a ticking engine sells at the first
+  such price on the way up), never at the high itself. The protection band
+  lies below a hold gap, so the range is searched whenever the high is in
+  profit, not only when the high itself fires.
 * Market orders only, taker fees on both legs (the larger of the configured
   rate and the public schedule), billed in the quote asset. There is no maker
   simulation, so nothing fills because a price was touched.
@@ -105,7 +107,9 @@ PROTOCOL = {
     'warmup_bars_1m': 120,
     'decision': 'every completed 1m bar; execution at the next bar open book',
     'exit_path': 'low (loss, time and regime exits), then high (profit exits), then close of each held bar',
-    'profit_exit_fill': 'the lowest price in the bar range at which the profit exit fires, never the high',
+    'profit_exit_fill': 'the lowest price in the bar range at which a profit exit fires, never the high; the '
+                        'range is searched whenever the high is in profit, since the protection band lies below a '
+                        'hold gap',
     'stress_fee': 'the multiple applies to the modeled fee, max(configured, public taker), in decimals',
     'open_at_end': 'counted at its executable estimate in net_marked, which the verdict reads',
     'min_split_bars': 60,
@@ -314,21 +318,26 @@ def run(series: fx.SeriesMarket, cache: list, rows_1m: list, *, start: int, end:
                                               target_net=open_cycle.target_net, stop_net=open_cycle.stop_net,
                                               peak_est_net=peak, opened_wall=open_cycle.entry_bar * 60.0,
                                               max_hold_s=p.max_hold_s, regime=regime, now=(i + 1) * 60.0)
-                return verdict, snapshot
+                return verdict, snapshot, estimate
 
             for label, price in (('low', rows_1m[i][3]), ('high', rows_1m[i][2]), ('close', rows_1m[i][4])):
                 peak_before = open_cycle.peak
-                verdict, snapshot = assess(price, peak_before)
-                if verdict.new_peak is not None and (open_cycle.peak is None or verdict.new_peak > open_cycle.peak):
-                    open_cycle.peak = verdict.new_peak
-                profit_trigger = verdict.trigger in PROFIT_TRIGGERS
-                if label == 'high' and profit_trigger:
+                verdict, snapshot, estimate = assess(price, peak_before)
+                if label == 'high' and (verdict.trigger in PROFIT_TRIGGERS
+                                        or (verdict.action != 'exit' and _in_profit(estimate))):
                     # The engine sells at the first price on the way up where a profit exit fires; the high is only
-                    # an upper bound, so fill at the lowest such price in the bar's range.
+                    # an upper bound, so fill at the lowest such price in the bar's range. The protection band lies
+                    # below a hold gap, so a high in the gap does not fire although the band was crossed on the way
+                    # up: search whenever the high is in profit, the least any profit exit needs.
                     def fires(at, peak=peak_before):
                         found = assess(at, peak)
                         return found if found[0].trigger in PROFIT_TRIGGERS else None
-                    verdict, snapshot = first_profit_exit(fires, rows_1m[i][3], price)
+                    found = first_profit_exit(fires, rows_1m[i][3], price)
+                    if found is not None:
+                        verdict, snapshot, _ = found
+                if verdict.new_peak is not None and (open_cycle.peak is None or verdict.new_peak > open_cycle.peak):
+                    open_cycle.peak = verdict.new_peak
+                profit_trigger = verdict.trigger in PROFIT_TRIGGERS
                 if verdict.action == 'exit' and (label != 'low' or not profit_trigger):
                     _sell(open_cycle, snapshot, rules, cost, verdict.trigger, i)
                     cash = money.add(cash, open_cycle.net_out)
@@ -397,13 +406,18 @@ def run(series: fx.SeriesMarket, cache: list, rows_1m: list, *, start: int, end:
 PROFIT_TRIGGERS = ('take_profit', 'profit_protection')
 
 
+def _in_profit(estimate) -> bool:
+    """Whether the estimate clears its uncertainty: both profit exits need that, and it only falls with price."""
+    return estimate.est_net_pnl is not None and money.sub(estimate.est_net_pnl, estimate.uncertainty) > money.ZERO
+
+
 def first_profit_exit(fires, low: float, high: float, *, step_bps: float = 2.0, refine: int = 12):
-    """The (verdict, book) at the lowest price in [low, high] where ``fires(price)`` returns one.
+    """What ``fires`` returns at the lowest price in [low, high] where it returns anything, or None.
 
     The protection band can be a few basis points wide, so the range is walked
     in steps of at most ``step_bps`` before the last step is halved ``refine``
     times; the price found is never above where the exit first fires by more
-    than the last half-step. ``fires(high)`` must return a result.
+    than the last half-step.
     """
     found = fires(low)
     if found is not None:
@@ -424,7 +438,7 @@ def first_profit_exit(fires, low: float, high: float, *, step_bps: float = 2.0, 
                     below = middle
             return found
         below = price
-    raise ValueError('first_profit_exit: no profit exit fires at the high')
+    return None
 
 
 def _buy(symbol, sizing, snapshot, cost, bar, target_net, stop_net, candidate, *, carry_base=money.ZERO,

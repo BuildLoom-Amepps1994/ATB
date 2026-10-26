@@ -103,14 +103,23 @@ _QUOTIENT = Context(prec=200, rounding=ROUND_HALF_EVEN, Emax=999, Emin=-999,
                     traps=[InvalidOperation, DivisionByZero, Overflow])
 
 
+# One step corrects a product that rounded across the value at 34 digits. A step finer than the value's last
+# 34-digit place cannot move it at all, so the correction is bounded and such a pair is refused, never looped on.
+_MAX_CORRECTIONS = 2
+
+
 def q_down(value: Decimal, step: Decimal) -> Decimal:
     """Largest multiple of ``step`` that is not above ``value``."""
     step = _check_step(step)
     units = _QUOTIENT.divide(value, step).to_integral_value(rounding=ROUND_FLOOR)
     result = CONTEXT.multiply(units, step)
-    while result > value:          # the product rounded up at 34 digits: never return more than was given
-        result = CONTEXT.subtract(result, step)
-    return result
+    for _ in range(_MAX_CORRECTIONS):
+        if result <= value:
+            return result
+        result = CONTEXT.subtract(result, step)      # the product rounded up: never return more than was given
+    if result <= value:
+        return result
+    raise MoneyError('quantization step too fine for this value at 34 digits')
 
 
 def q_up(value: Decimal, step: Decimal) -> Decimal:
@@ -118,9 +127,13 @@ def q_up(value: Decimal, step: Decimal) -> Decimal:
     step = _check_step(step)
     units = _QUOTIENT.divide(value, step).to_integral_value(rounding=ROUND_CEILING)
     result = CONTEXT.multiply(units, step)
-    while result < value:          # the product rounded down at 34 digits: never return less than was asked
-        result = CONTEXT.add(result, step)
-    return result
+    for _ in range(_MAX_CORRECTIONS):
+        if result >= value:
+            return result
+        result = CONTEXT.add(result, step)           # the product rounded down: never return less than was asked
+    if result >= value:
+        return result
+    raise MoneyError('quantization step too fine for this value at 34 digits')
 
 
 def add(*values: Decimal) -> Decimal:

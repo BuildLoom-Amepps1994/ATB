@@ -70,6 +70,15 @@ def test_archive_holds_exactly_the_committed_files_and_is_deterministic(repo, tm
     assert manifest['file_count'] == 2
 
 
+def test_windows_and_linux_build_the_same_archive(repo, tmp_path, monkeypatch):
+    linux = archive.build(tmp_path / 'linux', 'src', root=repo)
+    monkeypatch.setattr(sys, 'platform', 'win32')              # zipfile.ZipInfo reads it to pick create_system
+    windows = archive.build(tmp_path / 'windows', 'src', root=repo)
+    assert windows['archive_sha256'] == linux['archive_sha256']
+    with zipfile.ZipFile(tmp_path / 'windows' / 'src.zip') as bundle:
+        assert {info.create_system for info in bundle.infolist()} == {3}
+
+
 def test_uncommitted_changes_are_refused(repo, tmp_path):
     (repo / 'app.py').write_bytes(b'print("edited")\n')
     with pytest.raises(archive.ArchiveRefused, match='Commit or discard'):
@@ -126,6 +135,9 @@ def test_a_submodule_is_refused(repo, tmp_path):
     ('keys.pem', b'x'),
     ('.env', b'x'),
     ('deploy/.env.local', b'x'),
+    ('deploy/prod.env', b'MEXC_API_KEY=short-but-real\n'),      # under 24 characters: only the name catches it
+    ('config/app_settings.json', b'{"pass' + b'word": "Tr0ub4dor&3"}'),
+    ('user-settings.json', b'{}'),
     ('logs/cryptopilot.log', b'started'),
     ('id_ed25519', b'x'),
     ('data/cache.bin', archive.SQLITE_MAGIC + b'\x10\x00'),

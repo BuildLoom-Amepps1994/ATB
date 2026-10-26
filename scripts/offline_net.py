@@ -1,7 +1,8 @@
 """Refuse remote networking in this process: used by the offline tests and the fixture soak.
 
 ``install()`` replaces the socket entry points that can reach another host
-(connect, connect_ex, sendto, sendmsg, the name and address lookups, and on
+(connect, connect_ex, sendto, sendmsg, the name and address lookups including
+``getnameinfo``'s reverse lookup, and on
 Windows the proactor connect and sendto that asyncio uses in place of
 ``socket.connect``) with versions that allow only loopback addresses and local
 sockets. Anything else raises ``RemoteNetworkRefused`` before a packet leaves.
@@ -77,6 +78,7 @@ def install() -> None:
     real_sendmsg = getattr(socket.socket, 'sendmsg', None)        # not on Windows
     real_getaddrinfo, real_gethostbyname = socket.getaddrinfo, socket.gethostbyname
     real_gethostbyname_ex, real_gethostbyaddr = socket.gethostbyname_ex, socket.gethostbyaddr
+    real_getnameinfo = socket.getnameinfo
 
     def connect(self, address):
         if not allowed(address):
@@ -118,12 +120,18 @@ def install() -> None:
             _refuse('an address lookup for', host)
         return real_gethostbyaddr(host)
 
+    def getnameinfo(sockaddr, flags):
+        if not (flags & socket.NI_NUMERICHOST) and not allowed(sockaddr):
+            _refuse('an address lookup for', sockaddr)       # asks the resolver for the address's name
+        return real_getnameinfo(sockaddr, flags)
+
     socket.socket.connect, socket.socket.connect_ex = connect, connect_ex
     socket.socket.sendto = sendto
     if real_sendmsg is not None:
         socket.socket.sendmsg = sendmsg
     socket.getaddrinfo, socket.gethostbyname = getaddrinfo, gethostbyname
     socket.gethostbyname_ex, socket.gethostbyaddr = gethostbyname_ex, gethostbyaddr
+    socket.getnameinfo = getnameinfo
 
     if sys.platform == 'win32':
         # The proactor event loop connects through ConnectEx, not socket.connect, and an IP

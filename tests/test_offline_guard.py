@@ -93,6 +93,14 @@ def test_name_and_address_lookups_are_refused_but_localhost_resolves():
             lookup('api.mexc.com')
     with pytest.raises(offline_net.RemoteNetworkRefused):
         socket.gethostbyaddr(REMOTE[0])
+    with pytest.raises(offline_net.RemoteNetworkRefused):
+        socket.getnameinfo(REMOTE, 0)                           # a reverse lookup, sent to the resolver
+
+    async def reverse_lookup():
+        return await asyncio.get_running_loop().getnameinfo(REMOTE)
+    with pytest.raises(offline_net.RemoteNetworkRefused):
+        asyncio.run(reverse_lookup())
+    assert socket.getnameinfo(REMOTE, socket.NI_NUMERICHOST | socket.NI_NUMERICSERV) == ('203.0.113.10', '443')
     assert socket.gethostbyname('localhost').startswith('127.')
 
 

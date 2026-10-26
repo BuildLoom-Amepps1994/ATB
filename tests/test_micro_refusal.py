@@ -161,6 +161,17 @@ def journal_count():
     return storage.rows('SELECT COUNT(*) AS n FROM order_journal')[0]['n']
 
 
+def test_the_settings_bound_refuses_a_micro_budget_above_25_and_the_manager_caps_one_that_bypassed_it(engine):
+    base = {'time_horizon': 'micro', 'max_order_notional_usdt': 1000, 'max_asset_notional_usdt': 1000}
+    assert storage.validate_settings({**base, 'micro_budget_usdt': 25})['micro_budget_usdt'] == 25
+    for value in (25.01, 26, 1e9, float('inf'), float('nan'), '30', True):
+        with pytest.raises(storage.ConfigValidationError):
+            storage.validate_settings({**base, 'micro_budget_usdt': value})
+    engine.cfg = {**engine.cfg, 'micro_budget_usdt': 100.0}       # a value that never went through validation
+    assert str(engine.micro.budget_cap()) == '25'
+    assert str(engine.micro.allocation()) == str(25 * int(engine.cfg['micro_max_cycles']))
+
+
 def test_the_final_submit_refuses_a_live_micro_order_even_with_a_valid_looking_authorization(engine):
     client = Recorder()
     engine.mode, engine.running = 'live', True

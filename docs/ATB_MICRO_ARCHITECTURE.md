@@ -43,7 +43,7 @@ explains how they fit.
 | `venue_rules.py` | CCXT market → `VenueRules`: steps, minimums by order type (MEXC's market-order minimum is `info.quoteAmountPrecisionMarket`; CCXT normalizes only the limit minimum), status, side permission, public fee schedule, staleness. Missing values stay unknown and are listed as issues. | yes |
 | `micro_policy.py` | The single PAPER-only rule: `live_refusal(mode, horizon=, kind=)`. Reads no environment, setting, database or flag, so nothing can switch it off. | yes |
 | `micro_book.py` | Validated order-book snapshots from REST depth or ticker top of book: sorted, uncrossed, finite, bounded levels; venue sequence and timestamps kept separate from local generation; out-of-order and clock-rollback detection; invalidation on reconnect. | yes (tracker holds state) |
-| `micro_economics.py` | The one sizing, cost and accounting component: cost model, ask/bid walks, `size_entry` (12 named checks), `estimate_exit`, `account_entry`, `realize_exit`, break-even algebra and the sensitivity table. | yes |
+| `micro_economics.py` | The one sizing, cost and accounting component: cost model, ask/bid walks, `size_entry` (12 numbered steps, each recorded as one or more named checks), `estimate_exit`, `account_entry`, `realize_exit`, break-even algebra and the sensitivity table. | yes |
 | `micro_strategy.py` | Completed-bar features, regime classification, two candidate setups (momentum pullback, range reversion), the economic feasibility gate and the exit policy. Every decision is a record with all checks. | yes |
 | `micro_venue.py` | Durable, depth-aware paper counterparty (table `paper_venue_orders`): market orders walk the captured book with the latency margin, taker fees, venue steps and minimums, partial fills and cancels, idempotent client order ids, failure injection for tests. | no (SQLite) |
 | `micro.py` | `MicroManager`: data cadence, decisions, reservations, the cycle state machine (`micro_cycles`, `micro_cycle_events`), booking, latches, recovery, status. | no |
@@ -206,7 +206,7 @@ While running, three checks keep the ledger and the venue record in step:
   cycles keep overlapping. Without a holding the refresh keeps its retries.
 * Each book also refreshes the engine's marks, which the risk gate's
   freshness checks read. A closed cycle's residual that no open cycle reads is
-  re-quoted every third of `data_max_age_seconds` on a schedule of its own, so
+  re-quoted every `min(30 s, data_max_age_seconds / 3)` (30 s at the default 120 s) on a schedule of its own, so
   the 30 s idle cadence of a pair that is still selected cannot delay it. The
   legacy monitor leaves micro-owned pairs alone, and a stale mark would make
   the gate refuse every entry.

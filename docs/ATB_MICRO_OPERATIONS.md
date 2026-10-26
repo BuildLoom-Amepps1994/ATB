@@ -22,7 +22,7 @@ mode.
    trade in *Pairs to monitor*. Only these pairs are entered; automatic
    discovery never adds a micro pair.
 3. **Choose the strategy.** Set *Strategy* to *Micro · PAPER only · 25 USDT
-   all-in cycles*. The *Micro cycles* settings open below it. The defaults are
+   all-in cycles*. The *Micro cycles · PAPER only* settings are in the collapsible section below the fields; open it to review them (it opens by itself once Micro is saved). The defaults are
    the reviewed profile; change them only deliberately (see *Settings*).
 4. **Save settings**, then **Start bot**. That is the only action a routine
    session needs. From then on the bot, for every selected pair, keeps
@@ -48,7 +48,7 @@ mode.
 | The budget is below the pair's venue minimum | Never trades that pair at a larger size. The pair shows `BUDGET_BELOW_VENUE_MINIMUM` and the smallest workable budget. |
 | A buy would leave unsellable dust | Not bought (`EXIT_BELOW_VENUE_MINIMUM`). |
 | Profit target reached after all estimated costs | Sells. A gross gain below costs is not a profit exit. |
-| Estimated loss reaches the loss cap, the hold time runs out, or the market turns volatile or down while the cycle is under water | Sells without needing a profit, an entry signal or buy-side depth. |
+| Estimated loss reaches the cycle's stop (the round-trip cost carried at entry plus the ATR move, never above the loss cap), the hold time runs out, or the market turns volatile or down while the cycle is under water | Sells without needing a profit, an entry signal or buy-side depth. |
 | A sell leaves a remainder below the venue minimum | The cycle closes and the remainder stays recorded as residual (never deleted); the next cycle on that pair carries it. |
 | A cycle closes | Cooldown for the pair (longer after consecutive losses), then a new cycle needs a newer completed bar than the exit, so the same signal can never be bought twice. |
 | A pair is removed from the list while held | Its exits keep running until it is sold; no new entry. |
@@ -67,7 +67,7 @@ mode.
 | **Restart while an order was in flight** | At start-up the bot stays STOPPED in PAPER mode, releases reservations that provably never left the computer, and marks every other unfinished cycle for review. | Apply each recovery as above, then Start. |
 | **Late fill on a held cycle** (the paper venue reports more filled than was booked) | The cycle goes to *Review required*; every new micro entry is blocked. | Stop, read the explanation, *Apply recovery…*: it books exactly the extra quantity, fee and cash. |
 | **Late fill on a closed cycle** (the venue reports more filled on an order of a cycle that already closed) | Recorded durably on that cycle; every new micro entry is blocked, across restarts, until it is booked. It does not lift by itself when the record ages. | Stop, *Apply recovery…*. It books exactly the extra quantity, fee and cash, corrects the closed cycle's totals, and a sellable holding that results is adopted by a new cycle (strategy *late fill recovery*) whose exits manage it. A late sale of more than the ledger holds is refused and stays blocked. |
-| **Venue record conflict** on a pair (an order no journal explains) | New entries on that pair wait (*REVIEW: Venue record conflict*); other pairs continue. | Read the conflict in the recovery list. An orphan order with no journal intent needs the developer (see the release-gates register). |
+| **Venue record conflict** on a pair (an order no journal explains) | New entries on that pair wait (*REVIEW: Venue record conflict*); other pairs continue. | Read the conflict in the pair's *Why waiting* column (it is also listed under `recovery` in `/api/micro`). An orphan order with no journal intent has no *Apply recovery…*; it needs the developer (register item 16 in `docs/ATB_MICRO_RELEASE_GATES.md`). |
 
 ## Data faults, sleep and going offline
 
@@ -90,7 +90,8 @@ mode.
   or *Exit all micro positions…* and stop first.
 * **The app closes or crashes.** Holdings stay recorded. At the next start the
   bot is STOPPED in PAPER mode; reservations that never left are released,
-  everything else waits for review (see above). Nothing is resent.
+  holdings resume their exits when you start, and an order that may have left
+  waits for review (see above). Nothing is resent.
 * **Clock changes.** Book ages use the monotonic clock; a wall-clock jump
   backwards invalidates every stored book until fresh ones arrive.
 
@@ -112,8 +113,8 @@ it stops at the end of the requested time (or on Ctrl+C).
    .\.venv\Scripts\python.exe scripts\micro_soak.py --data-dir D:\soak\micro-on --hours 24 --pairs BTC/USDT,ETH/USDT,SOL/USDT --streaming
    ```
 
-   Each run needs a new, empty folder; an existing or normal profile folder
-   is refused. Keep the PC awake.
+   Each run needs a new, empty folder; a folder that already holds files, or
+   one that overlaps the normal profile folder, is refused. Keep the PC awake.
 4. Share `soak\summary.json` (and, if asked, `soak\samples.jsonl`) from each
    folder. They hold timings, cycle counts, waiting reasons and simulated
    results; no key and no account data.

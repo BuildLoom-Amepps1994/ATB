@@ -5,7 +5,7 @@ an actual MEXC account fee, a recommended target, or a predicted opportunity.
 The account's own fee rate needs a signed endpoint that this work never called.
 
 All numbers below come from `micro_economics.py` (the same code the engine
-uses) and are pinned by `tests/test_micro_economics.py`.
+uses). `tests/test_micro_economics.py` pins the headline break-even and target ratios and checks how the other tables behave (budget independence, the minimum fee, rounding and depth); their individual figures are not pinned.
 
 ## Units and names
 
@@ -29,7 +29,7 @@ places that a non-zero amount never prints as zero.
 |---|---|---|
 | **Venue minimum feasible debit** | Smallest all-in debit that passes every venue rule (cost minimum by order type, amount step, exit minimum, depth) for this pair now. Found by searching the same sizing plan. | No. Display only. A pair whose minimum is above the budget is ineligible with `BUDGET_BELOW_VENUE_MINIMUM`; it is never upsized. |
 | **Strategy target budget** | `min(configured micro budget, 25)`, then reduced by available paper cash and the remaining allocation. | Yes, but only downward. |
-| **Absolute maximum all-in debit** | `MICRO_MAX_ALL_IN_USDT = 25`, a code constant, checked again against a private literal. No setting, environment variable or research run can raise it. | It bounds everything. The risk gate and the paper venue re-check it. |
+| **Absolute maximum all-in debit** | `MICRO_MAX_ALL_IN_USDT = 25`, a code constant, checked again against a private literal. No setting, environment variable or research run can raise it. | It bounds everything. The risk gate and `account_entry` re-check it; the paper venue does not (it enforces only the venue's own rules and the paper balance). |
 
 The legacy 12 USDT floors (`risk.MIN_ORDER_USDT`, the settings bound, the
 manual ticket and the legacy entry pass) still apply to the legacy strategies.
@@ -94,7 +94,7 @@ required exit-bid improvement over the entry ask.
 | 0.2% | 0.2% | 0.8032% | 1.0048% | -0.1992 |
 
 The same table for 10, 15 and 50 USDT has identical percentages; only the last
-column scales. `research/micro_research.py` writes the full grid to its result
+column scales. `research/micro_research.py` writes a related grid (fees 0.05, 0.1 and 0.2 %, slippage 0, 0.03 and 0.2 %) to its result
 file, and `micro_economics.sensitivity()` reproduces it.
 
 ## What makes a small budget different: fixed costs, rounding and depth
@@ -202,11 +202,14 @@ book is available, the engine does not use it:
 - The latency and adverse-selection margin (default 3 bps per leg, setting `micro_latency_bps`) is applied
   once per leg, to every level of the walk.
 - The flat fallback slippage is used only when depth is unknown (a ticker top
-  of book with no quantity). Entries are refused in that case
+  of book, even one that carries quantities: those are kept for display only). Entries are refused in that case
   (`DEPTH_UNKNOWN`); exits may still be estimated, and the estimate is labeled
   `flat_fallback`.
 - When the visible bids cannot absorb the sellable quantity, the exit estimate
-  is **unknown**, not a number. The strategy cannot call that a profit.
+  is still a number, priced conservatively: the visible bids for what they
+  absorb and the flat fallback from the worst visible bid for the rest,
+  labeled `flat_fallback` with `depth_exhausted` set. The strategy cannot call
+  that a profit; a safety exit can act on it.
 - Confirmed results use the actual fills and the fees the venue reported.
   Modeled slippage is never subtracted again from an observed fill.
 
@@ -259,15 +262,16 @@ showed that such a stop sits inside the cost and fires on the first exit check
 with the book unchanged.
 
 The economic gate also needs a market that moves enough: the required move
-(costs plus target plus margin, about 65 bps at the defaults) must fit within
+(costs plus target, about 58 bps at the defaults; the spread and the exit's
+uncertainty margin come on top for a take-profit) must fit within
 `0.6 x ATR x sqrt(hold minutes)`, which at a 30-minute hold means an ATR of at
-least about 20 bps. Together the two rules leave this window of 1-minute ATR:
+least about 18 bps. Together the two rules leave this window of 1-minute ATR:
 
 | Loss cap | Largest ATR the stop allows (40 bps entry cost) | Smallest ATR the economic gate allows | Window |
 |---|---|---|---|
-| 80 bps (0.20 USDT) | 20 bps | about 20 bps | essentially empty: the mode would never enter |
-| 120 bps (0.30 USDT), the default | 40 bps | about 20 bps | 20 to 40 bps |
-| 160 bps (0.40 USDT) | 60 bps | about 20 bps | 20 to 60 bps (1-minute volatility above 60 bps is refused anyway) |
+| 80 bps (0.20 USDT) | 20 bps | about 18 bps | about 18 to 20 bps: a sliver, so the mode would almost never enter |
+| 120 bps (0.30 USDT), the default | 40 bps | about 18 bps | 18 to 40 bps |
+| 160 bps (0.40 USDT) | 60 bps | about 18 bps | 18 to 60 bps (1-minute volatility above 60 bps is refused anyway) |
 
 The default was therefore raised from 80 to 120 bps, a loss of at most about
 0.30 USDT of a 25 USDT cycle on an orderly exit. A gap or an outage can lose

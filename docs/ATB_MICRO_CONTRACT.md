@@ -106,7 +106,7 @@ class BookTracker:
 
 A REST depth response is a complete snapshot, so REST has no gap concept;
 ordering uses the venue's `lastUpdateId`. A ticker stream is top of book only
-(`depth_known=False`). A stream reconnect calls `invalidate()` for its symbols.
+(`depth_known=False`). The tracker holds REST depth only (`MicroManager._fetch_book`); a ticker snapshot is built for each read and never accepted, so nothing calls `invalidate()` on a stream reconnect.
 
 `market_data.MarketData.order_book(symbol, limit=20)` (added by the
 integration step, not by the book module): `read('fetch_order_book', symbol,
@@ -336,7 +336,7 @@ order without filling twice).
 Fills: a market buy walks the asks spending `cost` (each level price raised by
 `adverse_bps`), a market sell walks the bids (lowered by `adverse_bps`); when
 depth runs out the remainder is canceled (`status 'canceled'`, `filled` <
-requested). Liquidity is always `taker`; the fee is `rules.taker_fee` (or the
+requested). Liquidity is always `taker`; the fee is the higher of `rules.taker_fee` and the (optional
 configured fee passed in params as `taker_fee`) and is charged in the quote
 asset unless the fee currency is `base` (buys: fee in base, reduces the coins
 delivered). Returned dicts are CCXT-shaped with float `filled`, `cost`,

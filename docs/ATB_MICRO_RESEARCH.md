@@ -50,7 +50,7 @@ superseded and are not evidence of anything.
 
 ## Data
 
-| Series | Data ID (SHA-256 of the 2,880 one-minute closes, first 16 hex) | Generator | Range of closes |
+| Series | Data ID (SHA-256 of `json.dumps` of the 2,880 one-minute closes rounded to 10 decimals, first 16 hex) | Generator | Range of closes |
 |---|---|---|---|
 | ETH/USDT | `045cdd861f887dfe` | `swings`: saw-tooth, 80 bps range, 18 bars up, 2 down, 4 bps zigzag | 2490.11 to 2511.00 |
 | ADA/USDT | `9ea060826947759c` | `oscillating`: sine, 70 bps amplitude, period 24, 3 bps noise, seed 11 | 0.49602 to 0.50391 |
@@ -62,14 +62,14 @@ Each series is 2,880 one-minute bars (two days) from the fixed epoch minute
 29,000,000, so a replay never depends on today's date. Books are modeled from
 the bars. Venue rules are MEXC-shaped with fine quantity steps, so rounding
 stays out of the fixtures; `docs/ATB_MICRO_ECONOMICS.md` shows what rounding
-costs at real steps. Real data: **NOT RUN**.
+costs at coarser, illustrative steps (not MEXC's, which come from the live catalogue). Real data: **NOT RUN**.
 
 ## Sample sizes and uncertainty
 
 * The only series with cycles is the ETH mechanics fixture: 76 development,
   21 validation and 21 holdout cycles at 25 USDT. These cycles are not
   independent samples. The fixture is periodic, so its validation and holdout
-  windows are the same price path and their results are identical by
+  windows repeat the same 20-bar saw-tooth (8 bars out of phase) and the strategy's results on them are identical by
   construction (register item 9 in `docs/ATB_MICRO_RELEASE_GATES.md`).
 * The per-cycle standard deviation on that fixture is about 0.000001 USDT:
   the path is deterministic, so a confidence interval would be meaningless and

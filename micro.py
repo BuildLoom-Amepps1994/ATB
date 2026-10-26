@@ -54,6 +54,10 @@ TERMINAL = ('CLOSED', 'ABANDONED')
 ENTRY_STATES = ('ENTRY_RESERVED', 'ENTRY_SUBMITTED', 'ENTRY_UNKNOWN')
 OWNING_STATES = ('HOLDING', 'EXIT_SUBMITTED', 'EXIT_UNKNOWN')
 BLOCKING_STATES = ('ENTRY_UNKNOWN', 'EXIT_UNKNOWN', 'REVIEW')
+# States that exist only while one operation runs; one seen when none runs was interrupted.
+TRANSIENT_STATES = ('ENTRY_RESERVED', 'ENTRY_SUBMITTED', 'EXIT_SUBMITTED')
+# Intent statuses that settled an earlier attempt: never the outcome of the current one.
+SETTLED_INTENT_STATUSES = ('accounted', 'reconciled')
 TRANSITIONS = {
     'ENTRY_RESERVED': {'ENTRY_SUBMITTED', 'ABANDONED', 'REVIEW'},
     'ENTRY_SUBMITTED': {'HOLDING', 'ABANDONED', 'ENTRY_UNKNOWN', 'REVIEW'},
@@ -79,10 +83,15 @@ ENTRY_BOOK_SECONDS = 3.0          # a flat pair's book is refreshed this often w
 IDLE_BOOK_SECONDS = 30.0          # otherwise only this often (eligibility display)
 EXIT_RETRY_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
 CATALOGUE_MAX_AGE_S = 2 * 3600.0
+# While a cycle is held the hourly catalogue refresh waits until the catalogue is this old, then makes one attempt:
+# a slow or failing reload must not hold the worker while an exit may be due.
+CATALOGUE_HOLD_REFRESH_S = CATALOGUE_MAX_AGE_S - 1800.0
 ENTRIES_PER_TICK = 1
 RECONCILE_WINDOW_S = 6 * 3600.0  # venue records this recent are compared with the journal before an entry
 LATE_FILL_CHECK_S = 30.0         # how often a partially filled holding re-reads its venue orders
 CONTEXT_RETRY_S = 5.0            # a candle frame that lacks the last closed bar is read again after this
+FLATTEN_WINDOW_S = 120.0         # an Exit-all request keeps trying this long within the run it was made in
+FLATTEN_STOP_WAIT_S = 10.0       # Exit all pressed while stopping waits this long for the worker to finish
 
 SCHEMA = (
     '''CREATE TABLE IF NOT EXISTS micro_cycles (
@@ -101,7 +110,7 @@ SCHEMA = (
         exit_proceeds_net TEXT NOT NULL DEFAULT '0', realized_net TEXT NOT NULL DEFAULT '0',
         realized_status TEXT, last_exit_trigger TEXT, closed_at TEXT, closed_wall REAL,
         residual_base TEXT NOT NULL DEFAULT '0', residual_basis TEXT NOT NULL DEFAULT '0',
-        last_reason TEXT, review_reason TEXT)''',
+        last_reason TEXT, review_reason TEXT, late_fill_reason TEXT)''',
     # One open cycle per pair, and one cycle per opportunity, even across restarts.
     '''CREATE UNIQUE INDEX IF NOT EXISTS micro_one_open_cycle ON micro_cycles(exchange, mode, symbol)
         WHERE state NOT IN ('CLOSED', 'ABANDONED')''',
@@ -117,6 +126,9 @@ SCHEMA = (
 def ensure_schema(db) -> None:
     for statement in SCHEMA:
         db.execute(statement)
+    columns = {row[1] for row in db.execute('PRAGMA table_info(micro_cycles)').fetchall()}
+    if 'late_fill_reason' not in columns:      # a table created by an earlier build of this mode
+        db.execute('ALTER TABLE micro_cycles ADD COLUMN late_fill_reason TEXT')
 
 
 def _now_iso() -> str:
@@ -195,8 +207,12 @@ class MicroManager:
         self.last_tick = self.last_error = None
         self.tick_count = 0
         self._next_book: dict[str, float] = {}
-        self._flatten = threading.Event()
+        self._flatten_until = 0.0                    # monotonic deadline of a pending Exit-all request
+        self._flatten_tried: set[str] = set()        # cycles already given their first Exit-all attempt
         self._late_checked: dict[str, float] = {}
+        # The bar and gate state each pair's last entry decision was made on: an idle pair keeps that decision
+        # between book reads only while both are unchanged.
+        self._decided_bar: dict[str, tuple] = {}
         self._conflicts: dict[str, tuple[float, list]] = {}
 
     # ------------------------------------------------------------ plumbing
@@ -375,16 +391,32 @@ class MicroManager:
             except Exception as exc:
                 explanations.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
                                      'explanation': f'recovery check failed: {type(exc).__name__}; review required'})
-        for orphan in self._orphans():
-            explanations.append(orphan)
+        orphans = self._orphans()
+        self._note_closed_late_fills(orphans)
+        explanations.extend(orphans)
+        try:
+            # A close committed just before a crash never ran its loss-limit check.
+            self._check_loss_limits()
+        except Exception as exc:
+            self._engage_latch(f'micro loss limits could not be checked at startup ({type(exc).__name__})')
         self.recovery = [item for item in explanations if item]
         if self.recovery:
             observability.event('micro.recovery', level='warning', items=self.recovery)
         return self.recovery
 
-    def _intent(self, cycle_id: str, side: str) -> dict | None:
-        found = storage.rows('SELECT * FROM order_journal WHERE decision_id=? AND side=? ORDER BY created_at DESC LIMIT 1',
-                             (cycle_id, side))
+    def _intent(self, cycle_id: str, side: str, *, attempt: bool = False) -> dict | None:
+        """The newest ``side`` intent of the cycle; with ``attempt``, only one that can belong to the current attempt.
+
+        Booking marks an intent accounted in the same transaction that moves
+        the cycle on, and a recovery settles one as reconciled the same way,
+        so an accounted or reconciled intent seen while a cycle is mid-order
+        belongs to an earlier, finished attempt (a partial exit before this
+        one). Treating it as the current outcome would book that sale twice.
+        """
+        settled = ' AND status NOT IN (%s)' % ','.join('?' * len(SETTLED_INTENT_STATUSES)) if attempt else ''
+        found = storage.rows(f'SELECT * FROM order_journal WHERE decision_id=? AND side=?{settled} '
+                             'ORDER BY created_at DESC, rowid DESC LIMIT 1',
+                             (cycle_id, side, *(SETTLED_INTENT_STATUSES if attempt else ())))
         return found[0] if found else None
 
     def _venue_record(self, intent: dict | None) -> dict | None:
@@ -399,13 +431,13 @@ class MicroManager:
         state, symbol = cycle['state'], cycle['symbol']
         base = {'cycle_id': cycle['cycle_id'], 'symbol': symbol, 'state': state}
         if state in ('ENTRY_RESERVED', 'ENTRY_SUBMITTED', 'ENTRY_UNKNOWN'):
-            intent = self._intent(cycle['cycle_id'], 'BUY')
+            intent = self._intent(cycle['cycle_id'], 'BUY', attempt=True)
             if intent is None or (intent['status'] == 'pending' and not intent.get('submitted_at')) \
                     or intent['status'] == 'rejected':
                 with storage.connection() as db:
                     if intent is not None and intent['status'] == 'pending':
-                        storage.update_order_intent(intent['intent_id'], 'rejected', note='never sent; released at startup', db=db)
-                    transition(db, cycle, 'ABANDONED', 'released at startup: no order left this computer',
+                        storage.update_order_intent(intent['intent_id'], 'rejected', note='never sent; released by the recovery check', db=db)
+                    transition(db, cycle, 'ABANDONED', 'released: no order left this computer',
                                reserved_quote='0')
                 return {**base, 'state': 'ABANDONED', 'explanation': 'The reservation was released: no order intent '
                         'had been sent, so nothing can have filled.'}
@@ -413,15 +445,15 @@ class MicroManager:
             explanation = self._describe_record('entry', intent, record)
             if state != 'ENTRY_UNKNOWN':
                 with storage.connection() as db:
-                    transition(db, cycle, 'ENTRY_UNKNOWN', 'restart during the entry order', review_reason=explanation)
+                    transition(db, cycle, 'ENTRY_UNKNOWN', 'interrupted during the entry order', review_reason=explanation)
             return {**base, 'state': 'ENTRY_UNKNOWN', 'explanation': explanation, 'action': 'apply_recovery'}
         if state in ('EXIT_SUBMITTED', 'EXIT_UNKNOWN'):
-            intent = self._intent(cycle['cycle_id'], 'SELL')
+            intent = self._intent(cycle['cycle_id'], 'SELL', attempt=True)
             if intent is None or (intent['status'] == 'pending' and not intent.get('submitted_at')) \
                     or intent['status'] == 'rejected':
                 with storage.connection() as db:
                     if intent is not None and intent['status'] == 'pending':
-                        storage.update_order_intent(intent['intent_id'], 'rejected', note='never sent; released at startup', db=db)
+                        storage.update_order_intent(intent['intent_id'], 'rejected', note='never sent; released by the recovery check', db=db)
                     transition(db, cycle, 'HOLDING', 'exit order never left; the holding is unchanged')
                 return {**base, 'state': 'HOLDING', 'explanation': 'The exit order was never sent; the holding is '
                         'unchanged and will be managed when the bot starts.'}
@@ -429,7 +461,7 @@ class MicroManager:
             explanation = self._describe_record('exit', intent, record)
             if state != 'EXIT_UNKNOWN':
                 with storage.connection() as db:
-                    transition(db, cycle, 'EXIT_UNKNOWN', 'restart during the exit order', review_reason=explanation)
+                    transition(db, cycle, 'EXIT_UNKNOWN', 'interrupted during the exit order', review_reason=explanation)
             return {**base, 'state': 'EXIT_UNKNOWN', 'explanation': explanation, 'action': 'apply_recovery'}
         if state == 'HOLDING':
             problem = self._ownership_problem(cycle)
@@ -441,6 +473,35 @@ class MicroManager:
         if state == 'REVIEW':
             return {**base, 'explanation': cycle.get('review_reason') or 'review required', 'action': 'apply_recovery'}
         return None
+
+    def settle_stranded(self) -> list[dict]:
+        """Explain and convert cycles left mid-operation, exactly as a restart would. Submits nothing.
+
+        ENTRY_RESERVED, ENTRY_SUBMITTED and EXIT_SUBMITTED exist only while
+        one entry or exit runs. Call this only when none runs (the start of a
+        tick, the worker's exit, a recovery while stopped): a cycle still in
+        one of them was interrupted by a failure between its durable writes,
+        and is released, returned to HOLDING, or moved to ENTRY_UNKNOWN or
+        EXIT_UNKNOWN, where it blocks new entries until it is recovered.
+        """
+        found = []
+        for cycle in open_cycles(self.engine.exchange_name, 'paper'):
+            if cycle['state'] not in TRANSIENT_STATES:
+                continue
+            try:
+                item = self._recover_cycle(cycle)
+            except Exception as exc:
+                item = {'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
+                        'explanation': f'recovery check failed: {type(exc).__name__}; review required'}
+            if item:
+                found.append(item)
+        if found:
+            known = {item.get('cycle_id') for item in found}
+            self.recovery = [item for item in self.recovery if item.get('cycle_id') not in known] + found
+            storage.audit('error', 'Micro: an entry or exit was interrupted by a failure; ' + '; '.join(
+                f'{item["symbol"]} now {item["state"]}' for item in found) + '.')
+            observability.event('micro.stranded_settled', level='error', items=found)
+        return found
 
     @staticmethod
     def _describe_record(leg: str, intent: dict, record: dict | None) -> str:
@@ -497,6 +558,40 @@ class MicroManager:
                                   'action': 'review'})
         return found
 
+    def _note_closed_late_fills(self, found: list[dict]) -> None:
+        """Make a late fill reported for a closed cycle durable: it blocks entries until recovered.
+
+        The reconciliation that reports it only looks back RECONCILE_WINDOW_S;
+        without this record the block would lift by itself once the venue
+        record aged out of that window, and the fill would never be booked.
+        """
+        for item in found:
+            cycle_id = item.get('cycle_id')
+            if not cycle_id:
+                continue
+            with storage.connection() as db:
+                row = db.execute('SELECT state, late_fill_reason FROM micro_cycles WHERE cycle_id=?',
+                                 (cycle_id,)).fetchone()
+                if row is None or row['state'] not in TERMINAL or row['late_fill_reason']:
+                    continue
+                reason = (item['explanation'] + ' The cycle had already closed. Stop the bot and apply the recovery '
+                          'to book it; new micro entries stay blocked until then.')
+                stamp = _now_iso()
+                db.execute('UPDATE micro_cycles SET late_fill_reason=?, updated_at=?, version=version+1 '
+                           'WHERE cycle_id=?', (reason[:600], stamp, cycle_id))
+                db.execute('INSERT INTO micro_cycle_events(cycle_id, at, from_state, to_state, reason, data) '
+                           'VALUES (?,?,?,?,?,?)', (cycle_id, stamp, row['state'], row['state'],
+                                                     'late fill reported after close',
+                                                     json.dumps({'order_id': item.get('order_id')})))
+            storage.audit('error', f'Micro {item.get("symbol")}: {reason}')
+            observability.event('micro.late_fill_after_close', level='error', cycle_id=cycle_id,
+                                order_id=item.get('order_id'))
+
+    def _closed_late_fills(self) -> list[dict]:
+        return storage.rows("SELECT * FROM micro_cycles WHERE exchange=? AND mode='paper' AND state IN "
+                            "('CLOSED','ABANDONED') AND late_fill_reason IS NOT NULL ORDER BY created_at",
+                            (self.engine.exchange_name,))
+
     def _late_fills(self, cycle: dict) -> list[tuple[dict, dict, Decimal]]:
         """(intent, venue view, extra base) for each accounted order of ``cycle`` the venue later filled further."""
         found = []
@@ -535,19 +630,41 @@ class MicroManager:
         observability.event('micro.late_fill_detected', level='error', cycle_id=cycle['cycle_id'], detail=detail)
         return cycle
 
-    def _book_late_fills(self, cycle: dict, late: list) -> None:
-        """Book only the extra quantity each order filled after it was booked, in one transaction."""
+    def _book_late_fills(self, cycle: dict, late: list) -> str:
+        """Book only the extra quantity each order filled after it was booked, in one transaction.
+
+        An open cycle in review owns the result and returns to HOLDING (or
+        closes). A closed cycle is never reopened: its totals and realized
+        result are corrected, the ledger position is updated, and a sellable
+        holding that results is adopted by a new HOLDING cycle so its exits
+        manage it (an unsellable one stays as a residual the next cycle on the
+        pair carries). Returns the outcome sentence.
+        """
         engine = self.engine
         symbol = cycle['symbol']
+        adopted = None
         with storage.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             fresh = dict(db.execute('SELECT * FROM micro_cycles WHERE cycle_id=?', (cycle['cycle_id'],)).fetchone())
-            owned = _dec(fresh['owned_base'], money.ZERO)
-            basis = _dec(fresh['basis_quote'], money.ZERO)
+            if fresh['version'] != cycle['version']:
+                raise CycleError('the cycle changed before the late fill could be booked')
+            closed = fresh['state'] in TERMINAL
+            position = db.execute('SELECT qty, cost FROM positions WHERE exchange=? AND mode=? AND symbol=?',
+                                  (engine.exchange_name, 'paper', symbol)).fetchone()
+            if closed:
+                # The ledger position is what is left of a closed cycle (its residual, if no later cycle carried it).
+                owned = money.parse(float(position['qty']), field='ledger quantity') if position else money.ZERO
+                basis = money.parse(float(position['cost']), field='ledger cost') if position else money.ZERO
+            else:
+                owned = _dec(fresh['owned_base'], money.ZERO)
+                basis = _dec(fresh['basis_quote'], money.ZERO)
             key = engine._key('paper_cash')
             cash = money.parse(float(db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()['value']),
                                field='paper cash')
             realized_total = _dec(fresh['realized_net'], money.ZERO)
+            totals = {name: _dec(fresh[name], money.ZERO) for name in (
+                'entry_filled_base', 'entry_gross', 'entry_fee_quote', 'entry_debit', 'closed_base', 'exit_gross',
+                'exit_fees', 'exit_proceeds_net')}
             for intent, view, _extra in late:
                 total = self._fill(view)
                 booked = db.execute('SELECT COALESCE(SUM(quantity),0) AS q, COALESCE(SUM(gross),0) AS g, '
@@ -556,6 +673,8 @@ class MicroManager:
                 quote_fee, base_fee, other = self._split_fee(symbol, total)
                 extra_gross = money.sub(total['gross'], money.parse(float(booked['g']), field='booked gross'))
                 extra_fee = money.sub(quote_fee or money.ZERO, money.parse(float(booked['f']), field='booked fee'))
+                extra_filled = money.sub(total['filled'], money.parse(float(intent['filled_quantity']),
+                                                                      field='booked fill'))
                 if intent['side'] == 'BUY':
                     extra_base = money.sub(money.sub(total['filled'], base_fee or money.ZERO),
                                            money.parse(float(booked['q']), field='booked quantity'))
@@ -565,6 +684,9 @@ class MicroManager:
                     if debit > cash:
                         raise CycleError('paper cash below the late fill debit')
                     cash, owned, basis = money.sub(cash, debit), money.add(owned, extra_base), money.add(basis, debit)
+                    for name, delta in (('entry_filled_base', extra_filled), ('entry_gross', extra_gross),
+                                        ('entry_fee_quote', extra_fee), ('entry_debit', debit)):
+                        totals[name] = money.add(totals[name], delta)
                     db.execute('INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,reason,'
                                'order_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                                (_now_iso(), engine.exchange_name, 'paper', symbol, 'BUY', float(total['average']),
@@ -574,12 +696,18 @@ class MicroManager:
                     extra_sold = money.sub(total['filled'], money.parse(float(booked['q']), field='booked quantity'))
                     if extra_sold <= 0 or extra_gross < 0 or extra_fee < 0:
                         raise CycleError('the late exit fill does not add a positive quantity')
+                    if extra_sold > owned:
+                        raise CycleError(f'the venue reports selling {money.text(extra_sold)} more than the ledger holds '
+                                         f'({money.text(owned)}); this cannot be booked automatically')
                     realized = econ.realize_exit(owned_base=owned, basis_quote=basis, sold_base=extra_sold,
                                                  gross_quote=extra_gross, quote_fee=extra_fee, base_fee=None,
                                                  other_fees={}, other_fee_value=None, fee_status=total['fee_status'])
                     cash = money.add(cash, realized.net_proceeds)
                     owned, basis = realized.residual_base, realized.residual_basis
                     realized_total = money.add(realized_total, realized.realized_net)
+                    for name, delta in (('closed_base', realized.closed_base), ('exit_gross', extra_gross),
+                                        ('exit_fees', extra_fee), ('exit_proceeds_net', realized.net_proceeds)):
+                        totals[name] = money.add(totals[name], delta)
                     db.execute('INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,realized,'
                                'reason,order_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                                (_now_iso(), engine.exchange_name, 'paper', symbol, 'SELL', float(total['average']),
@@ -600,10 +728,91 @@ class MicroManager:
             else:
                 db.execute('DELETE FROM positions WHERE exchange=? AND mode=? AND symbol=?',
                            (engine.exchange_name, 'paper', symbol))
-            transition(db, fresh, 'HOLDING' if owned > 0 else 'CLOSED', 'operator recovery: late fill booked',
-                       owned_base=money.text(owned), basis_quote=money.text(basis),
-                       realized_net=money.text(realized_total), review_reason=None,
-                       **({} if owned > 0 else {'closed_at': _now_iso(), 'closed_wall': time.time()}))
+            aggregates = {name: money.text(value) for name, value in totals.items()}
+            if not closed:
+                transition(db, fresh, 'HOLDING' if owned > 0 else 'CLOSED', 'operator recovery: late fill booked',
+                           owned_base=money.text(owned), basis_quote=money.text(basis),
+                           realized_net=money.text(realized_total), review_reason=None, **aggregates,
+                           **({} if owned > 0 else {'closed_at': _now_iso(), 'closed_wall': time.time()}))
+                outcome = 'late fill booked from the venue record'
+            else:
+                stamp = _now_iso()
+                assignments = ','.join(f'{name}=?' for name in aggregates)
+                db.execute(f'UPDATE micro_cycles SET {assignments}, realized_net=?, late_fill_reason=NULL, updated_at=?, '
+                           'version=version+1 WHERE cycle_id=?',
+                           (*aggregates.values(), money.text(realized_total), stamp, fresh['cycle_id']))
+                db.execute('INSERT INTO micro_cycle_events(cycle_id, at, from_state, to_state, reason, data) '
+                           'VALUES (?,?,?,?,?,?)', (fresh['cycle_id'], stamp, fresh['state'], fresh['state'],
+                                                     'operator recovery: late fill booked after close',
+                                                     json.dumps({'owned_after': money.text(owned),
+                                                                 'realized_net': money.text(realized_total)})))
+                outcome = 'late fill booked from the venue record; the closed cycle\'s totals were corrected'
+                # The ledger position is the one residual record of the pair: earlier records are superseded.
+                db.execute("UPDATE micro_cycles SET residual_base='0', residual_basis='0' WHERE exchange=? AND mode='paper' "
+                           "AND symbol=? AND state='CLOSED'", (engine.exchange_name, symbol))
+                if owned > 0 and self._sellable(symbol, owned, money.div(basis, owned)):
+                    adopted = self._adopt_holding(db, fresh, owned, basis)
+                    outcome += f'; a new cycle {adopted[:12]} now manages the {money.text(owned)} held'
+                elif owned > 0:
+                    db.execute('UPDATE micro_cycles SET residual_base=?, residual_basis=? WHERE cycle_id=?',
+                               (money.text(owned), money.text(basis), fresh['cycle_id']))
+                    outcome += f'; {money.text(owned)} is below the venue minimum and stays as a residual'
+        if not closed and owned <= 0:
+            self._after_close(cycle)
+        if closed:
+            self._after_close(cycle)     # a corrected realized result counts toward the loss limits
+        return outcome
+
+    def _sellable(self, symbol: str, quantity: Decimal, price: Decimal) -> bool:
+        rules = self.rules(symbol)
+        step = rules.amount_step
+        amount = money.q_down(quantity, step) if step is not None else quantity
+        minimum_cost = rules.market_min_cost()
+        return bool(amount > 0 and (rules.min_amount is None or amount >= rules.min_amount)
+                    and (minimum_cost is None or money.mul(amount, price) >= minimum_cost))
+
+    def _adopt_holding(self, db, closed: dict, owned: Decimal, basis: Decimal) -> str:
+        """A new HOLDING cycle for a holding a late entry fill created after its cycle closed (inside ``db``)."""
+        params = self.params()
+        cycle_id = 'cyc_' + uuid.uuid4().hex[:24]
+        stamp = _now_iso()
+        cap = self.budget_cap()
+        db.execute('INSERT INTO micro_cycles(cycle_id, exchange, mode, symbol, state, created_at, updated_at, strategy, '
+                   'decision_id, opportunity_key, budget_cap, reserved_quote, owned_base, basis_quote, entry_price, '
+                   'opened_at, opened_wall, target_net, stop_net, max_hold_s, realized_status, last_reason) '
+                   'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   (cycle_id, closed['exchange'], 'paper', closed['symbol'], 'HOLDING', stamp, stamp,
+                    'late_fill_recovery', closed['cycle_id'], f'{closed["symbol"]}|late_fill|{closed["cycle_id"]}|{stamp}',
+                    money.text(cap), '0', money.text(owned), money.text(basis), money.text(money.div(basis, owned)),
+                    stamp, time.time(), money.text(self.target_net()),
+                    money.text(money.mul(cap, money.bps(money.parse(params.max_loss_bps)))), float(params.max_hold_s),
+                    'confirmed', 'adopted a holding created by a late entry fill after its cycle closed'))
+        db.execute('INSERT INTO micro_cycle_events(cycle_id, at, from_state, to_state, reason, data) VALUES (?,?,?,?,?,?)',
+                   (cycle_id, stamp, None, 'HOLDING', 'adopted a late-fill holding',
+                    json.dumps({'from_cycle': closed['cycle_id'], 'owned': money.text(owned),
+                                'basis': money.text(basis)})))
+        return cycle_id
+
+    def _apply_closed_late_fill(self, cycle: dict) -> dict:
+        others = [c for c in open_cycles(self.engine.exchange_name, 'paper') if c['symbol'] == cycle['symbol']]
+        if others:
+            raise storage.ConfigValidationError(f'Exit or recover the open {cycle["symbol"]} cycle first; the late fill '
+                                                'changes the same ledger position.')
+        late = self._late_fills(cycle)
+        if not late:
+            with storage.connection() as db:
+                stamp = _now_iso()
+                db.execute('UPDATE micro_cycles SET late_fill_reason=NULL, updated_at=?, version=version+1 '
+                           'WHERE cycle_id=?', (stamp, cycle['cycle_id']))
+                db.execute('INSERT INTO micro_cycle_events(cycle_id, at, from_state, to_state, reason, data) '
+                           'VALUES (?,?,?,?,?,?)', (cycle['cycle_id'], stamp, cycle['state'], cycle['state'],
+                                                     'operator recovery: the venue no longer reports a late fill', None))
+            return {'cycle_id': cycle['cycle_id'], 'outcome': 'the venue no longer reports a late fill; nothing booked'}
+        try:
+            outcome = self._book_late_fills(cycle, late)
+        except CycleError as exc:
+            raise storage.ConfigValidationError(f'The late fill was not booked: {exc}.') from exc
+        return {'cycle_id': cycle['cycle_id'], 'outcome': outcome}
 
     def _symbol_conflicts(self, symbol: str, now: float, *, force: bool = False) -> list[dict]:
         """Recent venue orders on ``symbol`` the journal does not explain (re-read at most every 10 s)."""
@@ -612,6 +821,7 @@ class MicroManager:
         if not force and checked is not None and mono - checked[0] < 10.0:
             return checked[1]
         found = self._orphans(symbol, since_ms=int((now - RECONCILE_WINDOW_S) * 1000))
+        self._note_closed_late_fills(found)
         self._conflicts[symbol] = (mono, found)
         if found:
             known = {(item.get('order_id'), item.get('explanation')) for item in self.recovery}
@@ -641,6 +851,9 @@ class MicroManager:
             if cycle['state'] in BLOCKING_STATES:
                 blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
                                  'explanation': cycle.get('review_reason') or cycle.get('last_reason') or 'review required'})
+        for cycle in self._closed_late_fills():
+            blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
+                             'explanation': cycle['late_fill_reason'], 'late_fill': True})
         return blockers
 
     def apply_recovery(self, cycle_id: str, confirmation: str) -> dict:
@@ -658,9 +871,19 @@ class MicroManager:
             cycle = load_cycle(cycle_id)
             if cycle is None or cycle['exchange'] != engine.exchange_name or cycle['mode'] != 'paper':
                 raise storage.ConfigValidationError('Unknown micro cycle for this exchange.')
-            if cycle['state'] not in BLOCKING_STATES:
+            if cycle['state'] in TRANSIENT_STATES:
+                # Interrupted mid-operation while the bot ran: explain it as a restart would, then recover.
+                self.settle_stranded()
+                cycle = load_cycle(cycle_id)
+                if cycle['state'] not in BLOCKING_STATES:
+                    explanation = next((item.get('explanation') for item in self.recovery
+                                        if item.get('cycle_id') == cycle_id), cycle.get('last_reason'))
+                    return {'cycle_id': cycle_id, 'outcome': f'{cycle["state"].lower()}: {explanation}'}
+            if cycle['state'] in TERMINAL and cycle.get('late_fill_reason'):
+                result = self._apply_closed_late_fill(cycle)
+            elif cycle['state'] not in BLOCKING_STATES:
                 raise storage.ConfigValidationError('This cycle does not need a recovery.')
-            if cycle['state'] == 'ENTRY_UNKNOWN':
+            elif cycle['state'] == 'ENTRY_UNKNOWN':
                 result = self._apply_entry_recovery(cycle)
             elif cycle['state'] == 'EXIT_UNKNOWN':
                 result = self._apply_exit_recovery(cycle)
@@ -689,7 +912,7 @@ class MicroManager:
                                         note='paper venue holds no such order; released by operator recovery')
 
     def _apply_entry_recovery(self, cycle: dict) -> dict:
-        intent = self._intent(cycle['cycle_id'], 'BUY')
+        intent = self._intent(cycle['cycle_id'], 'BUY', attempt=True)
         record = self._venue_record(intent)
         filled = None
         if record is not None:
@@ -707,7 +930,7 @@ class MicroManager:
         return {'cycle_id': cycle['cycle_id'], 'outcome': 'entry fill booked from the venue record'}
 
     def _apply_exit_recovery(self, cycle: dict) -> dict:
-        intent = self._intent(cycle['cycle_id'], 'SELL')
+        intent = self._intent(cycle['cycle_id'], 'SELL', attempt=True)
         record = self._venue_record(intent)
         filled = None
         if record is not None:
@@ -728,8 +951,11 @@ class MicroManager:
     def _apply_review(self, cycle: dict) -> dict:
         late = self._late_fills(cycle)
         if late:
-            self._book_late_fills(cycle, late)
-            return {'cycle_id': cycle['cycle_id'], 'outcome': 'late fill booked from the venue record'}
+            try:
+                outcome = self._book_late_fills(cycle, late)
+            except CycleError as exc:
+                raise storage.ConfigValidationError(f'The late fill was not booked: {exc}.') from exc
+            return {'cycle_id': cycle['cycle_id'], 'outcome': outcome}
         position = storage.rows('SELECT qty, cost FROM positions WHERE exchange=? AND mode=? AND symbol=?',
                                 (cycle['exchange'], cycle['mode'], cycle['symbol']))
         with storage.connection() as db:
@@ -744,10 +970,15 @@ class MicroManager:
         return {'cycle_id': cycle['cycle_id'], 'outcome': 'cycle closed (no ledger position); realized result unconfirmed'}
 
     # -------------------------------------------------------------- data
-    def _refresh_catalogue(self) -> None:
+    def _refresh_catalogue(self, *, holding: bool = False) -> None:
         engine = self.engine
         before = engine.markets_loaded_at
-        engine._fetch_markets()
+        if holding and before and self.rules_loaded_at is not None:
+            if time.time() - self.rules_loaded_at < CATALOGUE_HOLD_REFRESH_S:
+                return
+            engine._fetch_markets(attempts=1)
+        else:
+            engine._fetch_markets()
         if engine.markets_loaded_at != before or self.rules_loaded_at is None:
             # The catalogue was (re)loaded: rules derived from it are rebuilt.
             self.rules_loaded_at = time.time()
@@ -785,12 +1016,19 @@ class MicroManager:
         except ValueError:
             pass
 
-    def _book(self, symbol: str, *, interval: float, max_age: float) -> micro_book.BookSnapshot | None:
+    def _book(self, symbol: str, *, interval: float, max_age: float,
+              idle: bool = False) -> micro_book.BookSnapshot | None:
+        """A book no older than ``max_age``, read at most every ``interval``.
+
+        Exits (``idle`` False) read a new book whenever none is fresh enough,
+        so a holding is never left without one. An ``idle`` read honours its
+        interval even then and returns None until it is due.
+        """
         now_mono = time.monotonic()
         current = self.books.latest(symbol, now_mono=now_mono, max_age_s=max_age)
         if current is not None and current.age_seconds(now_mono) < interval:
             return current
-        if now_mono < self._next_book.get(symbol, 0.0) and current is not None:
+        if now_mono < self._next_book.get(symbol, 0.0) and (current is not None or idle):
             return current
         self._next_book[symbol] = now_mono + interval
         try:
@@ -892,7 +1130,42 @@ class MicroManager:
 
     # -------------------------------------------------------------- tick
     def request_flatten(self) -> None:
-        self._flatten.set()
+        """Exit every holding from the running worker, retrying within FLATTEN_WINDOW_S of this run only."""
+        self._flatten_until = time.monotonic() + FLATTEN_WINDOW_S
+        self._flatten_tried = set()
+        storage.audit('warning', 'Operator asked to exit all micro positions; the running bot is selling them.')
+
+    def cancel_flatten(self, why: str) -> None:
+        """An Exit-all request never outlives the run it was made in."""
+        if self._flatten_until:
+            self._flatten_until = 0.0
+            remaining = [c['symbol'] for c in open_cycles(self.engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
+            if remaining:
+                storage.audit('warning', f'Exit all micro positions ended ({why}) with {", ".join(remaining)} still held; '
+                                         'press Exit all again to sell them.')
+
+    def flatten_pending(self) -> float:
+        """Seconds left on a pending Exit-all request (0 when none)."""
+        return max(0.0, self._flatten_until - time.monotonic()) if self._flatten_until else 0.0
+
+    def _run_flatten(self, params) -> None:
+        if not self._flatten_until:
+            return
+        held = [c for c in open_cycles(self.engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
+        if not held:
+            self._flatten_until = 0.0
+            storage.audit('info', 'Exit all micro positions finished: nothing is held.')
+            return
+        if time.monotonic() >= self._flatten_until:
+            self.cancel_flatten(f'no sale within {FLATTEN_WINDOW_S:g} s')
+            return
+        for cycle in held:
+            if not self.engine._orders_allowed():
+                return
+            first = cycle['cycle_id'] not in self._flatten_tried
+            self._flatten_tried.add(cycle['cycle_id'])
+            # The first attempt ignores an exit back-off; a refused or unfilled one then waits like any exit.
+            self._manage_exit(cycle, params, operator=True, ignore_backoff=first)
 
     def tick(self) -> float:
         """One pass of exits, context and entries. Returns seconds until the next pass."""
@@ -905,25 +1178,31 @@ class MicroManager:
             engine.stop_event.set()
             storage.audit('error', refusal)
             return 1.0
+        self.venue   # bind the venue to the current exchange before anything else
+        self.settle_stranded()      # no operation runs between ticks: a mid-operation state here was interrupted
         if not engine._orders_allowed():
             return 1.0
-        self.venue   # bind the venue to the current exchange before anything else
         params = self.params()
+        held = [c for c in open_cycles(engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
+        checked = bool(engine.markets_loaded_at)
+        if checked:
+            # Holdings are checked before the hourly catalogue refresh, which can be slow or failing.
+            self._run_flatten(params)
+            self._manage_exits(params)
         try:
-            self._refresh_catalogue()
+            self._refresh_catalogue(holding=bool(held))
         except Exception as exc:
             self.last_error = f'market catalogue unavailable: {type(exc).__name__}'
-            return 5.0
-        held = [c for c in open_cycles(engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
-        if self._flatten.is_set():
-            self._flatten.clear()
-            for cycle in held:
-                self._manage_exit(cycle, params, operator=True)
-            held = [c for c in open_cycles(engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
-        self._manage_exits(params)
+            return 1.0 if held and checked else 5.0
+        if not checked:
+            self._run_flatten(params)
+        self._manage_exits(params, only_due=checked)
+        self._mark_residuals()
         selected = self.selected()
-        self._prefetch_context(selected)
-        for symbol in selected:
+        # Held pairs need their candle context for the regime exit even after leaving the selection.
+        watched = selected + sorted({c['symbol'] for c in held} - set(selected))
+        self._prefetch_context(watched)
+        for symbol in watched:
             if not engine._orders_allowed():
                 break
             self._refresh_context(symbol)
@@ -938,6 +1217,22 @@ class MicroManager:
         streaming = current is not None and getattr(current, 'healthy', lambda: False)()
         return 1.0 if streaming or held else 2.0
 
+    def _mark_residuals(self) -> None:
+        """Keep a fresh mark for a closed cycle's residual that no open cycle reads.
+
+        The legacy monitor leaves micro-owned pairs alone, and the risk gate
+        refuses every entry while any held asset's mark is stale; a residual
+        on a pair that left the selection would otherwise block all micro
+        entries. The interval keeps the mark well inside the gate's age limit.
+        """
+        engine = self.engine
+        interval = max(1.0, min(IDLE_BOOK_SECONDS, float(engine.cfg['data_max_age_seconds']) / 3.0))
+        max_age = float(engine.cfg['micro_book_max_age_seconds'])
+        for symbol in sorted(self.owned_symbols() - self.open_symbols()):
+            if not engine._orders_allowed():
+                return
+            self._book(symbol, interval=interval, max_age=max_age, idle=True)
+
     # ------------------------------------------------------------- exits
     def _manage_exits(self, params, *, only_due: bool = False) -> None:
         engine = self.engine
@@ -950,7 +1245,8 @@ class MicroManager:
                 continue
             self._manage_exit(cycle, params, interval=interval)
 
-    def _manage_exit(self, cycle: dict, params, *, operator: bool = False, interval: float = 1.0) -> None:
+    def _manage_exit(self, cycle: dict, params, *, operator: bool = False, interval: float = 1.0,
+                     ignore_backoff: bool = False) -> None:
         engine = self.engine
         symbol = cycle['symbol']
         cycle = self._check_late_fills(cycle)
@@ -980,7 +1276,10 @@ class MicroManager:
             except Exception as exc:
                 self._note_error(symbol, f'exit estimate failed: {type(exc).__name__}')
         context = self.context.get(symbol) or {}
-        features = context.get('features')
+        # A regime exit reads only a context of the last completed bar (or the one before, while the new bar's
+        # candles are read): a frozen context would fire, or fail to fire, on a market that has moved on.
+        current = bool(context.get('current')) and (context.get('bar_due') or 0) >= self._bar_due() - 60
+        features = context.get('features') if current else None
         regime = None
         if features is not None and book is not None:
             regime, _ = strat.classify_regime(features, spread_bps=float(book.spread_bps), depth_ok=True,
@@ -1013,7 +1312,7 @@ class MicroManager:
             self._note_error(symbol, 'exit wanted but no fresh executable quote is available')
             return
         backoff = self.exit_backoff.get(cycle['cycle_id'])
-        if backoff and time.monotonic() < backoff[1] and not operator:
+        if backoff and time.monotonic() < backoff[1] and not ignore_backoff:
             return
         self._sell(cycle, book, rules, cost, trigger=trigger, reason=reason)
 
@@ -1072,7 +1371,7 @@ class MicroManager:
 
     def _unsent_or_unknown(self, cycle: dict, side: str) -> None:
         """After _submit returned nothing: a refusal/rejection or an uncertain outcome."""
-        intent = self._intent(cycle['cycle_id'], side)
+        intent = self._intent(cycle['cycle_id'], side, attempt=True)
         fresh = load_cycle(cycle['cycle_id']) or cycle
         with storage.connection() as db:
             if intent is None or intent['status'] == 'rejected':
@@ -1139,7 +1438,7 @@ class MicroManager:
                                              fee_status=fill['fee_status'], reserved=reserved)
         except Exception as exc:
             engine._ledger_failure(f'MICRO BUY {symbol}: {type(exc).__name__}; fill accounting requires review',
-                                   intent_id=(intent or {}).get('intent_id'))
+                                   intent_id=(intent or {}).get('intent_id'), contain=True)
             return False
         order_id = order.get('id')
         sizing = json.loads(cycle.get('sizing') or '{}')
@@ -1178,6 +1477,10 @@ class MicroManager:
                                'WHERE exchange=? AND mode=? AND symbol=?',
                                (float(owned), price, float(basis), price, stop_value, target_value, _now_iso(),
                                 engine.exchange_name, 'paper', symbol))
+                if order_id is not None and db.execute(
+                        'SELECT 1 FROM trades WHERE exchange=? AND mode=? AND order_id=? LIMIT 1',
+                        (engine.exchange_name, 'paper', order_id)).fetchone():
+                    raise ValueError('this venue order is already booked')
                 db.execute('INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,reason,order_id) '
                            'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                            (_now_iso(), engine.exchange_name, 'paper', symbol, 'BUY', price,
@@ -1205,7 +1508,7 @@ class MicroManager:
                            review_reason=None)
         except Exception as exc:
             engine._ledger_failure(f'MICRO BUY {symbol}: {type(exc).__name__}; portfolio ledger requires review',
-                                   intent_id=(intent or {}).get('intent_id'))
+                                   intent_id=(intent or {}).get('intent_id'), contain=True)
             return False
         self.metrics.observe('micro.fill_to_commit_ms', (time.monotonic() - started) * 1000)
         try:
@@ -1234,7 +1537,7 @@ class MicroManager:
                                          other_fees=other, other_fee_value=None, fee_status=fill['fee_status'])
         except Exception as exc:
             engine._ledger_failure(f'MICRO SELL {symbol}: {type(exc).__name__}; fill accounting requires review',
-                                   intent_id=(intent or {}).get('intent_id'))
+                                   intent_id=(intent or {}).get('intent_id'), contain=True)
             return False
         order_id = order.get('id')
         rules = self.rules(symbol)
@@ -1254,6 +1557,10 @@ class MicroManager:
                 else:
                     db.execute('UPDATE positions SET qty=?, cost=? WHERE exchange=? AND mode=? AND symbol=?',
                                (float(residual), float(realized.residual_basis), engine.exchange_name, 'paper', symbol))
+                if order_id is not None and db.execute(
+                        'SELECT 1 FROM trades WHERE exchange=? AND mode=? AND order_id=? LIMIT 1',
+                        (engine.exchange_name, 'paper', order_id)).fetchone():
+                    raise ValueError('this venue order is already booked')
                 db.execute('INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,realized,reason,order_id) '
                            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                            (_now_iso(), engine.exchange_name, 'paper', symbol, 'SELL', float(fill['average']),
@@ -1288,7 +1595,7 @@ class MicroManager:
                                residual_basis=money.text(realized.residual_basis), **fields)
         except Exception as exc:
             engine._ledger_failure(f'MICRO SELL {symbol}: {type(exc).__name__}; portfolio ledger requires review',
-                                   intent_id=(intent or {}).get('intent_id'))
+                                   intent_id=(intent or {}).get('intent_id'), contain=True)
             return False
         self.metrics.observe('micro.fill_to_commit_ms', (time.monotonic() - started) * 1000)
         try:
@@ -1313,7 +1620,8 @@ class MicroManager:
         try:
             self._check_loss_limits()
         except Exception as exc:
-            storage.audit('warning', f'Micro loss-limit check failed ({type(exc).__name__}); it runs again after the next exit.')
+            storage.audit('warning', f'Micro loss-limit check failed ({type(exc).__name__}); it runs again before the '
+                                     'next entry, which waits for it.')
 
     # ------------------------------------------------------------ entries
     def _last_close(self, symbol: str) -> dict | None:
@@ -1350,16 +1658,29 @@ class MicroManager:
     def _entries(self, params, selected: list[str]) -> None:
         engine = self.engine
         now = time.time()
+        try:
+            # Re-evaluated before every entry pass: a close whose check never ran (a crash, a recovery) still counts.
+            self._check_loss_limits()
+        except Exception as exc:
+            for symbol in selected:
+                self._set_waiting(symbol, 'RISK', f'Micro loss limits could not be checked ({type(exc).__name__}); '
+                                  'no entry this pass', [type(exc).__name__])
+            return
         opened = open_cycles(engine.exchange_name, 'paper')
         open_symbols = {c['symbol'] for c in opened}
-        blockers = [c for c in opened if c['state'] in BLOCKING_STATES]
+        blockers = [c for c in opened if c['state'] in BLOCKING_STATES or c['state'] in TRANSIENT_STATES]
+        blockers += self._closed_late_fills()
         latch = self.latch()
         capacity = len(opened) < int(engine.cfg['micro_max_cycles'])
         entered = 0
         max_age = float(engine.cfg['micro_book_max_age_seconds'])
-        for symbol in selected:
+        offset = engine._clock_offset()
+        for index, symbol in enumerate(selected):
             if not engine._orders_allowed():
                 return
+            if index:
+                # Every pair's book read can wait on the exchange: held cycles are re-checked between pairs.
+                self._manage_exits(params, only_due=True)
             if symbol in open_symbols:
                 self._set_waiting(symbol, None, 'Cycle open', [])
                 continue
@@ -1368,14 +1689,28 @@ class MicroManager:
             cooldown, last = self._cooldown_remaining(symbol, now)
             fresh_after_exit = True
             if last is not None and features is not None:
-                fresh_after_exit = (features.bar_ts_ms / 1000.0 + 60.0) > last['closed_wall']
+                # The bar closed on the venue's clock; the exit was stamped on this PC's.
+                fresh_after_exit = (features.bar_ts_ms / 1000.0 + 60.0 + offset) > last['closed_wall']
             pre_regime = None
             if features is not None:
                 pre_regime, _ = strat.classify_regime(features, spread_bps=0.0, depth_ok=True, data_fresh=True,
                                                       params=params)
             plausible = pre_regime in ('trending_up', 'ranging') and capacity and not blockers and not latch \
                 and cooldown <= 0 and fresh_after_exit
-            book = self._book(symbol, interval=ENTRY_BOOK_SECONDS if plausible else IDLE_BOOK_SECONDS, max_age=max_age)
+            decided_on = (context.get('bar_due'), pre_regime, capacity, bool(blockers), bool(latch), cooldown > 0,
+                          fresh_after_exit)
+            if plausible:
+                book = self._book(symbol, interval=ENTRY_BOOK_SECONDS, max_age=max_age)
+            else:
+                # No setup is possible on this bar: the book is read once per new bar and then at most every
+                # IDLE_BOOK_SECONDS, and between reads the pair keeps its last decision instead of a new one.
+                # A changed gate (a cycle that just closed, a latch, a cooldown that ran out) is a new decision too,
+                # and an 'enter' decision is never kept: it was acted on or refused.
+                last_decision = (self.pairs.get(symbol) or {}).get('decision') or {}
+                new_bar = self._decided_bar.get(symbol) != decided_on or last_decision.get('action') == 'enter'
+                book = self._book(symbol, interval=0.0 if new_bar else IDLE_BOOK_SECONDS, max_age=max_age, idle=True)
+                if book is None and not new_bar and last_decision:
+                    continue
             rules = self.rules(symbol)
             cost = self.cost(rules)
             sizing = None
@@ -1393,8 +1728,10 @@ class MicroManager:
                 except Exception as exc:
                     self._note_error(symbol, f'sizing failed: {type(exc).__name__}')
             fresh_book = book if book is not None and book.age_seconds(time.monotonic()) <= max_age else None
-            # Features of an older bar than the one that just closed are not fresh data for an entry.
-            features_current = features is None or bool(context.get('current'))
+            # Features of an older bar than the one that just closed are not fresh data for an entry, even
+            # when the bar closed during this pass after the pair's context was read.
+            features_current = features is None or (bool(context.get('current'))
+                                                    and context.get('bar_due') == self._bar_due())
             regime, regime_reasons = strat.classify_regime(
                 features, spread_bps=float(fresh_book.spread_bps) if fresh_book else 1e9,
                 depth_ok=bool(fresh_book and fresh_book.depth_known),
@@ -1415,13 +1752,14 @@ class MicroManager:
             started = time.monotonic()
             verdict = strat.evaluate_entry(symbol=symbol, features=features, regime=regime,
                                            regime_reasons=regime_reasons, sizing=sizing_dict, book_summary=book_summary,
-                                           params=params, gates=gates, now=now,
+                                           params=params, gates=gates, now=now - self.engine._clock_offset(),
                                            feature_reason=context.get('reason') if features is None else None)
             self.metrics.observe('micro.entry_decision_ms', (time.monotonic() - started) * 1000)
             if book is not None and verdict.action == 'enter':
                 self.metrics.observe('micro.book_to_decision_ms',
                                      max(0.0, (time.monotonic() - book.received_mono) * 1000))
             self._record_decision(symbol, verdict, sizing_dict, book_summary, regime, context)
+            self._decided_bar[symbol] = decided_on
             if conflicts:
                 # The venue shows an order or a fill the ledger does not: never add exposure on top of it.
                 self._set_waiting(symbol, 'REVIEW', 'Venue record conflict: ' + conflicts[0]['explanation'],
@@ -1470,7 +1808,7 @@ class MicroManager:
         if sizing is None or not sizing.eligible or sizing.max_debit is None:
             return False
         cycle_id = 'cyc_' + uuid.uuid4().hex[:24]
-        stop_bps = proposal.get('stop_net_bps') or strat.stop_net_bps(features, params)
+        stop_bps = proposal.get('stop_net_bps')      # includes the entry cost; never recomputed without it
         if stop_bps is None:
             return False
         stop_net = money.mul(self.budget_cap(), money.bps(money.parse(float(stop_bps))))
@@ -1555,13 +1893,25 @@ class MicroManager:
 
     # ------------------------------------------------------- operator exit
     def flatten(self) -> dict:
-        """Exit every open micro holding now (a risk-reducing operator action)."""
+        """Exit every open micro holding now (a risk-reducing operator action).
+
+        While the bot runs, the worker sells within FLATTEN_WINDOW_S; while it
+        is stopping, this waits for the worker to finish and then sells here;
+        while stopped, it sells here at once. The answer says which happened.
+        """
         engine = self.engine
         with engine.lock:
-            running = engine.running and engine.thread is not None and engine.thread.is_alive()
-        if running:
+            thread = engine.thread
+            alive = engine.running and thread is not None and thread.is_alive()
+            stopping = alive and (engine.stopping or engine.stop_event.is_set())
+        if stopping:
+            thread.join(timeout=FLATTEN_STOP_WAIT_S)
+            if thread.is_alive():
+                raise storage.ConfigValidationError('The bot is still stopping. Press Exit all again once it shows '
+                                                    'Stopped.')
+        elif alive:
             self.request_flatten()
-            return {'queued': True}
+            return {'queued': True, 'window_s': FLATTEN_WINDOW_S}
         with engine.lock:
             if engine._busy():
                 raise storage.ConfigValidationError('Wait for the active operation to finish.')
@@ -1573,11 +1923,13 @@ class MicroManager:
             engine.stop_event.clear()
         results = []
         try:
-            self._refresh_catalogue()
+            self.settle_stranded()
+            self._refresh_catalogue(holding=any(c['state'] == 'HOLDING'
+                                                for c in open_cycles(engine.exchange_name, 'paper')))
             params = self.params()
             for cycle in open_cycles(engine.exchange_name, 'paper'):
                 if cycle['state'] == 'HOLDING':
-                    self._manage_exit(cycle, params, operator=True)
+                    self._manage_exit(cycle, params, operator=True, ignore_backoff=True)
                     results.append(cycle['symbol'])
         finally:
             with engine.lock:
@@ -1682,6 +2034,7 @@ class MicroManager:
                 'uncertainty_floor_bps': UNCERTAINTY_FLOOR_BPS, 'max_spread_bps': self.params().max_spread_bps,
                 'max_vol_bps': MAX_VOL_BPS, 'edge_ratio': EDGE_RATIO},
             'latch': latch, 'review_block': self.review_block(), 'recovery': list(self.recovery),
+            'exit_all_pending_s': round(self.flatten_pending(), 1),
             'pairs': pairs, 'cycles': cycles, 'results': self.results(), 'counters': counters,
             'books': self.books.status(time.monotonic()), 'last_tick': self.last_tick, 'last_error': self.last_error,
             'heuristic_note': 'Setup checks are transparent heuristics, not calibrated probabilities of profit.',

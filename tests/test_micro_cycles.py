@@ -828,3 +828,478 @@ def test_a_venue_that_publishes_the_bar_late_is_retried_at_a_bounded_rate(world,
     w.tick()
     assert w.engine.micro.context['ETH/USDT']['current'] is True
     assert w.engine.micro.pairs['ETH/USDT']['decision']['code'] != 'STALE_DATA'
+
+
+# ===================================================================== integration review regressions
+def _partial_exit(w: World, fraction: str = '0.4') -> str:
+    """A HOLDING cycle that already sold part of its holding (one SELL intent, accounted)."""
+    held = w.run_until_state('HOLDING')
+    w.venue().partial_next = Decimal(fraction)
+    assert w.run(120, until=lambda: int(micro.load_cycle(held['cycle_id'])['exit_count'] or 0) >= 1)
+    cycle = micro.load_cycle(held['cycle_id'])
+    assert cycle['state'] == 'HOLDING'
+    assert [i['status'] for i in w.intents(cycle['cycle_id']) if i['side'] == 'SELL'] == ['accounted']
+    return cycle['cycle_id']
+
+
+def _no_order_booked_twice(w: World) -> None:
+    ids = [t['order_id'] for t in w.trades() if t['order_id'] and 'late fill' not in (t['reason'] or '')]
+    assert len(ids) == len(set(ids)), 'one venue order was booked twice'
+
+
+def test_an_exit_that_dies_before_its_intent_never_rebooks_the_earlier_partial_sale(world, monkeypatch):
+    w = world()
+    cycle_id = _partial_exit(w)
+    cash, trades = w.cash(), len(w.trades())
+    real = storage.create_order_intent
+
+    def die(*args, **kwargs):
+        raise Crash()                         # the process dies before the next exit's intent is written
+    monkeypatch.setattr(storage, 'create_order_intent', die)
+    with pytest.raises(Crash):
+        w.run(60)
+    monkeypatch.setattr(storage, 'create_order_intent', real)
+    assert micro.load_cycle(cycle_id)['state'] == 'EXIT_SUBMITTED'
+    engine = w.restart()
+    # The accounted intent belongs to the earlier sale: the interrupted attempt sent nothing.
+    after = micro.load_cycle(cycle_id)
+    assert after['state'] == 'HOLDING' and engine.micro.review_block() == []
+    assert any('never sent' in item['explanation'] for item in engine.micro.recovery if item.get('cycle_id') == cycle_id)
+    assert w.cash() == cash and len(w.trades()) == trades
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+def test_stop_between_the_gate_and_the_submit_of_a_second_exit_returns_to_holding(world, monkeypatch):
+    w = world()
+    cycle_id = _partial_exit(w)
+    cash, trades = w.cash(), len(w.trades())
+    real = w.engine._authorize
+
+    def authorize_then_stop(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if args[1] == 'SELL' and result.allowed:
+            w.engine.stop_event.set()         # Stop pressed while the worker is between the gate and the submit
+        return result
+    monkeypatch.setattr(w.engine, '_authorize', authorize_then_stop)
+    w.run(60, until=lambda: w.engine.stop_event.is_set())
+    after = micro.load_cycle(cycle_id)
+    assert after['state'] == 'HOLDING' and w.engine.micro.review_block() == []
+    assert w.cash() == cash and len(w.trades()) == trades
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+def test_booking_refuses_a_venue_order_that_is_already_in_the_ledger(world):
+    w = world()
+    cycle_id = _partial_exit(w)
+    first_sale = next(i for i in w.intents(cycle_id) if i['side'] == 'SELL')
+    record = w.venue().fetch_order(None, 'ETH/USDT', {'clientOrderId': first_sale['client_order_id']})
+    cash, trades = w.cash(), len(w.trades())
+    assert w.engine.micro._book_exit(micro.load_cycle(cycle_id), None, record, trigger='test', reason='again') is False
+    assert w.cash() == cash and len(w.trades()) == trades
+    assert 'MICRO SELL' in (w.engine.risk_block or '')
+
+
+def _fail_sell_booking_once(monkeypatch, cycle_id: str) -> dict:
+    real = storage.update_order_intent
+    armed = {'on': True}
+
+    def flaky(intent_id, status, *args, **kwargs):
+        db = kwargs.get('db')
+        if armed['on'] and status == 'accounted' and db is not None:
+            row = db.execute('SELECT side, decision_id FROM order_journal WHERE intent_id=?', (intent_id,)).fetchone()
+            if row['decision_id'] == cycle_id and row['side'] == 'SELL':
+                armed['on'] = False
+                raise sqlite3.OperationalError('disk I/O error')     # the booking transaction rolls back
+        return real(intent_id, status, *args, **kwargs)
+    monkeypatch.setattr(storage, 'update_order_intent', flaky)
+    return armed
+
+
+def test_a_booking_failure_while_running_is_settled_on_the_next_pass_and_blocks_entries(world, monkeypatch):
+    w = world(two_setups, micro_max_cycles=2)
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    armed = _fail_sell_booking_once(monkeypatch, held['cycle_id'])
+    w.run(120, until=lambda: not armed['on'])
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_SUBMITTED'
+    # Contained: the worker keeps running, so every other cycle keeps its exits.
+    assert not w.engine.stop_event.is_set() and 'MICRO SELL' in w.engine.risk_block
+    before = len(w.cycles())
+    w.run(30)
+    unknown = micro.load_cycle(held['cycle_id'])
+    assert unknown['state'] == 'EXIT_UNKNOWN'
+    assert [b['cycle_id'] for b in w.engine.micro.review_block()] == [held['cycle_id']]
+    assert len(w.cycles()) == before                         # no new cycle while a filled sale is unbooked
+    w.engine.running = False
+    result = w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)
+    assert result['outcome'] == 'exit fill booked from the venue record'
+    assert micro.load_cycle(held['cycle_id'])['state'] in ('CLOSED', 'HOLDING')
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+def test_a_cycle_interrupted_mid_exit_can_be_recovered_while_stopped(world, monkeypatch):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    armed = _fail_sell_booking_once(monkeypatch, held['cycle_id'])
+    w.run(120, until=lambda: not armed['on'])
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_SUBMITTED'
+    w.engine.running = False                                  # stopped; no further pass has run
+    result = w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)
+    assert result['outcome'] == 'exit fill booked from the venue record'
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED'
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+def test_the_worker_exit_settles_interrupted_cycles_and_ends_an_exit_all_request(world, monkeypatch):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    armed = _fail_sell_booking_once(monkeypatch, held['cycle_id'])
+    w.run(120, until=lambda: not armed['on'])
+    w.engine.micro.request_flatten()
+    assert w.engine.micro.flatten_pending() > 0
+    w.engine.stop_event.set()
+    w.engine._loop()                        # returns at once; its cleanup is what a real worker runs on exit
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_UNKNOWN'
+    assert w.engine.micro.flatten_pending() == 0
+    assert any(item.get('cycle_id') == held['cycle_id'] for item in w.engine.micro.recovery)
+
+
+def test_a_reservation_stranded_by_a_failure_is_released_on_the_next_pass(world, monkeypatch):
+    w = world()
+    real = w.engine._authorize
+
+    def broken(*args, **kwargs):
+        if args[1] == 'BUY':
+            raise RuntimeError('gate unavailable')
+        return real(*args, **kwargs)
+    monkeypatch.setattr(w.engine, '_authorize', broken)
+    with pytest.raises(RuntimeError):
+        w.run(60)
+    stranded = w.cycles()[-1]
+    assert stranded['state'] == 'ENTRY_RESERVED' and Decimal(stranded['reserved_quote']) > 0
+    monkeypatch.setattr(w.engine, '_authorize', real)
+    w.tick()
+    assert micro.load_cycle(stranded['cycle_id'])['state'] == 'ABANDONED'
+    assert Decimal(micro.load_cycle(stranded['cycle_id'])['reserved_quote']) == 0
+
+
+def _raise_entry_fill(w: World, cycle_id: str, extra_base=Decimal('0.0004'), extra_cost=Decimal('1.0004'),
+                      extra_fee=Decimal('0.0010004')) -> None:
+    buy = next(i for i in w.intents(cycle_id) if i['side'] == 'BUY')
+    stored = w.venue().fetch_order(None, 'ETH/USDT', {'clientOrderId': buy['client_order_id']})['info']['exact']
+    with storage.connection() as db:                # the venue now reports a larger fill on that entry
+        db.execute('UPDATE paper_venue_orders SET filled=?, cost=?, fee_cost=? WHERE client_order_id=?',
+                   (str(Decimal(stored['filled']) + extra_base), str(Decimal(stored['cost']) + extra_cost),
+                    str(Decimal(stored['fee_cost']) + extra_fee), buy['client_order_id']))
+
+
+def test_a_late_fill_after_the_cycle_closed_blocks_until_booked_and_never_ages_out(world):
+    w = world(micro_cooldown_seconds=0)
+    w.venue().partial_next = Decimal('0.5')
+    held = w.run_until_state('HOLDING')
+    closed = w.run_until_state('CLOSED')
+    assert closed['cycle_id'] == held['cycle_id']
+    _raise_entry_fill(w, closed['cycle_id'])
+    cash = w.cash()
+    count = len(w.cycles())
+    w.run(30)
+    assert len(w.cycles()) == count
+    blockers = w.engine.micro.review_block()
+    assert [(b['cycle_id'], b.get('late_fill')) for b in blockers] == [(closed['cycle_id'], True)]
+    # The venue record ages out of the reconciliation window; the block does not.
+    w.clock.advance(micro.RECONCILE_WINDOW_S + 60)
+    w.run(60)
+    assert len(w.cycles()) == count and w.engine.micro.review_block()
+    engine = w.restart()                                      # and it survives a restart
+    assert engine.micro.review_block()
+    result = engine.micro.apply_recovery(closed['cycle_id'], REVIEW)
+    assert 'late fill booked' in result['outcome']
+    assert engine.micro.review_block() == []
+    assert money_close(cash - w.cash(), Decimal('1.0004') + Decimal('0.0010004'))
+    after = micro.load_cycle(closed['cycle_id'])
+    assert after['state'] == 'CLOSED' and after['late_fill_reason'] is None
+    assert money_close(Decimal(after['entry_debit']) - Decimal(closed['entry_debit']), Decimal('1.0014004'))
+    adopted = [c for c in w.cycles() if c['strategy'] == 'late_fill_recovery']
+    assert len(adopted) == 1 and adopted[0]['state'] == 'HOLDING' and adopted[0]['decision_id'] == closed['cycle_id']
+    position = storage.rows("SELECT qty FROM positions WHERE symbol='ETH/USDT' AND mode='paper'")
+    assert money_close(position[0]['qty'], adopted[0]['owned_base'], Decimal('1e-12'))
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+    # The adopted holding is managed like any other: its maximum hold closes it.
+    w.go()
+    w.run(45, until=lambda: micro.load_cycle(adopted[0]['cycle_id'])['state'] == 'CLOSED')
+    assert micro.load_cycle(adopted[0]['cycle_id'])['state'] == 'CLOSED'
+    assert_ledger_consistent(w)
+
+
+def test_a_late_sale_fill_corrects_the_cycle_totals_and_the_results(world):
+    w = world()
+    cycle_id = _partial_exit(w, '0.5')
+    cycle = micro.load_cycle(cycle_id)
+    sale = next(i for i in w.intents(cycle_id) if i['side'] == 'SELL')
+    record = w.venue().fetch_order(None, 'ETH/USDT', {'clientOrderId': sale['client_order_id']})['info']['exact']
+    extra_base, price = Decimal('0.001'), Decimal(record['average'])
+    extra_gross = extra_base * price
+    extra_fee = extra_gross * Decimal('0.001')
+    with storage.connection() as db:
+        db.execute('UPDATE paper_venue_orders SET filled=?, cost=?, fee_cost=? WHERE client_order_id=?',
+                   (str(Decimal(record['filled']) + extra_base), str(Decimal(record['cost']) + extra_gross),
+                    str(Decimal(record['fee_cost']) + extra_fee), sale['client_order_id']))
+    w.set_closes('ETH/USDT', float(Decimal(cycle['basis_quote']) / Decimal(cycle['owned_base'])) * 0.999)
+    w.run(1)
+    assert micro.load_cycle(cycle_id)['state'] == 'REVIEW'
+    w.engine.running = False
+    cash = w.cash()
+    w.engine.micro.apply_recovery(cycle_id, REVIEW)
+    after = micro.load_cycle(cycle_id)
+    assert money_close(w.cash() - cash, extra_gross - extra_fee)
+    assert money_close(Decimal(after['exit_gross']) - Decimal(cycle['exit_gross']), extra_gross)
+    assert money_close(Decimal(after['exit_fees']) - Decimal(cycle['exit_fees']), extra_fee)
+    assert money_close(Decimal(after['closed_base']) - Decimal(cycle['closed_base']), extra_base)
+    assert money_close(Decimal(after['exit_proceeds_net']) - Decimal(cycle['exit_proceeds_net']),
+                       extra_gross - extra_fee)
+    assert_ledger_consistent(w)
+
+
+def test_exit_all_pressed_while_stopping_waits_for_the_worker_and_sells_or_refuses(world):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    release = threading.Event()
+
+    def worker():
+        release.wait(5)
+        w.engine.running = w.engine.stopping = False          # what the real worker's cleanup does
+    thread = threading.Thread(target=worker, name='TradingEngine')
+    thread.start()
+    w.engine.thread = thread
+    w.engine.stop()                                           # returns while the worker is still finishing
+    assert thread.is_alive() and w.engine.stopping
+    threading.Timer(0.3, release.set).start()
+    answer = w.engine.micro.flatten()
+    assert answer == {'queued': False, 'attempted': ['ETH/USDT']}
+    closed = micro.load_cycle(held['cycle_id'])
+    assert closed['state'] == 'CLOSED' and closed['last_exit_trigger'] == 'operator'
+    assert w.engine.micro.flatten_pending() == 0
+    # A worker that does not finish in time gets a refusal, never a request left queued for the next start.
+    stuck = threading.Thread(target=threading.Event().wait, args=(30,), daemon=True, name='TradingEngine')
+    stuck.start()
+    w.engine.thread, w.engine.running = stuck, True
+    w.engine.stop_event.set()
+    monkeypatched = micro.FLATTEN_STOP_WAIT_S
+    micro.FLATTEN_STOP_WAIT_S = 0.2
+    try:
+        with pytest.raises(storage.ConfigValidationError):
+            w.engine.micro.flatten()
+    finally:
+        micro.FLATTEN_STOP_WAIT_S = monkeypatched
+    assert w.engine.micro.flatten_pending() == 0
+
+
+def test_a_queued_exit_all_retries_within_its_window_then_ends(world, monkeypatch):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    w.set_closes('ETH/USDT', float(Decimal(held['entry_price'])))      # no exit of its own meanwhile
+    with pytest.MonkeyPatch.context() as no_quotes:
+        no_quotes.setattr(micro.MicroManager, '_book', lambda self, *a, **k: None)
+        no_quotes.setattr(micro.MicroManager, '_ticker_snapshot', lambda self, symbol: None)
+        w.engine.micro.request_flatten()
+        w.run(1)
+        assert w.engine.micro.flatten_pending() > 0                     # no quote yet: still trying
+        w.run(3)
+        assert w.engine.micro.flatten_pending() == 0                    # the window passed
+        assert micro.load_cycle(held['cycle_id'])['state'] == 'HOLDING'
+        assert any('still held' in row['message'] for row in storage.rows('SELECT message FROM audit'))
+    w.run(5)                                  # quotes return: only the cycle's own exit rules may sell now
+    assert micro.load_cycle(held['cycle_id'])['last_exit_trigger'] != 'operator'
+
+
+def test_open_cycles_block_an_exchange_change_and_leaving_micro(world):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    w.engine.running = False
+    for change in ({'time_horizon': 'rapid'}, {'exchange': 'kraken'}, {'exchange': 'kraken', 'time_horizon': 'rapid'}):
+        with pytest.raises(storage.ConfigValidationError, match='Micro cycles are still open'):
+            w.engine.update_config(micro_settings(**change))
+    assert w.engine.exchange_name == 'mexc' and micro.load_cycle(held['cycle_id'])['state'] == 'HOLDING'
+
+
+def test_the_micro_stop_is_carried_to_another_exchange(world):
+    w = world()
+    w.engine.running = False
+    w.engine.micro._engage_latch('2 consecutive losing micro cycles')
+    w.engine.update_config(micro_settings(exchange='kraken'))
+    assert w.engine.exchange_name == 'kraken'
+    assert 'Carried over from MEXC' in w.engine.micro.latch()['reason']
+
+
+def test_a_held_cycle_defers_the_catalogue_refresh_then_makes_one_attempt_after_its_exit_check(world):
+    import ccxt
+    w = world(micro_max_hold_minutes=240)
+    w.run_until_state('HOLDING')
+    w.engine.data.wait = lambda seconds: False
+    w.clock.advance(3601)                                     # the hourly refresh is due
+    real_load, real_book = w.exchange.load_markets, w.exchange.fetch_order_book
+    events = []
+
+    def slow_failing(reload=False):
+        if reload:
+            events.append(('catalogue', w.clock.time()))
+            w.clock.advance(18.0)                             # the client timeout, then a transport error
+            raise ccxt.RequestTimeout('timed out')
+        return real_load(reload)
+
+    def book(symbol, *args, **kwargs):
+        events.append((symbol, w.clock.time()))
+        return real_book(symbol, *args, **kwargs)
+    w.exchange.load_markets, w.exchange.fetch_order_book = slow_failing, book
+    w.clock.advance(1.0)
+    w.tick()
+    kinds = [kind for kind, _ in events]
+    assert 'ETH/USDT' in kinds and 'catalogue' not in kinds       # deferred while the cycle is held
+    assert w.cycles('HOLDING')
+    # Once the catalogue nears the age at which entries refuse it, one attempt is made, after the exit check.
+    w.engine.micro.rules_loaded_at -= micro.CATALOGUE_HOLD_REFRESH_S
+    events.clear()
+    w.clock.advance(1.0)
+    w.tick()
+    kinds = [kind for kind, _ in events]
+    assert kinds.count('catalogue') == 1                          # one attempt, not the client's three
+    assert kinds.index('ETH/USDT') < kinds.index('catalogue')     # the holding was checked first
+    for _ in range(20):
+        w.clock.advance(5.0)
+        w.tick()
+    assert [kind for kind, _ in events].count('catalogue') == 1   # not retried for the next five minutes
+    w.clock.advance(trader.TradingEngine.CATALOGUE_RETRY_SECONDS)
+    w.tick()
+    assert [kind for kind, _ in events].count('catalogue') == 2
+
+
+def test_without_a_holding_a_failing_catalogue_refresh_keeps_its_retries_and_waits_before_the_next(world):
+    import ccxt
+    w = world()
+    w.run(1)
+    assert not w.cycles()
+    w.engine.data.wait = lambda seconds: False
+    w.clock.advance(3601)
+    real_load = w.exchange.load_markets
+    reloads = []
+
+    def failing(reload=False):
+        if reload:
+            reloads.append(w.clock.time())
+            raise ccxt.RequestTimeout('timed out')
+        return real_load(reload)
+    w.exchange.load_markets = failing
+    w.tick()
+    assert len(reloads) == 3                                      # the normal client retries, nothing held
+    for _ in range(10):
+        w.clock.advance(5.0)
+        w.tick()
+    assert len(reloads) == 3
+
+
+def test_a_loss_limit_reached_just_before_a_crash_latches_at_the_next_start(world, monkeypatch):
+    w = world(micro_daily_loss_limit_usdt=0.1, micro_cooldown_seconds=0)
+    held = w.run_until_state('HOLDING')
+    real = micro.MicroManager._after_close
+
+    def die(self, cycle):
+        raise Crash()                         # the process dies right after the exit transaction committed
+    monkeypatch.setattr(micro.MicroManager, '_after_close', die)
+    w.set_closes('ETH/USDT', float(Decimal(held['entry_price'])) * 0.985)
+    with pytest.raises(Crash):
+        w.run(30)
+    monkeypatch.setattr(micro.MicroManager, '_after_close', real)
+    closed = micro.load_cycle(held['cycle_id'])
+    assert closed['state'] == 'CLOSED' and Decimal(closed['realized_net']) <= Decimal('-0.1')
+    engine = w.restart()
+    assert 'realized micro loss today' in engine.micro.latch()['reason']
+    w.go()
+    w.exchange.series['ETH/USDT'].closes[:] = mechanics(base=float(Decimal(held['entry_price'])))
+    count = len(w.cycles())
+    w.run(90)
+    assert len(w.cycles()) == count
+
+
+def test_a_loss_limit_check_that_failed_after_a_close_runs_before_the_next_entry(world, monkeypatch):
+    w = world(micro_daily_loss_limit_usdt=0.1, micro_cooldown_seconds=0)
+    held = w.run_until_state('HOLDING')
+    real = micro.MicroManager._check_loss_limits
+    calls = {'n': 0}
+
+    def flaky(self):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise sqlite3.OperationalError('database is locked')
+        return real(self)
+    w.set_closes('ETH/USDT', float(Decimal(held['entry_price'])) * 0.985)
+    monkeypatch.setattr(micro.MicroManager, '_check_loss_limits', lambda self: None)
+    w.run(30, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    monkeypatch.setattr(micro.MicroManager, '_check_loss_limits', flaky)
+    w.exchange.series['ETH/USDT'].closes[:] = mechanics(base=float(Decimal(held['entry_price'])))
+    count = len(w.cycles())
+    w.run(90)
+    assert len(w.cycles()) == count and 'realized micro loss today' in w.engine.micro.latch()['reason']
+
+
+def test_an_uncertain_entry_blocks_new_entries_but_other_cycles_keep_their_exits(world):
+    import ccxt
+    w = world(two_setups, micro_max_cycles=2)
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    w.set_closes('ETH/USDT', float(Decimal(held['entry_price'])))     # ETH holds still meanwhile
+    w.venue().reject_next = ccxt.RequestTimeout('response lost')        # the next order's outcome is unknown
+    original = w.venue().fetch_order
+
+    def unreachable(order_id, symbol=None, params=None):
+        raise ccxt.NetworkError('lookup failed')
+    w.venue().fetch_order = unreachable
+    assert w.run(120, until=lambda: bool(w.cycles('ENTRY_UNKNOWN', 'BTC/USDT')))
+    w.venue().fetch_order = original
+    assert not w.engine.stop_event.is_set()                   # the worker keeps running
+    assert w.engine.micro.review_block()
+    count = len(w.cycles())
+    w.set_closes('ETH/USDT', float(Decimal(held['entry_price'])) * 0.95)   # far through ETH's stop
+    w.run(10, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    closed = micro.load_cycle(held['cycle_id'])
+    assert closed['state'] == 'CLOSED' and closed['last_exit_trigger'] == 'stop_loss'
+    assert len(w.cycles()) == count                           # and still nothing new
+    assert_ledger_consistent(w)
+
+
+def test_a_residual_on_a_pair_that_left_the_selection_keeps_a_fresh_mark(world):
+    w = world(two_setups, micro_cooldown_seconds=0, data_max_age_seconds=30)
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    venue = w.venue()
+    original = venue.create_order
+
+    def eth_sale_fills_97_percent(symbol, *args, **kwargs):
+        if symbol == 'ETH/USDT':
+            venue.partial_next = Decimal('0.97')            # the rest is below the 1 USDT market minimum
+        return original(symbol, *args, **kwargs)
+    venue.create_order = eth_sale_fills_97_percent
+    assert w.run(120, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    venue.create_order = original
+    closed = micro.load_cycle(held['cycle_id'])
+    assert Decimal(closed['residual_base']) > 0 and 'ETH/USDT' in w.engine.micro.owned_symbols()
+    w.engine.running = False
+    w.engine.update_config(micro_settings(watchlist=['BTC/USDT'], micro_cooldown_seconds=0,
+                                          data_max_age_seconds=30))
+    w.go()
+    count = len(w.cycles(symbol='BTC/USDT'))
+    w.run(120, until=lambda: len(w.cycles(symbol='BTC/USDT')) > count)
+    fresh = w.cycles(symbol='BTC/USDT')[count:]
+    assert fresh and fresh[0]['state'] != 'ABANDONED', fresh[0]['last_reason'] if fresh else 'no BTC entry'
+    refusals = [c['last_reason'] for c in w.cycles() if 'stale or missing price' in (c['last_reason'] or '')]
+    assert refusals == []
+
+
+def test_recovery_explanations_follow_the_selected_exchange(world):
+    w = world()
+    w.engine.running = False
+    w.engine.micro.recovery = [{'cycle_id': 'cyc_other', 'symbol': 'ETH/USDT', 'state': 'REVIEW',
+                                'explanation': 'an explanation for MEXC', 'action': 'apply_recovery'}]
+    w.engine.update_config(micro_settings(exchange='kraken'))
+    assert w.engine.micro.status()['recovery'] == []

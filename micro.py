@@ -468,12 +468,10 @@ class MicroManager:
         """Venue orders that no journal intent explains, or that filled more than the ledger booked."""
         found = []
         try:
-            records = self.venue.records(symbol)
+            records = self.venue.records(symbol, since_ms=since_ms)
         except Exception as exc:
             return [{'symbol': symbol, 'explanation': f'paper venue records unreadable: {type(exc).__name__}',
                      'action': 'review'}]
-        if since_ms is not None:
-            records = [record for record in records if int(record.get('timestamp_ms') or 0) >= since_ms]
         for record in records:
             client_id = record.get('clientOrderId') or record.get('client_order_id')
             journal = storage.rows('SELECT intent_id, status, filled_quantity, decision_id FROM order_journal '

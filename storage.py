@@ -421,6 +421,8 @@ def init_db():
                 db.execute(f'ALTER TABLE order_journal ADD COLUMN {column} {definition}')
         db.execute('CREATE INDEX IF NOT EXISTS orders_recent ON order_journal(exchange,mode,created_at)')
         db.execute('CREATE INDEX IF NOT EXISTS orders_decision ON order_journal(decision_id)')
+        # Reconciliation looks intents up by the client order id a venue reports back.
+        db.execute('CREATE INDEX IF NOT EXISTS orders_client_id ON order_journal(exchange,mode,client_order_id)')
         # Micro-trading cycles and the durable paper venue's own order records.
         import micro
         import micro_venue

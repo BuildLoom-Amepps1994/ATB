@@ -704,8 +704,13 @@ class MicroPaperVenue:
             found = found[-int(limit):] if int(limit) > 0 else []
         return found
 
-    def records(self, symbol: str | None = None) -> list[dict]:
-        """Every stored order of this exchange, exact, oldest first, for reconciliation."""
-        if symbol is None:
-            return self._read('WHERE exchange=? ORDER BY timestamp_ms, rowid', (self.exchange_name,))
-        return self._read('WHERE exchange=? AND symbol=? ORDER BY timestamp_ms, rowid', (self.exchange_name, symbol))
+    def records(self, symbol: str | None = None, *, since_ms: int | None = None) -> list[dict]:
+        """Every stored order of this exchange (optionally one pair, optionally from ``since_ms``), exact,
+        oldest first, for reconciliation. The time filter runs in SQL on the (exchange, symbol, time) index,
+        so a periodic check reads only its window however long the venue history grows."""
+        where, args = 'WHERE exchange=?', [self.exchange_name]
+        if symbol is not None:
+            where, args = where + ' AND symbol=?', args + [symbol]
+        if since_ms is not None:
+            where, args = where + ' AND timestamp_ms>=?', args + [int(since_ms)]
+        return self._read(where + ' ORDER BY timestamp_ms, rowid', tuple(args))

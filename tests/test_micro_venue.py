@@ -698,3 +698,16 @@ def test_ensure_schema_is_idempotent_and_creates_the_lookup_index():
         micro_venue.ensure_schema(db)
         indexes = {row['name'] for row in db.execute("PRAGMA index_list('paper_venue_orders')")}
     assert 'paper_venue_orders_recent' in indexes
+
+
+def test_records_can_be_read_for_one_pair_from_a_point_in_time():
+    """A periodic reconciliation reads only its window, in SQL, however long the history grows."""
+    now = {'t': 1_000.0}
+    v = venue(clock=lambda: now['t'])
+    first = v.create_market_buy_order_with_cost(SYMBOL, D('10.00'), params())
+    now['t'] = 2_000.0
+    second = v.create_market_buy_order_with_cost(SYMBOL, D('10.00'), params())
+    assert [r['client_order_id'] for r in v.records()] == [first['clientOrderId'], second['clientOrderId']]
+    assert [r['client_order_id'] for r in v.records(SYMBOL, since_ms=1_500_000)] == [second['clientOrderId']]
+    assert v.records(SYMBOL, since_ms=2_000_000)[0]['timestamp_ms'] == 2_000_000      # the bound is inclusive
+    assert v.records('BTC/USDT', since_ms=0) == [] and v.records(since_ms=3_000_000) == []

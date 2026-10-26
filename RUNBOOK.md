@@ -164,6 +164,10 @@ the exchange knows an order with that client order id and what state it is in.
 Run these on the machine that will trade. None of them places an order.
 
 1. **Tests.** `python -m pytest tests -q` and `node --test tests/test_dashboard.js`.
+   `python tests/smoke_frozen_orders.py --work <scratch folder>` stages exactly
+   the installer's file set and drives paper and simulated-live manual orders
+   through the launcher; add `--runtime <folder with CryptoPilotRuntime.exe>`
+   on Windows to run it inside the frozen runtime.
 2. **Replay check.** `python benchmarks/replay.py` must report zero mismatches.
 3. **Latency benchmark.** `python benchmarks/bench_latency.py --json out.json`
    and compare with `benchmarks/results/`.

@@ -18,9 +18,13 @@ import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Every top-level application module ships here. tests/test_app_manifest.py keeps this set,
+# windows_runtime.REQUIRED_MODULES and maintenance MODULES equal to the modules in the repository.
 REQUIRED_APP = {
     'app.py', 'launcher.py', 'trader.py', 'strategy.py', 'storage.py',
-    'credentials.py', 'market_data.py', 'recovery.py', 'updater.py', 'requirements-lock.txt',
+    'credentials.py', 'market_data.py', 'recovery.py', 'updater.py',
+    'decision.py', 'feed.py', 'observability.py', 'orders.py', 'paper_exchange.py', 'risk.py',
+    'requirements-lock.txt',
     'static/index.html', 'static/dashboard.js', 'static/dashboard-core.js',
 }
 

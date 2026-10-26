@@ -18,8 +18,9 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 MODULES = (
-    'app.py', 'credentials.py', 'launcher.py', 'market_data.py',
-    'recovery.py', 'storage.py', 'strategy.py', 'trader.py', 'updater.py',
+    'app.py', 'credentials.py', 'decision.py', 'feed.py', 'launcher.py', 'market_data.py',
+    'observability.py', 'orders.py', 'paper_exchange.py', 'recovery.py', 'risk.py',
+    'storage.py', 'strategy.py', 'trader.py', 'updater.py',
 )
 METADATA_FILES = ('requirements-lock.txt',)
 REQUIRED_ASSETS = ('static/index.html', 'static/dashboard.js', 'static/dashboard-core.js')

@@ -125,7 +125,9 @@ impact on live capital or on the integrity of the record.
 | `benchmarks/bench_latency.py`, `benchmarks/replay.py`, `benchmarks/results/` | Latency percentiles (runs on both trees), determinism check, raw results. |
 | `tests/test_risk_gate.py`, `test_order_lifecycle.py`, `test_decisions.py`, `test_quote_feed.py`, `test_hardening_fixes.py` (new) | 92 new tests; see D. |
 | `tests/test_recovery.py`, `test_execution_speed.py`, `test_quote_protection.py`, `test_review_fixes.py` | Fixture updates for schema version 3, the 12 USDT minimum and client order ids. |
-| `README.md`, `RUNBOOK.md`, this file | Documentation. |
+| `scripts/build_installer.py`, `windows_runtime.py`, `maintenance/update_installation.py` | The six new modules join the installer's staged file list, the frozen runtime's required-module set and the offline source updater's module list. The first Windows build of the branch failed its frozen-runtime smoke test with `No module named 'decision'` because these lists are explicit. |
+| `tests/test_app_manifest.py` (new), `tests/smoke_frozen_orders.py` | A test keeps the three lists equal to the repository's modules and asserts everything the launcher imports is staged. The smoke test stages exactly the installer's file set (read from the builder), imports `ccxt.pro` inside the runtime, and can be rehearsed without the frozen runtime (`--work` alone). |
+| `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
 status strings, protective-exit semantics, manual ticket contract) is
@@ -301,7 +303,7 @@ What the records can and cannot say:
 
 ## G. Rollback
 
-The branch is seven commits on top of `7207e82`, oldest first:
+The branch is ten commits on top of `7207e82`, oldest first:
 
 1. `a83667d` Add an independent risk gate, kill switch and structured events
 2. `185b346` Make order execution an explicit state machine shared by paper and live
@@ -311,7 +313,8 @@ The branch is seven commits on top of `7207e82`, oldest first:
 6. `b99b0a8` Close audit findings on quote ordering, shutdown, the decision trail and entry errors
 7. `eee9f1c` Read protective quotes from the lighter book-ticker endpoint where one exists
 8. `21c4692` Document the hardened engine: runbook, README summary and review deliverables
-9. (fix) Append the event log per write so Windows can delete the data directory
+9. `030a8f2` Append the event log per write so Windows can delete the data directory
+10. (fix) Ship the new modules in the installer, runtime and source updater
 
 `git revert` them newest first, or check out `7207e82` to go back to v1.4.0
 entirely. Data: the schema change is additive (`PRAGMA user_version = 3`, new
@@ -340,13 +343,29 @@ decision log are informational and can be deleted.
    position, raise a dashboard warning and engage the entry side of the kill
    switch.
 5. Fee fallback on MEXC base-asset fees (13).
+6. Manifest-driven source updates: `maintenance/update_installation.py`
+   packages a fixed module list, so a source-only update applied by an
+   *older* installed helper cannot add modules that a newer release
+   introduces. Hashing the top-level modules actually present (with the
+   fixed list as the required minimum) would let later additions flow through
+   `--update-source` as well as Setup.
+
+**Upgrade path for an existing installation.** If the 1.4.0 build from CI is
+installed anywhere, upgrade it with the new Setup (the in-app updater does
+this), not with `UPDATE_INSTALLED.bat` / `--update-source`: the installed
+helper would copy only the nine modules it knows, and the app would then stop
+at start with `No module named 'decision'`. Recovery from that state is
+`CryptoPilotRuntime.exe --update-source <installation>\backups\update-<stamp>\app`,
+which restores the backed-up source.
 
 **What only you can verify.**
 
 * Run the suite, the replay check and the benchmarks on your Windows machine
   with Python 3.14, and compare with `benchmarks/results/`.
 * Let the pull request's Windows build finish; it is the only check that the
-  frozen app still starts with the new modules.
+  frozen app still starts with the new modules and that `ccxt.pro` is bundled
+  (the smoke test now imports it inside the runtime). The staging itself can
+  be rehearsed anywhere with `python tests/smoke_frozen_orders.py --work <scratch>`.
 * Paper soaks with streaming off and on, with real exchange connectivity,
   and the kill-switch drill (section F).
 * Optional, still without live trading: connect a read-only key and confirm

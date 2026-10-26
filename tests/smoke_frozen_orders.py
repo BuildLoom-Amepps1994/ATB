@@ -2,13 +2,20 @@
 
 python tests/smoke_frozen_orders.py --runtime PATH --work SCRATCH_FOLDER
 The simulation is installed only in a new temporary folder, never in the release.
+The staged app folder holds exactly the files the installer ships (read from
+scripts/build_installer.py), so a module missing from that list fails here.
+Without --runtime the same staged app is driven by this interpreter through
+windows_runtime.py from an otherwise empty runtime folder: a local rehearsal of
+the staging and the order path, not a check of the frozen Windows runtime.
 """
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -55,9 +62,31 @@ class FakeExchange:
 '''
 
 
+CREATION=getattr(subprocess,'CREATE_NO_WINDOW',0)
+
+
+def staged_app_files(root):
+    """The files the installer ships, read from the builder so this check cannot drift from it."""
+    spec=importlib.util.spec_from_file_location('build_installer_smoke',root/'scripts/build_installer.py')
+    builder=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    return sorted(builder.REQUIRED_APP)
+
+
+def runtime_command(runtime,root,installed):
+    """The frozen runtime when given; otherwise this interpreter running windows_runtime.py from an
+    otherwise empty runtime folder, so that only the staged app folder can satisfy application imports."""
+    if runtime is not None:
+        shutil.copytree(runtime,installed/'runtime')
+        return [str(installed/'runtime/CryptoPilotRuntime.exe')]
+    (installed/'runtime').mkdir()
+    shutil.copy2(root/'windows_runtime.py',installed/'runtime/windows_runtime.py')
+    return [sys.executable,str(installed/'runtime/windows_runtime.py'),'--app-dir',str(installed/'app')]
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--runtime',type=Path,required=True)
+    parser.add_argument('--runtime',type=Path,help='Folder holding CryptoPilotRuntime.exe; omit for a local rehearsal.')
     parser.add_argument('--work',type=Path,required=True)
     args=parser.parse_args()
     root=Path(__file__).resolve().parents[1]
@@ -65,15 +94,16 @@ def main():
     assert folder.parent==args.work.resolve()
     installed,data=folder/'install',folder/'portfolio'
     installed.mkdir();data.mkdir()
-    shutil.copytree(args.runtime,installed/'runtime')
+    command=runtime_command(args.runtime,root,installed)
     app=installed/'app';app.mkdir()
-    for name in ('app.py','trader.py','strategy.py','storage.py','credentials.py','market_data.py','launcher.py','recovery.py','updater.py','requirements-lock.txt'):
+    for name in staged_app_files(root):
+        (app/name).parent.mkdir(parents=True,exist_ok=True)
         shutil.copy2(root/name,app/name)
-    shutil.copytree(root/'static',app/'static')
     shutil.copytree(root/'maintenance',installed/'maintenance',ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
     (app/'simulated_exchange.py').write_text(FAKE,encoding='utf8')
     launcher=(app/'launcher.py').read_text(encoding='utf8')
     injected=('            from simulated_exchange import FakeExchange\n'
+              '            import ccxt.pro  # the streaming quote feed needs this in the runtime\n'
               '            import trader, credentials\n'
               '            trader.TradingEngine._new_exchange = staticmethod(lambda *a: FakeExchange.shared())\n'
               '            credentials.load = lambda _: None\n')
@@ -82,8 +112,7 @@ def main():
     with (app/'app.py').open('a',encoding='utf8') as handle:
         handle.write("\n@app.get('/api/simulation-proof')\ndef simulation_proof():\n    from simulated_exchange import FakeExchange\n    return {'fake_orders':FakeExchange.shared().orders}\n")
     env=dict(os.environ,CRYPTOPILOT_DATA_DIR=str(data),CRYPTOPILOT_NO_BROWSER='1',CRYPTOPILOT_PORT='18768',PYTHON_KEYRING_BACKEND='keyring.backends.null.Keyring')
-    exe=installed/'runtime/CryptoPilotRuntime.exe'
-    check=subprocess.run([str(exe),'--check-runtime'],env=env,capture_output=True,text=True,check=True,timeout=30,creationflags=subprocess.CREATE_NO_WINDOW)
+    check=subprocess.run([*command,'--check-runtime'],env=env,capture_output=True,text=True,check=True,timeout=30,creationflags=CREATION)
     assert json.loads(check.stdout)['valid']
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
     base='http://127.0.0.1:18768'
@@ -97,7 +126,7 @@ def main():
             raw=response.read()
             return json.loads(raw) if path!='/' else raw.decode()
     with (folder/'runtime.log').open('w') as log:
-        child=subprocess.Popen([str(exe)],cwd=folder,env=env,stdout=log,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW)
+        child=subprocess.Popen(command,cwd=folder,env=env,stdout=log,stderr=subprocess.STDOUT,creationflags=CREATION)
         try:
             for _ in range(150):
                 if child.poll() is not None: raise RuntimeError((folder/'runtime.log').read_text(errors='replace'))
@@ -129,7 +158,8 @@ def main():
                 assert not state['positions'] and len(state['trades'])==4 and not state['live_halted']
             assert api('/api/simulation-proof')['fake_orders']==['BUY','SELL','BUY','SELL']
             api('/api/mode',{'mode':'paper'})
-            print(json.dumps({'passed':True,'folder':str(folder),'paper_round_trips':2,'simulated_live_round_trips':2,
+            print(json.dumps({'passed':True,'folder':str(folder),'frozen_runtime':args.runtime is not None,
+                              'staged_files':len(staged_app_files(root)),'paper_round_trips':2,'simulated_live_round_trips':2,
                               'duplicate_requests_replayed':True,'native_TLS_checks':True,'real_orders':0,'real_credentials':False},indent=2))
         finally:
             child.terminate();child.wait(timeout=15)

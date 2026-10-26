@@ -60,7 +60,7 @@ Direct installed edits are detected. If the app folder differs from its installa
 
 Interrupted replacements retain a recovery record. The next launcher/update restores the previous source before continuing. If recovery fails, preserve the installation/backups and review the error; do not delete portfolio data to fix an installation problem. A source update is a locked, staged replacement with recovery, not a guarantee against every disk/power failure.
 
-Ordinary Python/dashboard changes do not require reinstalling the runtime. Changes to Python itself, native libraries or the dependency lock require a rebuilt installer. New application modules can be added directly under `app`; the conservative source updater currently packages the eight existing core modules plus dashboard assets.
+Ordinary Python/dashboard changes do not require reinstalling the runtime. Changes to Python itself, native libraries or the dependency lock require a rebuilt installer. New application modules can be added directly under `app`; the conservative source updater packages the fifteen core modules it lists plus dashboard assets. A source update cannot add a module that the installed updater does not list, so when a release adds modules (the hardening release adds six), upgrade with Setup; the in-app updater always uses Setup.
 
 ## In-app updates
 

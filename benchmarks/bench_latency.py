@@ -1,6 +1,7 @@
 """Latency benchmark for the quote -> decision -> order path. No exchange is contacted.
 
-Run from the repository root:  python benchmarks/bench_latency.py [--json out.json] [--repeat N]
+Run from the repository root:
+    python benchmarks/bench_latency.py [--json out.json] [--repeat N] [--warmup W] [--revision LABEL]
 
 The script only uses engine entry points that exist on both the previous
 release and this branch, so the same file produces comparable "before" and
@@ -8,17 +9,27 @@ release and this branch, so the same file produces comparable "before" and
 the new modules (decision records, the websocket feed, the metrics
 reservoirs) are skipped where those modules are absent and say so.
 
-What is measured (wall clock, milliseconds, p50/p95/p99 over ``--repeat``):
+Sampling: every row first runs ``--warmup`` iterations (default 5) that are
+discarded, then records ``--repeat`` samples (default 100); both numbers are
+the same for every row, so no row compares a cold first call with warm
+calls. Quantiles are nearest-rank on the sorted samples. A p99 is reported
+only when a row has at least 100 samples; below that the tail is reported
+as ``max_ms`` and ``tail`` says ``max``.
+
+What is measured (wall clock, milliseconds, p50/p95 and p99-or-max):
 
 * ``decision_cpu``      indicator pipeline + entry rule for one symbol, and
                         (new) one ``decision.evaluate_entry`` record.
 * ``scan_warm``         a strategy scan over 8 symbols whose candles are
                         cached: one bulk REST ticker read plus per-symbol
                         decisions. (new) The engine's own quote-to-decision
-                        reservoir for the same scans.
+                        reservoir, cleared after the warm-up so it covers the
+                        timed scans only; the set-up scans (one cold) are
+                        reported separately.
 * ``monitor_rest``      one protective monitor tick with 1 and 5 held
                         positions against a REST fake costing 0 ms and 150 ms
-                        per request.
+                        per request. The positions are opened with fresh
+                        marks and the script asserts they are all open.
 * ``monitor_stream``    (new) the same tick when every held asset has a live
                         stream quote, so no REST round trip is made.
 * ``feed_ingest``       (new) cost of ingesting one websocket update.
@@ -53,7 +64,8 @@ os.environ.setdefault('CRYPTOPILOT_NO_UPDATE_CHECK', '1')
 
 import storage  # noqa: E402
 import strategy  # noqa: E402
-from bench_hot_path import make_engine, walk  # noqa: E402
+import bench_hot_path  # noqa: E402
+from bench_hot_path import make_engine, open_paper_positions, walk  # noqa: E402
 
 try:
     import decision  # noqa: E402
@@ -65,22 +77,65 @@ except ImportError:                       # previous release
     HAS_NEW = False
 
 
-def pct(samples_ms: list[float]) -> dict:
+# Discarded iterations before every row; main() sets it from --warmup.
+WARMUP = 5
+# Below this many samples a "p99" is just the maximum, so it is not reported.
+P99_MIN_SAMPLES = 100
+
+
+def pct(samples_ms: list[float], *, warmup: int | None = None) -> dict:
     ordered = sorted(samples_ms)
+    count = len(ordered)
 
     def q(fraction):
-        return round(ordered[min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))], 3)
-    return {'count': len(ordered), 'p50_ms': q(.5), 'p95_ms': q(.95), 'p99_ms': q(.99),
-            'max_ms': round(ordered[-1], 3), 'mean_ms': round(statistics.fmean(ordered), 3)}
+        return round(ordered[min(count - 1, max(0, int(round(fraction * (count - 1)))))], 3)
+    result = {'count': count, 'warmup_discarded': WARMUP if warmup is None else warmup,
+              'p50_ms': q(.5), 'p95_ms': q(.95)}
+    if count >= P99_MIN_SAMPLES:
+        result['p99_ms'] = q(.99)
+    result.update({'max_ms': round(ordered[-1], 3), 'tail': 'p99' if count >= P99_MIN_SAMPLES else 'max',
+                   'mean_ms': round(statistics.fmean(ordered), 3)})
+    return result
 
 
-def timed(fn, repeat: int) -> dict:
+def timed(fn, repeat: int, *, after_warmup=None) -> dict:
+    """Run ``WARMUP`` discarded calls, then time ``repeat`` calls."""
+    for _ in range(WARMUP):
+        fn()
+    if after_warmup is not None:
+        after_warmup()
     samples = []
     for _ in range(repeat):
         start = time.perf_counter()
         fn()
         samples.append((time.perf_counter() - start) * 1000)
     return pct(samples)
+
+
+def tail_rule(summary):
+    """Apply the p99 rule to an engine reservoir summary (which always reports a p99)."""
+    if not isinstance(summary, dict) or summary.get('p50_ms') is None:
+        return summary
+    summary = dict(summary)
+    window = summary.get('window', summary.get('count', 0))
+    if window < P99_MIN_SAMPLES:
+        summary.pop('p99_ms', None)
+    summary['tail'] = 'p99' if 'p99_ms' in summary else 'max'
+    return summary
+
+
+def engine_reservoir(engine, name):
+    return tail_rule(engine.metrics.snapshot()['latency'].get(name)) if HAS_NEW else None
+
+
+def clear_reservoirs(engine, *names) -> dict:
+    """Drop the named engine reservoirs (shared by every engine in this process) and return what they held."""
+    if not HAS_NEW:
+        return {}
+    metrics = engine.metrics
+    with metrics.lock:
+        dropped = {name: metrics.timings.pop(name, None) for name in names}
+    return {name: tail_rule(reservoir.summary()) for name, reservoir in dropped.items() if reservoir is not None}
 
 
 def decision_cpu(repeat: int) -> dict:
@@ -103,7 +158,7 @@ def decision_cpu(repeat: int) -> dict:
             decision.evaluate_entry(symbol='BTC/USDT', last=last, regime_ok=regime, market_ok=None, rapid=False,
                                     filters=True, price=float(last['close']), volume=5e7, spread_pct=.02,
                                     quote_age_s=.2, quote_ts=now - .2, cfg=cfg, now=now)
-        result['decision_record'] = timed(record, repeat * 5)
+        result['decision_record'] = timed(record, repeat)
     else:
         result['decision_record'] = 'not available on this tree'
     return result
@@ -112,15 +167,20 @@ def decision_cpu(repeat: int) -> dict:
 def scan_warm(repeat: int, rtt: float = .15) -> dict:
     symbols = ['BTC/USDT'] + [f'C{i:02d}/USDT' for i in range(7)]
     engine, exchange = make_engine(symbols, rtt, 50, 'balanced')
-    engine.scan_once(allow_orders=False)
+    clear_reservoirs(engine, 'decision.quote_to_decision_ms')
+    engine.scan_once(allow_orders=False)          # cold: catalogue and candle downloads
     engine.scan_once(allow_orders=False)          # candles cached from here on
-    exchange.requests = 0
+    setup = {}
+
+    def after_warmup():
+        exchange.requests = 0
+        setup.update(clear_reservoirs(engine, 'decision.quote_to_decision_ms'))
     result = {'symbols': len(symbols), 'rtt_ms': rtt * 1000,
-              'scan': timed(lambda: engine.scan_once(allow_orders=False), repeat)}
+              'scan': timed(lambda: engine.scan_once(allow_orders=False), repeat, after_warmup=after_warmup)}
     result['requests_per_scan'] = exchange.requests / repeat
     if HAS_NEW:
-        summary = engine.metrics.snapshot()['latency'].get('decision.quote_to_decision_ms')
-        result['quote_to_decision_per_symbol'] = summary
+        result['quote_to_decision_per_symbol'] = engine_reservoir(engine, 'decision.quote_to_decision_ms')
+        result['quote_to_decision_setup_scans'] = setup.get('decision.quote_to_decision_ms')
         if engine.decisions.latest:
             sample = next(iter(engine.decisions.latest.values()))
             result['sample_decision'] = {'action': sample.action, 'status': sample.status, 'checks': len(sample.checks)}
@@ -166,24 +226,22 @@ def fresh_ledger(engine) -> None:
 def monitor_tick(positions: int, rtt: float, repeat: int, *, stream: bool) -> dict:
     symbols = [f'C{i:02d}/USDT' for i in range(positions)]
     engine, exchange = make_engine(symbols, rtt, 0, 'balanced')
-    fresh_ledger(engine)
-    engine.cfg['max_positions'] = 8
-    if 'max_orders_per_minute' in engine.cfg:
-        engine.cfg['max_orders_per_minute'] = 10 ** 6
-    for symbol in symbols:
-        assert engine._buy(symbol, 50, 100, .04), symbol
-        # A held asset needs a recent mark before the next entry is allowed.
-        engine.last_prices[symbol], engine.last_price_times[symbol] = 99.99, time.time()
-        getattr(engine, 'last_asks', {})[symbol] = 100.01
+    # Resets the shared ledger, seeds fresh marks before each buy and asserts
+    # that ``positions`` paper positions are open.
+    held = open_paper_positions(engine, symbols)
     engine.running = True
     engine.stop_event.clear()
     if stream:
         engine.feed = StubFeed(symbols)
-    exchange.requests = 0
-    result = timed(lambda: engine._monitor_if_due(force=True), repeat)
+
+    def reset_counter():
+        exchange.requests = 0
+    result = timed(lambda: engine._monitor_if_due(force=True), repeat, after_warmup=reset_counter)
     engine.running = False
-    return {'positions': positions, 'rtt_ms': rtt * 1000, 'source': 'stream' if stream else 'rest',
-            'requests_per_tick': exchange.requests / repeat, **result}
+    still_open = len(engine._active_positions(engine.mode))
+    assert still_open == positions, f'{positions - still_open} position(s) closed during the timed ticks'
+    return {'positions': positions, 'open_positions': len(held), 'rtt_ms': rtt * 1000,
+            'source': 'stream' if stream else 'rest', 'requests_per_tick': exchange.requests / repeat, **result}
 
 
 def feed_ingest(repeat: int) -> dict:
@@ -193,12 +251,13 @@ def feed_ingest(repeat: int) -> dict:
     stream = feed.QuoteFeed('mexc', symbols, client_factory=lambda: None, metrics=observability.Metrics())
     base = int(time.time() * 1000)
     updates = [{symbols[i % 40]: {'bid': 100 + i * 1e-4, 'ask': 100.02 + i * 1e-4, 'timestamp': base + i}}
-               for i in range(repeat * 20)]
+               for i in range(WARMUP + repeat)]
     samples = []
-    for update in updates:
+    for index, update in enumerate(updates):
         start = time.perf_counter()
         stream._ingest(update, time.time())
-        samples.append((time.perf_counter() - start) * 1000)
+        if index >= WARMUP:
+            samples.append((time.perf_counter() - start) * 1000)
     summary = pct(samples)
     summary['out_of_order'] = stream.counters['out_of_order']
     return summary
@@ -210,40 +269,53 @@ def paper_order(repeat: int) -> dict:
     if 'max_orders_per_minute' in engine.cfg:
         engine.cfg['max_orders_per_minute'] = 10 ** 6
     buys, sells = [], []
-    for _ in range(repeat):
+    for index in range(WARMUP + repeat):
+        if index == WARMUP:
+            clear_reservoirs(engine, 'execution.submit_total_ms', 'execution.submit_to_ack_ms')
         start = time.perf_counter()
         assert engine._buy('BTC/USDT', 50, 100, .04)
-        buys.append((time.perf_counter() - start) * 1000)
+        buy_ms = (time.perf_counter() - start) * 1000
         position = engine._active_positions('paper')[0]
         start = time.perf_counter()
         engine._sell(position, 100, 'benchmark exit')
-        sells.append((time.perf_counter() - start) * 1000)
+        sell_ms = (time.perf_counter() - start) * 1000
+        assert not engine._active_positions('paper'), 'the benchmark sell left a position open'
+        if index >= WARMUP:
+            buys.append(buy_ms)
+            sells.append(sell_ms)
     result = {'buy': pct(buys), 'sell': pct(sells)}
     if HAS_NEW:
-        timings = engine.metrics.snapshot()['latency']
-        result['engine_submit_total'] = timings.get('execution.submit_total_ms')
-        result['engine_submit_to_ack'] = timings.get('execution.submit_to_ack_ms')
+        # Buys and sells both submit, so these hold two samples per timed round trip.
+        result['engine_submit_total'] = engine_reservoir(engine, 'execution.submit_total_ms')
+        result['engine_submit_to_ack'] = engine_reservoir(engine, 'execution.submit_to_ack_ms')
     return result
 
 
 def main():
+    global WARMUP
     parser = argparse.ArgumentParser()
     parser.add_argument('--json')
-    parser.add_argument('--repeat', type=int, default=40)
+    parser.add_argument('--repeat', type=int, default=100, help='samples per row (the same for every row)')
+    parser.add_argument('--warmup', type=int, default=WARMUP, help='discarded iterations before every row')
+    parser.add_argument('--revision', default='', help='label for the measured tree (default: git rev-parse)')
     args = parser.parse_args()
-    try:
-        revision = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT, capture_output=True,
-                                  text=True, check=False).stdout.strip() or 'unknown'
-    except OSError:
-        revision = 'unknown'
-    results = {'tree': str(ROOT), 'revision': revision, 'python': platform.python_version(),
-               'has_new_modules': HAS_NEW, 'repeat': args.repeat,
+    WARMUP = bench_hot_path.WARMUP = max(0, args.warmup)
+    revision = args.revision
+    if not revision:
+        try:
+            revision = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT, capture_output=True,
+                                      text=True, check=False).stdout.strip()
+        except OSError:
+            revision = ''
+    results = {'tree': str(ROOT), 'revision': revision or 'unknown', 'python': platform.python_version(),
+               'has_new_modules': HAS_NEW, 'repeat': args.repeat, 'warmup': WARMUP,
+               'p99_min_samples': P99_MIN_SAMPLES,
                'decision_cpu': decision_cpu(args.repeat),
-               'scan_warm': scan_warm(max(5, args.repeat // 4)),
+               'scan_warm': scan_warm(args.repeat),
                'monitor_rest': [monitor_tick(1, 0.0, args.repeat, stream=False),
                                 monitor_tick(5, 0.0, args.repeat, stream=False),
-                                monitor_tick(1, .15, max(10, args.repeat // 2), stream=False),
-                                monitor_tick(5, .15, max(10, args.repeat // 2), stream=False)],
+                                monitor_tick(1, .15, args.repeat, stream=False),
+                                monitor_tick(5, .15, args.repeat, stream=False)],
                'monitor_stream': ([monitor_tick(1, .15, args.repeat, stream=True),
                                    monitor_tick(5, .15, args.repeat, stream=True)] if HAS_NEW
                                   else 'not available on this tree'),

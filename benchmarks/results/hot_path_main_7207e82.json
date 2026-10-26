@@ -1,12 +1,20 @@
 {
+  "tree": "/tmp/claude-0/-home-claude-ATB/708fc544-a67e-5b0b-9b0b-808594276845/scratchpad/bench_main",
+  "revision": "7207e82",
+  "python": "3.13.17",
+  "warmup": 5,
   "cpu": {
     "symbol_pipeline_175_candles": {
-      "median_ms": 3.951,
-      "min_ms": 3.83
+      "median_ms": 3.995,
+      "min_ms": 3.739,
+      "samples": 60,
+      "warmup_discarded": 5
     },
     "research_report_900_candles": {
-      "median_ms": 49.18,
-      "min_ms": 47.922
+      "median_ms": 49.607,
+      "min_ms": 48.994,
+      "samples": 5,
+      "warmup_discarded": 5
     }
   },
   "scan": [
@@ -15,10 +23,10 @@
       "rtt_ms": 150.0,
       "rate_limit_ms": 50,
       "horizon": "balanced",
-      "cold_scan_s": 1.072,
+      "cold_scan_s": 1.069,
       "cold_requests": 17,
       "max_concurrent_requests": 3,
-      "warm_scan_s": 0.17,
+      "warm_scan_s": 0.171,
       "warm_requests": 1
     },
     {
@@ -26,10 +34,10 @@
       "rtt_ms": 150.0,
       "rate_limit_ms": 50,
       "horizon": "rapid",
-      "cold_scan_s": 2.291,
+      "cold_scan_s": 2.288,
       "cold_requests": 41,
       "max_concurrent_requests": 3,
-      "warm_scan_s": 0.194,
+      "warm_scan_s": 0.193,
       "warm_requests": 1
     },
     {
@@ -37,23 +45,31 @@
       "rtt_ms": 150.0,
       "rate_limit_ms": 1000,
       "horizon": "balanced",
-      "cold_scan_s": 17.004,
+      "cold_scan_s": 17.002,
       "cold_requests": 17,
       "max_concurrent_requests": 1,
-      "warm_scan_s": 1.013,
+      "warm_scan_s": 1.014,
       "warm_requests": 1
     }
   ],
   "monitor": [
     {
       "positions": 1,
-      "median_ms": 2.686,
-      "min_ms": 1.352
+      "open_positions": 1,
+      "requests_per_tick": 1.0,
+      "median_ms": 1.515,
+      "min_ms": 1.401,
+      "samples": 100,
+      "warmup_discarded": 5
     },
     {
       "positions": 5,
-      "median_ms": 3.075,
-      "min_ms": 2.913
+      "open_positions": 5,
+      "requests_per_tick": 1.0,
+      "median_ms": 3.335,
+      "min_ms": 3.029,
+      "samples": 100,
+      "warmup_discarded": 5
     }
   ]
 }

@@ -20,7 +20,7 @@ def test_editable_spec_preserves_optional_interpreter_trust_policy(monkeypatch, 
     monkeypatch.setattr(ssl, '__file__', str(ssl_source))
     preflight = []
     monkeypatch.setattr(ssl, 'create_default_context', lambda: preflight.append(True))
-    hooks = SimpleNamespace(collect_data_files=lambda _: [], collect_submodules=lambda _: [], copy_metadata=lambda _: [])
+    hooks = SimpleNamespace(collect_data_files=lambda _: [], collect_submodules=lambda _, **__: [], copy_metadata=lambda _: [])
     monkeypatch.setitem(sys.modules, 'PyInstaller.utils.hooks', hooks)
     captured = {}
 

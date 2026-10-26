@@ -72,8 +72,9 @@ The order of operations for one quote is now:
 Sources: a parallel eight-lens audit of `7207e82` (execution, risk bypass,
 market data, concurrency, strategy leakage, latency, persistence, security)
 whose findings were deduplicated and checked against the code, observations
-made while implementing, and a second, adversarial review of the branch
-itself (findings 27 onwards), each reproduced before it was fixed. Severity is the reviewer's judgement of
+made while implementing, and further adversarial reviews of the branch
+itself and of each round's fixes (findings 27–89), each finding reproduced
+before it was fixed. Severity is the reviewer's judgement of
 impact on live capital or on the integrity of the record.
 
 | # | Sev. | Finding | Status on this branch |
@@ -87,8 +88,8 @@ impact on live capital or on the integrity of the record.
 | 7 | High | Manual dust consolidation anchors stop/target/highest on the blended cost average; the merged position can be stopped out at the next poll. | **Open** (pre-existing manual-order behaviour; recommendation in H). |
 | 8 | High | MEXC private client's clock offset is measured once at connect; after a clock step every private call fails with code 700003 and exits silently stop. | **Open** (recommendation in H). |
 | 9 | High | Kraken candle completion is cut on the local clock; when the PC clock runs ahead an open candle is admitted as completed. | **Open** (recommendation in H). |
-| 10 | Med. | Every MEXC bulk ticker read costs 25 rate-limit units and, for two or more symbols, downloads the whole catalogue. | **Mitigated**: protective checks use the book-ticker endpoint (cost 10, bid/ask only); with streaming on, no REST read at all while every held asset streams. |
-| 11 | Med. | Decision records existed only in memory; the durable trail could not reconstruct an entry decision and no exit verdict was recorded. | **Fixed**: full record in every `decision.entry` event, `decision.exit` events with source and levels. |
+| 10 | Med. | Every MEXC bulk ticker read costs 25 rate-limit units and, for two or more symbols, downloads the whole catalogue. | **Mitigated**: protective checks use the book-ticker endpoint (cost 10, bid/ask only); one held pair is requested by name (finding 54), two or more still read the whole, smaller book-ticker list; with streaming on, no REST read at all while every held asset streams. |
+| 11 | Med. | Decision records existed only in memory; the durable trail could not reconstruct an entry decision and no exit verdict was recorded. | **Fixed**: full record in `decision.entry` events (every entry and every change of a symbol's outcome, finding 56), `decision.exit` events with source, trigger and levels, `decision.withheld` for entries that did not become orders. |
 | 12 | Med. | A pre-submit exception from one candidate aborted the whole entry pass with a generic error. | **Fixed**: recorded and counted; paper continues, live ends the pass deliberately. |
 | 13 | Med. | Fee-estimate fallback books the estimate as a quote fee; on MEXC base-asset fees the tracked quantity can be overstated. | **Open**. |
 | 14 | Med. | MEXC public clock offset refreshes only with the hourly catalogue load; a clock step mis-ages quotes until then. | **Open** (same remedy as 8). |
@@ -96,26 +97,77 @@ impact on live capital or on the integrity of the record.
 | 16 | Med. | Decision id omitted indicator features, so two different candles could share an id. | **Fixed**: features are part of the record and the id. |
 | 17 | Med. | A withheld setup (stale quote, same-candle re-entry) showed `BUY setup` in the dashboard. | **Fixed**. |
 | 18 | Med. | In a cold scan, decisions use the start-of-scan snapshot; by the last symbol the quote can be about one second old on MEXC and up to ~17 s on Kraken. The entry itself re-reads a fresh ticker, so orders are not affected, but the record's quote age says so. | **Mitigated**: every record carries `quote_age_s`; with streaming on the freshest quote is overlaid at decision time. |
-| 19 | Med. | Paper orders now cost ~12 ms instead of ~3 ms (four journal writes with `synchronous=FULL`, authorization, events). | **Accepted**; orders are rare. Batching the journal writes is a possible follow-up. |
+| 19 | Med. | Paper orders now cost about 15 ms to buy and 11 ms to sell instead of about 3 ms (four journal writes with `synchronous=FULL`, authorization, events; section C). | **Accepted**; orders are rare. Batching the journal writes is a possible follow-up. |
 | 20 | Low | Switching to paper with open live positions hides them without a warning. | **Open**. |
 | 21 | Low | The manual-order idempotent replay has no caller in the dashboard. | **Open**. |
 | 22 | Low | Candle prefetch threads can outlive Stop. | **Open**. |
 | 23 | Low | In-app update: the idle check is not latched before the forced shutdown. | **Open**. |
 | 24 | Low | The protective tick ends with a paced private balance read at least every 30 s. | **Open**; measured tick cost stays small. |
 | 25 | Low | The hot path opens many short SQLite connections per tick; because each call is the only connection, every write also checkpoints and deletes the WAL (measured 2.5–9× slower per write than with one anchor connection held open). | **Open**; measured tick cost is 1.8 ms with one position. Keeping one idle connection open is the follow-up; it needs care with Windows file locks during tests and exchange switches. |
-| 26 | Info | CCXT 4.5.90 does not support `watch_tickers` for MEXC spot. | The feed uses `watch_bids_asks` on both exchanges, `watch_tickers` as a fallback where the former is missing. |
+| 26 | Info | CCXT 4.5.90 does not support `watch_tickers` for MEXC spot, and its `watch_bids_asks` never resolves there (finding 39). | The feed keeps one `watch_ticker` per symbol on MEXC and uses `watch_bids_asks` on Kraken, `watch_tickers` as a fallback where neither exists. |
 | 27 | Med. | The daily realised-loss stop was a live threshold, not the latch the runbook described: a looser setting or a later profit the same day lifted it. | **Fixed**: durable latch (`realized_stop.<mode>.<exchange>`), cleared only with `RESUME TRADING` (`clear_realized_stop`) or a paper reset; shown as `risk.realized_stop`. |
 | 28 | Med. | A confirmed MEXC fill whose fee is billed in a third asset (the MX deduction) halted live trading with the position missing from the ledger, so a real holding went unprotected. | **Fixed**: the fill is booked exactly (such a fee touches neither quote cash nor base quantity); its value is the configured estimate, with an audit warning and `execution.fee_unvalued`. The paper exchange can bill a third asset so the parity tests cover it. |
 | 29 | Med. | `recovery.py` rendered the new `acked` journal state as `unknown`, hiding the one fact the journal had captured. | **Fixed**; a test ties the two status sets together. |
 | 30 | Med. | Exits and the ledger step were not correlated in the event log; the runbook's "one grep over the intent id" claim did not hold for them. | **Fixed**: every exit decision carries an id through authorization, submit and the journal; `ledger.accounted` and `ledger.failure` carry the intent id. |
 | 31 | Med. | Operator and lifecycle actions (start, stop, mode, settings, credentials, manual orders) were recorded only in the 300-row, de-duplicating audit table. | **Fixed**: `engine.started/stopped`, `mode.changed`, `settings.saved`, `paper.reset`, `credentials.disconnected`, `manual_order.requested/completed/failed` events. |
-| 32 | Med. | Graceful shutdown printed nothing while it waited; a second Ctrl+C or closing the console window skips the engine stop, which the runbook contradicted. | **Mitigated**: a console line on stop, a bounded connection drain, runbook corrected. A Windows console-close handler is a follow-up (H). |
+| 32 | Med. | Graceful shutdown printed nothing while it waited; a second Ctrl+C or closing the console window skips the engine stop, which the runbook contradicted. | **Mitigated**: the engine now stops the moment Ctrl+C arrives (finding 50) and says so, the connection drain is bounded, runbook corrected. A Windows console-close handler is a follow-up (H). |
 | 33 | Med. | Start-up failures outside three known classes printed a bare traceback to a console that closes, and were recorded nowhere. | **Fixed**: one safe console line naming the failure class and the data folder, and a redacted traceback in `logs/startup.log`. |
 | 34 | Low | `_authorize` judged a symbol whose last quote had just been discarded as invalid on the price supplied, so a scan exit could go out on the stale mark. | **Fixed**: a symbol with a mark but no quote time is stale. |
 | 35 | Low | `orders.locate` treated MEXC's bare `ExchangeError` for an unknown order (code -2013) as a failed lookup, so the start-up probe never consulted the order lists. | **Fixed**. |
 | 36 | Low | The redaction heuristic could swallow a JSON string's closing quote, making exactly the incident-relevant event lines invalid JSON. | **Fixed**: strings are redacted before serialization and a quote ends a value. |
 | 37 | Low | `recovery --clear-halt` reported an exchange unblocked while intents on the other exchange still blocked live trading, and the engine's refusal did not say which. | **Fixed**: the notice and the refusal name the exchange and count. |
-| 38 | Low | Saved credentials used keyring's default roaming persistence on Windows. | **Fixed** in code (stored for this machine only); not verifiable outside Windows. |
+| 38 | Low | Saved credentials used keyring's default roaming persistence on Windows. | **Fixed** in code for new saves (stored for this machine only); keys saved by an earlier build keep their old persistence until saved again (finding 51). Not verifiable outside Windows. |
+| 39 | Med. | Streaming quotes could never go live on MEXC: MEXC spot sends top-of-book only as protobuf frames, CCXT 4.5.90 routes them to the per-symbol ticker channel, so the combined `watch_bids_asks` subscription was accepted but never resolved and the feed reconnected forever; `protobuf` was not even in the shipped dependencies. | **Fixed**: one long-lived `watch_ticker` per symbol on MEXC; `protobuf` in the requirements, the lock and the runtime build; the frozen smoke test decodes a MEXC frame; a test drives the real `ccxt.pro.mexc` client with protobuf frames. |
+| 40 | Med. | A stored stop or target that failed to fill was submitted twice per tick (protective pass, then trailing pass at the same bid), doubling exit orders and rejections, and the trailing levels stopped rising while the bid stayed above the target. | **Fixed**: the trailing pass does not resubmit a stored-level exit already tried at that bid; levels ratchet on every outcome (dust included). |
+| 41 | Med. | Quote ordering compared an exchange timestamp with a local receipt time; an exchange clock running a few seconds ahead made every later receipt-stamped book-ticker bid look older, hiding a stop breach. | **Fixed**: two exchange timestamps compare directly, otherwise arrival order decides. |
+| 42 | Low | MEXC allows 30 subscriptions per websocket connection; the feed could ask for 40. | **Fixed**: capped at 30, held positions first; `feed.unsubscribed` counts the rest, which stay on REST. |
+| 43 | Low | The decision module changed the dashboard status precedence: a signal that ran away on a thin or wide market showed the volume or spread status. | **Fixed**: the original order restored. |
+| 44 | Low | `DecisionLog` was read by the dashboard while the scan appended to it without a lock; engine code re-read `self.feed` between check and use. | **Fixed**. |
+| 45 | Med. | The realised-loss stop was written only when an entry was being authorized, so a later profit or the UTC rollover could hide a crossing before any entry attempt latched it. | **Fixed**: checked and latched at every fresh valuation (each monitor poll and scan) as well as in the gate. |
+| 46 | Low | Clearing the realised-loss stop had no effect for the rest of the day (the next entry re-latched on the same loss), and the dashboard had no control for it. | **Fixed**: the clear records the day's realised total and only a further loss that day latches again; a **Clear latched stop** button clears both latches with the phrase. |
+| 47 | Low | A fee billed in a third asset was left out of realised P/L (so the realised-loss stop tripped later than set), and a fee split between USDT and a third asset counted the estimate on top of the USDT part. | **Fixed**: the estimate enters cost basis and realised P/L only, cash and quantity stay exact, and only the uncounted remainder of the configured rate is estimated. |
+| 48 | Low | Failure-path events (uncertain submit, unjournaled unfilled order, fill accounting failure, halt) carried no intent id, breaking the one-grep correlation exactly where it matters. | **Fixed**: `ledger.failure`, `execution.halt` and `execution.unfilled` carry the intent id. |
+| 49 | Low | `manual_order.failed` was logged before the committed-fill check, so a filled and booked manual order could appear failed; its test asserted a tautology. | **Fixed**, with a real test. |
+| 50 | Low | After Ctrl+C the engine kept scanning and could open entries during uvicorn's silent connection drain (up to 30 s) before it was told to stop. | **Fixed**: the exit request stops the engine at once and prints what follows. |
+| 51 | Low | Credentials saved before finding 38's fix keep roaming persistence. | **Open by choice**: rewriting stored secrets automatically was not done without approval. Saving the keys again with **Remember** switches them (H). |
+| 52 | Med. | After the PC clock stepped back, the quote guard kept the pre-step bid (every new quote looked older) and reported it fresh at age 0, so a stop could be missed for the size of the step. | **Fixed**: a stored arrival time later than now is distrusted, new quotes are accepted, and such a stored quote is not fresh; an exchange timestamp ahead of arrival is capped at arrival for ageing. |
+| 53 | Med. | The feed lost updates that arrived while a watch was being re-armed (a market-wide burst left all but one symbol at pre-move prices) and served quotes from a closed connection after reconnecting. | **Fixed**: CCXT's own quote cache is read on every wake and at least once a second; quotes are discarded when a connection ends. Tests drive the real CCXT MEXC client with a burst. |
+| 54 | Med. | With one held MEXC position, every protective read downloaded the whole book-ticker list, got nothing back from CCXT and then waited about 1.25 s of pacing for a second read. | **Fixed**: one pair is requested by name; a test uses the real CCXT MEXC adapter with its HTTP layer stubbed. |
+| 55 | Low | One unlisted watchlist pair failed the whole combined subscription, so streaming never worked. | **Fixed**: only catalogue-listed pairs are streamed, and the feed drops a pair the exchange rejects (`feed.unlisted`). |
+| 56 | Med. | Every scan wrote a full decision record per symbol, so in rapid mode the 20 MB event log rotated the decision, order and ledger trail away within hours. | **Fixed**: every entry and every change of a symbol's action, status or reasons is written in full; unchanged repeats are counted (`decision.entry_unchanged`) and stay in `GET /api/decisions`. |
+| 57 | Med. | A symbol blocked by the durable same-candle rule was recorded as `enter` / `BUY setup` with the re-entry check passed. | **Fixed**: the record applies the same durable rule as the entry pass. |
+| 58 | Low | `enter` decisions that did not become orders (per-scan cap, positions, re-quote, budget, guards) left no trace. | **Fixed**: one `decision.withheld` event per candidate with a reason code. |
+| 59 | Low | The runbook said exit ids appear in `GET /api/decisions`. | **Fixed** (runbook): exit ids are in `decision.exit` events and the journal. |
+| 60 | Low | Trailing exits decided by the protective monitor were labelled `source='scan'`. | **Fixed**: `source='monitor'`, and every `decision.exit` names its trigger. |
+| 61 | Med. | The documented rollback was unsafe: builds before the schema-3 migration insert journal rows by position into ten columns, so on a migrated database every order they journal fails, and the first live protective exit halts instead of being sent. Reproduced against the real `7207e82` code. | **Fixed**: `recovery.py --prepare-downgrade` (confirmation phrase, refuses open intents, full database copy first) returns the journal to the old layout; rehearsed against `7207e82`, which then journals orders, and the current build migrates forward again. Runbook §9 and §G corrected. |
+| 62 | Low | A Stop that landed while Start was preparing the stream left the websocket thread running with the bot stopped, and it kept serving quotes after **Streaming quotes** was switched off. | **Fixed**: Start re-checks after the stream starts and stops it if a Stop or a worker exit came in between; saving settings with streaming off stops any stream. |
+| 63 | Low | The kill switch was read once at the start of authorization, so an order authorized just before the switch was engaged was still sent, including an exit the operator meant to block. | **Fixed**: `_submit` re-reads the switch right before sending, under the submission lock, and journals the intent `rejected` with a `risk.blocked_at_submit` event. |
+| 64 | Med. | The documented recovery for a broken source-only update ran `--update-source` on the backup inside the installation folder, which the helper always refuses. | **Fixed** (docs): copy the backup outside the installation first, or run Setup. The reviewer's rehearsal confirmed that the copied backup restores. |
+| 65 | Med. | An interrupted Setup upgrade from 1.4.0 could not be recovered: the new helper checked the 1.4.0 backup record against its own 15-module list and refused it, and Setup refuses to run while that record exists. Restoring the old source would not have been enough either, because Setup had already installed the new runtime, which refuses a source without the new modules. | **Fixed in pull request #9** (installer work): a Setup journal is rolled forward to the staged new source, and Setup recovers its own interrupted swap. This branch carried a narrower fix (`0d277d4`) and reverted it (`196f2da`) in favour of #9. The reverse case, a 1.4.0 helper restoring a newer record during a downgrade, cannot be fixed from here and is documented in §G. |
+| 66 | Med. | The slippage breaker never closed: it re-read the last three fills with no time limit, so with no new orders it blocked entries for good, and it was missing from `risk.breakers_open`, which the runbook said would count it down. | **Fixed**: a durable 30-minute hold, after which the fills that tripped it are spent; it and the rejection spike are reported with seconds remaining; the rejection spike counts only requests that reached the exchange. |
+| 67 | Med. | `daily_realized_loss_limit_pct` nets profits against losses, but the runbook called it the sum of today's losses, which overstated the control. | **Fixed** (docs): the runbook says net realised P/L. Counting losses only is a one-line change if you prefer it (H). |
+| 68 | Med. | The one-grep correlation claim failed: the authorization line is written before the intent exists, there was no submit line, and manual orders had no id. | **Fixed**: `execution.submitted` carries the intent and decision ids and the authorization token; manual orders carry `manual_<request id>`; runbook §7 says how the token links the authorization. |
+| 69 | Low | The runbook listed the daily equity guard among the latches cleared with `RESUME TRADING` (it clears at the next UTC day), and did not say that a hand-written `POST /api/risk` is refused without the dashboard's per-session token. | **Fixed** (docs). The realised-stop re-latch and the missing clear button were findings 46. |
+| 70 | Low | The hot-path benchmark's five-position monitor run held one position (later buys were refused for missing marks), and the review explained a tick speed-up by a cause that does not exist. | **Fixed** (section C): both scripts reset the paper ledger, seed fresh marks before every buy and assert the position count; the speed-up claim is withdrawn, because the branch tick is about 1 ms slower. |
+| 71 | Low | The latency table compared the old code's cold first call with warm calls on the branch at p99, took p95 and p99 of the warm scan from ten samples, and measured a branch commit seven commits old. | **Fixed** (section C): five discarded warm-up iterations and 100 samples for every row, p99 only from at least 100 samples, reservoirs cleared per row, and the branch measured at `18a2fdc` and rechecked at `31d13bd`. |
+| 72 | Low | The kill switch is stored per exchange, so changing exchanges silently left an engaged switch behind. | **Fixed**: an engaged switch is carried over to the new exchange with its exit policy; the runbook says it is per exchange. |
+| 73 | Low | The upgrade path said the in-app updater would offer the hardening build to a 1.4.0 installation, but the build was also numbered 1.4.0. | **Resolved by pull request #7**: releases are numbered 1.5.<commits on main>, so every merged build is newer than 1.4.0. |
+| 74 | Med. | A loss booked by a manual exit never latched the realised-loss stop. Manual orders need a stopped bot, and the latch ran only at a valuation (monitor, scan, Start, entry authorization), so a later profitable close or the UTC rollover could hide the crossing and the bot resumed entries. | **Fixed**: every booked exit checks the day's realised P/L against the limit straight after the ledger commit, valued from the cash the sale left (no extra exchange read). |
+| 75 | Low | A re-quote failing with a network error (not a `ValueError`) ended the whole entry pass, and a Stop at the end of a scan, an entry error in live mode or a live halt dropped the remaining `enter` decisions with no `decision.withheld` line, so the soak check in the runbook could not pass. | **Fixed**: a re-quote with bad or missing data withholds that candidate (`requote_unavailable`) and the pass goes on (a connection failure ends the pass, finding 84); the scan withholds its candidates when a Stop landed (`orders_not_allowed`); the live breaks withhold the rest (`entry_error`, `live_halted`); and anything else that ends the pass withholds the candidates not yet tried (`entry_pass_error`) before it is reported. |
+| 76 | Low | A Stop (or a worker exit) landing between the stream's creation and its `start()` took it out of `self.feed` before its thread started; the start then ran anyway and nothing in the engine could reach the thread. | **Fixed**: Start keeps its own reference to the stream it started and stops that one when the generation check sees the Stop. |
+| 77 | Low | The durable slippage hold is an end time on the PC clock, so a clock corrected backwards while it was open stretched the 30-minute pause by the size of the step. | **Fixed**: an end time more than 30 minutes away is pulled back to 30 minutes from now and saved. The rejection-spike window still counts by journal timestamps, so a backward step keeps those rejections counted until the clock catches up; that fails closed and is listed in section H. |
+| 78 | Low | Changing exchange carried the kill switch only when the target's switch was released, so an exits-blocked switch did not tighten an entries-only switch already engaged on the target. | **Fixed**: it is carried when the target is released or when the target allows exits that the carried switch blocks; a stricter target is left as it is. |
+| 79 | Low | `--prepare-downgrade` refused while any paper intent was open, although it drops paper rows anyway; the report and `--clear-halt` list live rows only, and a restart closes stale paper intents only for the configured exchange, so a paper row left open on the other exchange blocked the rollback with nothing to reconcile. | **Fixed**: only an open live intent blocks it, and the message says so. |
+| 80 | Low | `decision.exit` lines from the protective path (stored stop and target, which handles most exits) carried no `trigger`, although the runbook and finding 60 say every exit names it. | **Fixed**: `trigger` is set on that path too (`stored`). |
+| 81 | Low | An `enter` decision the risk gate refused (kill switch, caps, breakers) left no `decision.withheld` line and no journal row; only a `risk.blocked` event with the decision id. | **Fixed**: withheld as `risk_gate`, or `not_submitted` when nothing reached the journal for another reason. |
+| 82 | Low | The slippage breaker was judged only at the next entry attempt, so after three bad fills the state view showed no breaker and the 30-minute hold started whenever the next candidate appeared, possibly hours later. | **Fixed**: it is judged as each fill is booked, so the hold starts, and is listed, when the third bad fill lands. |
+| 83 | Low | The test review found fix paths no test pinned: a clear floor from an earlier day, the launcher's Ctrl+C wiring, intent ids on seven failure sites, the fee clamp, the worker-exit stream branch, the stream symbols a scan pushes, the fee estimate on a dust merge, eleven of twelve withheld reasons, the manual SELL id, a carried entries-only switch, the rejection-spike countdown, the rollback command line, the MEXC single-pair fallback and the dashboard's element ids. Each was shown by a mutant that passed the whole suite. | **Fixed**: one test per gap, each checked to fail on its mutant (section B). |
+| 84 | Low | The fix for finding 75 let the entry pass go on after a re-quote's connection failed. Each further candidate then waited out the same retries (up to about 55 s each) while no protective check ran, and the dashboard showed no error. | **Fixed**: a network-class failure (a transport failure after its retries, a rate limit or the exchange being unavailable) withholds the rest of the pass as `requote_unavailable` and ends it, and the scan reports the error as before; bad data for one pair still only skips that pair. |
+| 85 | Low | A database error in a report or check made after the ledger commit (the trade audit line, or the realised-loss and slippage checks added by findings 74 and 82, whose fallback audit could itself fail) was handled as a ledger failure, halting live trading for a fill that was booked correctly. | **Fixed**: once the commit succeeds the fill counts as done. `ledger.accounted` is written first; a failed report after it is logged as `ledger.post_commit_error` and never reaches the ledger-failure path, and the realised-loss and slippage checks run whatever happened to the reports (finding 88). |
+| 86 | Low | An entry whose order path raised before anything was journaled left no `decision.withheld` line in paper, and none for itself in live. | **Fixed**: it is withheld as `entry_error` unless its decision id reached the journal. |
+| 87 | Low | Finding 83 overstated its coverage: three withheld reasons (`held`, `protective_exit_pending`, `settings_review`) and the in-loop Stop, three intent-id sites (both ledger-commit failures and the paper sell's fill accounting), the live branch of the exit latch and the slippage check after a sell could each be removed without a test failing. The runbook's re-latch rule also left out that the loss must be past the current limit. | **Fixed**: a test for each, checked to fail on its mutant; the re-latch wording (runbook and the clear's audit line) is exact. |
+| 88 | Med. | The first fix for finding 85 treated any failure after the commit as a report failure, so a failed trade audit line also skipped the realised-loss and slippage checks that followed it: a manual losing close whose audit write failed did not latch, and a later profit could hide the crossing. | **Fixed**: the reports are contained on their own and the checks always run after them; their own warning lines cannot raise. |
+| 89 | Low | The tests for finding 88 covered only the sell. The buy's own report containment and its `ledger.accounted`-first order, the realised-loss fallback that cannot raise, and the commit boundary itself (`booked` set inside the transaction, so a commit that fails and rolls back would count as a booked fill and not halt live) could each be reverted with the whole suite passing. | **Fixed**: a test for each, checked to fail on its mutant (five mutants). |
 
 ---
 
@@ -135,14 +187,22 @@ impact on live capital or on the integrity of the record.
 | `app.py` | `POST /api/risk`, `GET /api/metrics`, `GET /api/decisions`; shutdown waits for in-flight work. |
 | `recovery.py` | Reports and `--clear-halt` consider live journal rows only. |
 | `static/index.html`, `static/dashboard.js` | Kill switch button, five hard-limit inputs, streaming toggle, feed status line, risk warnings. |
-| `benchmarks/bench_latency.py`, `benchmarks/replay.py`, `benchmarks/results/` | Latency percentiles (runs on both trees), determinism check, raw results. |
-| `tests/test_risk_gate.py`, `test_order_lifecycle.py`, `test_decisions.py`, `test_quote_feed.py`, `test_hardening_fixes.py`, `test_app_manifest.py`, `test_review_round2.py` (new) | 115 new tests; see D. |
+| `benchmarks/bench_latency.py`, `benchmarks/bench_hot_path.py`, `benchmarks/replay.py`, `benchmarks/results/` | Latency percentiles (the same files run on both trees, with warm-up, equal sample counts and real positions; findings 70 and 71), determinism check, raw results. |
+| `tests/test_risk_gate.py`, `test_order_lifecycle.py`, `test_decisions.py`, `test_quote_feed.py`, `test_hardening_fixes.py`, `test_app_manifest.py`, `test_review_round2.py` (new) | 114 new tests, plus one new parametrized case in `test_engine_integrity.py`; see D. |
 | `tests/test_recovery.py`, `test_execution_speed.py`, `test_quote_protection.py`, `test_review_fixes.py` | Fixture updates for schema version 3, the 12 USDT minimum and client order ids. |
 | `scripts/build_installer.py`, `windows_runtime.py`, `maintenance/update_installation.py` | The six new modules join the installer's staged file list, the frozen runtime's required-module set and the offline source updater's module list. The first Windows build of the branch failed its frozen-runtime smoke test with `No module named 'decision'` because these lists are explicit. |
 | `tests/test_app_manifest.py` (new), `tests/smoke_frozen_orders.py` | A test keeps the three lists equal to the repository's modules and asserts everything the launcher imports is staged. The smoke test stages exactly the installer's file set (read from the builder), imports `ccxt.pro` inside the runtime, and can be rehearsed without the frozen runtime (`--work` alone). |
 | `risk.py`, `storage.py`, `app.py`, `static/dashboard.js` | Realised-loss latch, its release action and warning text; redaction stops at quotes. |
 | `trader.py`, `orders.py`, `recovery.py`, `observability.py`, `launcher.py`, `credentials.py`, `paper_exchange.py` | Review-round fixes 28–38: exit freshness, third-asset fees, exit decision ids and ledger events, operator events, MEXC unknown-order lookup, `acked` in the report, per-exchange halt messages, pre-serialization redaction, start-up failure log, local-only credential persistence, paper fee-asset injection. |
-| `tests/test_review_round2.py` (new) | 16 tests reproducing the review-round findings and asserting the fixes. |
+| `tests/test_review_round2.py` (new) | 15 tests reproducing the review-round findings and asserting the fixes. |
+| `feed.py`, `requirements.txt`, `requirements-lock.txt`, `CryptoPilotEditable.spec`, `scripts/bootstrap.py`, `tests/smoke_frozen_orders.py` | Findings 39, 42, 53, 55: per-symbol MEXC watches, the 30-subscription cap, the cache sweep, reconnect hygiene, unlisted pairs; `protobuf` shipped and checked in the frozen runtime. |
+| `decision.py`, `trader.py`, `risk.py`, `storage.py`, `market_data.py`, `launcher.py` | Findings 40, 41, 43–50, 52, 54, 56–60: exit retry and ratchet, quote clocks, status order, locks, realised-loss latching and clearing, fee P/L, failure correlation, manual-order events, Ctrl+C, single-pair MEXC reads, decision trail. |
+| `static/index.html`, `static/dashboard.js`, `static/dashboard-core.js` | **Clear latched stop** button and warning text (finding 46). |
+| `tests/test_review_round3.py` (new), `tests/test_dashboard.js` | 32 + 1 tests for findings 39–60. Each new test was checked to fail with its fix removed. |
+| `recovery.py`, `trader.py`, `risk.py`, `RUNBOOK.md` | Findings 61–63: `--prepare-downgrade` for a rollback across the schema change, stream lifecycle on a fast Stop or with streaming off, kill switch re-read at submit. |
+| `tests/test_review_round3.py` | 7 more tests for findings 61–63, checked to fail with each fix removed, except the `allow_exits=True` case of the exit kill-switch test, a guard that passes without the fix. |
+| `risk.py`, `trader.py`, `storage.py`, `RUNBOOK.md`, `tests/test_review_round3.py` | Findings 66–69 and 72: breakers that close and report, the submit event and manual order ids, the kill switch across an exchange change; 7 tests, each checked to fail without its fix. |
+| `trader.py`, `risk.py`, `recovery.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new), `tests/test_dashboard.js` | Findings 74–89: realised-loss latch on every booked exit, withheld records whatever ends the entry pass or the gate refuses, the stream started by Start stopped by reference, the slippage hold capped after a clock step and judged at each fill, the stricter kill switch carried, a rollback not blocked by paper intents, the protective exit trigger, a booked fill that stays booked, a pass that ends on a connection failure, and the test reviews' gaps; 60 + 1 tests. Each fails on the mutation it targets (the reviewer's 16 mutants and 35 more), except the small-manual-loss test, a guard against latching too eagerly. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -152,59 +212,186 @@ four fixture updates above and one deliberate expectation change: a confirmed
 fill whose fee is billed in a third asset used to be left unresolved (live
 halted, position absent from the ledger); it is now booked with the fee value
 flagged (finding 28), because an unrecorded holding is the worse outcome.
+Later review rounds changed three of the branch's own tests on purpose: the
+dashboard status precedence test now expects the original order (finding 43),
+the third-asset fee test expects the estimate in the cost basis (finding 47),
+and the manual-order event test exercises a real failure (finding 49). The
+spec test's stub of PyInstaller's `collect_submodules` accepts its `filter`
+argument.
 
 ---
 
 ## C. Measurements
 
-**Setup.** Linux container, 4 CPUs, Python 3.13.17, pandas 3.x, CCXT 4.5.90.
-`benchmarks/bench_latency.py --repeat 40` was run unchanged on a checkout of
-`main` (`7207e82`) and on this branch (`17ca0e9`, before the last two commits,
-which do not touch the measured paths except for the book-ticker read, which
-the fake exchange does not offer). The fake exchange sleeps a fixed round-trip
-time per request; "stream" uses a stub feed that always has a fresh quote.
-Values are milliseconds, p50 / p95 / p99.
+**Setup.** Linux container, 4 CPUs, Python 3.13.17, pandas 3.0.5, CCXT 4.5.90.
+The corrected `benchmarks/bench_latency.py` and `benchmarks/bench_hot_path.py`
+(see "What changed" below) were copied unchanged into a clean export of `main`
+(`7207e82`) and of this branch (`18a2fdc`), and each script was run three
+times on each tree, one run at a time. The fake exchange sleeps a fixed
+round-trip time per request; "stream" uses a stub feed that always has a fresh
+quote. Every row first runs 5 warm-up iterations that are discarded and then
+records 100 samples. Values are milliseconds, p50 / p95 / p99 (nearest rank);
+a row with fewer than 100 samples would show its maximum in the last column
+instead, and no row below has fewer. The table is the latency run whose p50s
+sit closest to the three-run median on each tree (run 2 on both); the raw
+files are `benchmarks/results/latency_main_7207e82.json` and
+`latency_branch_18a2fdc.json`.
 
-| Measurement | `main 7207e82` | this branch |
+| Measurement | `main 7207e82` | this branch `18a2fdc` |
 |---|---|---|
-| Indicators + entry rule, one symbol (CPU) | 1.71 / 1.78 / 1.79 | 1.50 / 1.64 / 1.68 |
-| One decision record (`evaluate_entry`) (CPU) | n/a | 0.04 / 0.05 / 0.07 |
-| Warm scan, 8 symbols, 150 ms REST | 169.3 / 172.2 / 172.2 | 174.7 / 185.0 / 185.0 |
-| Protective tick, 1 position, REST 0 ms | 1.56 / 1.77 / 3.59 | 1.82 / 2.02 / 2.17 |
-| Protective tick, 5 positions, REST 0 ms | 3.07 / 3.31 / 4.80 | 3.48 / 3.74 / 4.01 |
-| Protective tick, 1 position, REST 150 ms | 152.2 / 152.5 / 155.0 | 152.7 / 152.9 / 152.9 |
-| Protective tick, 5 positions, REST 150 ms | 154.0 / 155.0 / 158.5 | 154.5 / 154.8 / 156.8 |
-| Protective tick, 1 position, **stream** (REST would cost 150 ms) | n/a | 1.65 / 1.85 / 2.06 |
-| Protective tick, 5 positions, **stream** | n/a | 3.84 / 5.55 / 10.73 |
-| Paper buy, decision to ledger | 3.02 / 3.37 / 3.51 | 12.29 / 18.07 / 24.85 |
-| Paper sell, decision to ledger | 2.77 / 2.91 / 3.86 | 10.02 / 13.46 / 15.21 |
-| Websocket ingest, one update | n/a | 0.01 / 0.01 / 0.04 |
+| Indicators + entry rule, one symbol (CPU) | 1.78 / 1.92 / 1.98 | 1.58 / 2.66 / 2.78 |
+| One decision record (`evaluate_entry`) (CPU) | n/a | 0.05 / 0.07 / 0.09 |
+| Warm scan, 8 symbols, 150 ms REST | 173.1 / 173.9 / 182.2 | 179.9 / 194.2 / 195.1 |
+| Protective tick, 1 position, REST 0 ms | 1.82 / 2.02 / 2.43 | 2.76 / 3.27 / 3.37 |
+| Protective tick, 5 positions, REST 0 ms | 3.87 / 4.02 / 4.06 | 4.54 / 4.73 / 4.89 |
+| Protective tick, 1 position, REST 150 ms | 152.8 / 154.4 / 155.1 | 153.5 / 156.5 / 157.8 |
+| Protective tick, 5 positions, REST 150 ms | 154.7 / 155.7 / 157.0 | 155.2 / 155.6 / 156.0 |
+| Protective tick, 1 position, **stream** (REST would cost 150 ms) | n/a | 2.64 / 3.17 / 3.33 |
+| Protective tick, 5 positions, **stream** | n/a | 4.53 / 4.93 / 5.06 |
+| Paper buy, decision to ledger | 3.27 / 4.29 / 5.29 | 14.77 / 16.02 / 16.39 |
+| Paper sell, decision to ledger | 3.06 / 4.29 / 4.98 | 10.80 / 11.39 / 11.53 |
+| Websocket ingest, one update | n/a | 0.003 / 0.004 / 0.006 |
 
-Engine reservoirs during the same run (branch only): `execution.submit_total_ms`
-p50 5.6 / p95 7.4 / p99 8.6 for paper orders; `decision.quote_to_decision_ms`
-p50 17 ms with a p95 of 665 ms, the tail being the cold scans where candle
-downloads run between the ticker snapshot and the decision (finding 18).
+Between the three runs on one tree, the p50 of the millisecond-scale rows
+moved by up to 17% and the 150 ms rows by under 1%. Tails move more: the
+branch's 2.66 / 2.78 ms tail for the indicator row was 1.76 / 1.82 and
+1.99 / 2.40 in the other two runs, so it is noise. The differences discussed
+below are larger than the spread. Three-run p50 ranges, main against branch:
+one-position tick 1.66–1.86 against 2.63–3.08, five-position tick 3.51–3.87
+against 4.54–4.99, warm scan 170.3–173.1 against 179.9–183.1, paper buy
+3.18–3.75 against 14.53–17.13, paper sell 2.95–3.48 against 10.57–12.38,
+indicators 1.59–1.89 against 1.54–1.61.
 
-The original hot-path benchmark (`bench_hot_path.py`) is unchanged within
-noise: cold 8-symbol scan 1.07 s → 1.07 s, 20-symbol rapid scan 2.29 s →
-2.29 s, Kraken-paced cold scan 17.0 s → 17.0 s, same request counts; the
-protective tick median improved from 2.7 ms to 2.0 ms (one position) because
-the monitor no longer re-evaluates unchanged trailing levels.
+Engine reservoirs in the same branch run, cleared after each row's warm-up so
+that they hold only the timed calls: `execution.submit_total_ms` p50 6.2 /
+p95 6.6 / p99 7.0 over 200 paper submits (a buy and a sell per round trip);
+`decision.quote_to_decision_ms` p50 17.0 / p95 31.5 / p99 38.5 over the 100
+timed warm scans (the reservoir keeps the last 512 of their 800 per-symbol
+samples). Over the seven untimed scans of that row (two set-up scans, the
+first of them cold, and five warm-up scans) the same reservoir reads p50 20.2 /
+p95 766 / max 919 from 56 samples. The long tail is therefore confined to the
+untimed scans, which include the cold one with its candle downloads between
+the ticker snapshot and the decision (finding 18).
 
-**Reading the table.** The engine's own cost per protective tick and per
-decision is unchanged within a fraction of a millisecond; the extra 5–10 ms on
-a warm scan is the decision records and events for eight symbols. The real
-latency change is structural: with streaming on and every holding quoted, a
-protective check costs about 2 ms instead of a REST round trip, and runs
-every second instead of every five. Paper orders are four times slower
-because they now do what live orders do (authorization, journal, events).
+The hot-path benchmark (`bench_hot_path.py`, same two exports, three runs
+each; the figures are from run 3 on both, `hot_path_main_7207e82.json` and
+`hot_path_branch_18a2fdc.json`) shows cold scans unchanged: 8 symbols 1.069 s
+→ 1.076 s, 20-symbol rapid scan 2.288 s → 2.295 s, Kraken-paced 8 symbols
+17.00 s → 17.00 s, with the same request counts (17, 41, 17) and the same
+peak concurrency (3, 3, 1). Single warm scans are slower on the branch: 8
+symbols 171 → 185 ms and 20 symbols 193 → 219 ms (three runs: 170–172 against
+178–185 ms, and 192–201 against 215–221 ms). The per-symbol indicator
+pipeline is unchanged within noise (median 4.00 against 4.04 ms). The
+protective tick is slower on the branch: median 1.52 → 2.73 ms with one
+position and 3.34 → 4.43 ms with five (three runs: 1.50–1.72 against
+2.50–3.20 ms, and 3.30–3.44 against 4.38–5.60 ms). Both trees now hold the
+number of positions each row names; the script asserts it before and after
+the timed ticks.
+
+After the final review's fixes (`31d13bd`, which adds one realised-P/L check
+to every booked exit), one more run of each script on the branch gave values
+within the run-to-run spread above: one-position tick 2.44 ms, five
+positions 4.28 ms, warm scan 178.2 / 180.0 ms, paper buy 14.68 ms and paper
+sell 12.07 ms at p50; hot-path tick medians 2.78 and 4.67 ms. The stored
+branch results are the `18a2fdc` runs. The replay check on `31d13bd`
+(`benchmarks/results/replay_branch_31d13bd.json`) reports 240 comparisons and
+no mismatches.
+
+**Reading the table.** Cold scans and request pacing are unchanged. The branch
+spends more engine time on the order path and on every protective tick, and
+it is not hidden by the network: the 150 ms REST rows carry about the same
+0.5 to 1.5 ms difference.
+
+* Protective tick: about 1 ms more with one position and 0.7 to 1 ms more with
+  five. A profile of 300 one-position ticks on each tree (cProfile) shows the
+  branch tick opening 12 SQLite connections and making 36 `execute` calls
+  where `main` opens 7 and makes 21; about four fifths of the extra profiled
+  time is
+  in `_daily_allowed`, which on the branch also calls the risk module's
+  equity (drawdown) and realised-loss observers. One run of the corrected
+  latency script on `17ca0e9`, the commit the earlier table measured, gave a
+  2.16 ms one-position tick, between the two trees above; part of the extra
+  cost therefore arrived after that commit. The individual commits were not
+  measured.
+* Streaming: with every holding quoted by the stream, a protective check
+  makes no REST request and costs the same engine time as a REST tick with a
+  0 ms round trip (2.64 against 2.76 ms with one position, 4.53 against
+  4.54 ms with five), instead of about 153 to 156 ms against a 150 ms REST
+  round trip. The engine also schedules it every second instead of every
+  `protective_poll_seconds` (5 by default); that interval comes from the code
+  (`STREAM_MONITOR_SECONDS`), the benchmark forces each tick.
+* Warm scan: 7 ms more at p50 and 20 ms more at p95 for eight symbols. One
+  `evaluate_entry` record measures 0.05 ms, so the records' own computation
+  accounts for under half a millisecond of it; the rest was not isolated.
+* Paper orders: about 4.5 times slower to buy and 3.5 times slower to sell.
+  The paper path now goes through the risk gate, the order journal and the
+  paper exchange adapter, the same submit and confirm path as live orders.
+  The engine's own submit timer (`execution.submit_total_ms`, buys and sells
+  together) reads 6.2 ms at p50, under half of either order's total; the
+  rest of the split was not profiled.
+
+**What changed in the measurement, and why.**
+
+1. *Positions are now really opened (finding 70).* The hot-path monitor rows
+   bought positions without giving any symbol a mark. On the branch the risk
+   gate refuses an entry while any held asset has a stale or missing mark, so
+   every buy after the first was refused; and because every engine in one
+   process shares the paper ledger and the five-position row did not reset
+   it, that row held one position, the one left over from the one-position
+   row. Reproduced with the original script: after the "5 positions" row,
+   `18a2fdc` had one open position and `7207e82` had five. Both scripts now
+   reset the paper ledger, give every symbol a fresh bid/ask through the
+   engine's own `_observe_ticker` before each buy (present on both trees),
+   assert that each buy succeeds and that the requested number of positions
+   is open before and after timing.
+2. *Warm-up (finding 71).* No iteration was discarded, so a cold first call
+   was one of the samples, and with 40 samples the "p99" was the maximum.
+   Rerunning the original sampling twice on `7207e82`, the first protective
+   tick was the slowest of the 40 every time, about twice the p50 (one
+   position: 3.74 against 1.74 ms, and 3.45 against 1.53 ms). On `17ca0e9`
+   the first tick was not the slowest. Every row now discards 5 warm-up
+   iterations.
+3. *Equal sample counts and an honest tail (finding 71).* Rows used 10, 20,
+   40, 200 or 800 samples. Every row now records 100, and a p99 is reported
+   only with at least 100 samples; below that the script labels the tail as
+   the maximum.
+4. *Reservoirs per row.* The engine reservoirs are one per process, so the
+   branch's reservoir figures mixed in samples from earlier rows (cold scans
+   in `quote_to_decision`, the monitor rows' buys in `submit_total`). They are
+   now cleared after each row's warm-up, and the set-up scans are reported
+   separately.
+5. *The branch head.* The branch is measured at `18a2fdc`, not `17ca0e9`. An
+   exported tree has no git metadata, so the scripts take `--revision` to
+   label their output.
+
+**The earlier figures that were wrong.** The previous table measured
+`17ca0e9` rather than the branch head. Its p99 column compared `main`'s cold
+first call with warm calls on the branch: `main`'s 3.59 and 4.80 ms
+protective-tick "p99" values were each the slowest of 40 samples, which on
+`main` is the cold first call (item 2), against p50s of 1.56 and 3.07 ms.
+Its warm-scan p95 and p99 came from ten samples, so both were the slowest
+scan of the ten.
+
+The previous hot-path sentence said the one-position protective tick median
+improved from 2.7 ms to 2.0 ms because the monitor no longer re-evaluates
+unchanged trailing levels. Both the result and the reason were wrong. With a
+warm-up and 100 samples the branch tick is slower, not faster: 1.52 → 2.73 ms
+at `18a2fdc`, and a corrected run on `17ca0e9` gives 2.16 ms against `main`'s
+1.66–1.86 ms. `main`'s 2.7 ms median from that run sat beside a 1.35 ms
+minimum and does not reproduce; three corrected runs give 1.50–1.72 ms. The
+stated cause could not have acted either: in this benchmark the tick never
+reaches the trailing code on either tree, because no candles are cached, and
+`_mark_positions` was called zero times in 50 five-position ticks on both.
+Separately, the branch's "5 positions" figure in that run (1.92 ms) was a
+one-position tick (item 1).
 
 **Limitations.** No real network, no real exchange pacing beyond the fake's
-fixed sleep, CPU timings depend on the host, and the stream numbers show the
-engine's cost once a quote has arrived, not the exchange's publication delay.
-`feed.exchange_to_receipt_ms` will report that delay once the feed runs
-against a real exchange. The measurements should be repeated on the Windows
-machine with Python 3.14 (section H).
+fixed sleep, and a shared container whose CPU timings vary by up to 17% at
+p50 between runs. The stream numbers show the engine's cost once a quote has
+arrived, not the exchange's publication delay; `feed.exchange_to_receipt_ms`
+will report that delay once the feed runs against a real exchange. The
+measurements should be repeated on the Windows machine with Python 3.14
+(section H).
 
 ---
 
@@ -212,8 +399,8 @@ machine with Python 3.14 (section H).
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **549 passed** |
-| `node --test tests/test_dashboard.js` | 11 passed | 11 passed |
+| `python -m pytest tests -q` | 434 passed | **658 passed** |
+| `node --test tests/test_dashboard.js` | 11 passed | 15 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
 | `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
 
@@ -252,7 +439,7 @@ New test files and what they prove:
   frozen runtime's required modules and the source updater's module list all
   equal the repository's top-level modules; everything the launcher imports
   is staged; every dashboard asset is staged.
-* `tests/test_review_round2.py` (16): the realised-loss latch (settings,
+* `tests/test_review_round2.py` (15): the realised-loss latch (settings,
   profit, phrase, API, paper reset), an invalidated quote is stale for the
   gate, third-asset fees booked on the live and paper paths, MEXC unknown
   order code treated as absent, recovery statuses match the journal, the
@@ -260,6 +447,50 @@ New test files and what they prove:
   decision, authorization, journal and ledger events, operator and manual
   order events, redaction keeps lines valid JSON, start-up failures are
   logged safely.
+* `tests/test_review_round3.py` (46): the real CCXT MEXC websocket client fed
+  protobuf frames goes live, keeps both symbols updating and serves the newest
+  quote after a burst; the 30-subscription cap; cache entries a combined watch
+  did not return; no pre-outage quotes after a reconnect; an unlisted pair;
+  protobuf in the dependency files; exchange clock ahead, PC clock stepped
+  back, and age capped at arrival; one exit order per poll for a rejected
+  target, with the trail still rising; a new bid between the two passes;
+  trigger names and dust ratchet; status order; concurrent decision-log reads;
+  the feed cleared mid-poll; realised-loss latching on booking, clearing and
+  re-latching; third-asset fees in P/L on both legs and split fees; intent ids
+  on failure and halt events; a filled manual order never logged as failed;
+  one MEXC pair read by name with the real adapter; catalogue-only streaming;
+  the same-candle rule in the record; unchanged abstentions; withheld reasons;
+  monitor-labelled exits; Ctrl+C stopping the engine first; no stream left
+  running after a Stop during Start or with streaming off; the kill switch
+  engaged after authorization stopping an entry, and an exit only when exits
+  are blocked; a rollback prepared by `recovery.py` letting the old positional
+  journal insert succeed, with the full copy kept, and refusing open intents
+  or a wrong phrase; the slippage breaker reported, closing on its own,
+  tripping again only on newer fills and cleared by a paper reset; the
+  rejection spike reported and ignoring orders never sent; one intent id
+  finding the submit, whose token finds the authorization; manual order ids;
+  the kill switch carried to the other exchange.
+* `tests/test_review_round4.py` (60): a manual close that crosses the
+  realised-loss limit latches before a later profitable close, and a small
+  one does not, also on the live path; a connection failure on a re-quote
+  withholds the rest and ends the pass, while bad data for one pair skips
+  only that pair; an error that ends the pass withholds only the candidates
+  not yet tried; a Stop at the end of a scan and a live halt leave a
+  withheld line for every remaining `enter`; a Stop between the stream's creation and its
+  start leaves no stream thread running; a slippage hold seen after a
+  six-hour backward clock step counts down from 30 minutes and closes; an
+  exits-blocked switch tightens an entries-only one on the target, and an
+  entries-only switch does not loosen an exits-blocked target; an open paper
+  intent on another exchange does not block the rollback that drops it; a
+  protective exit names its trigger; gate refusals are withheld; the slippage
+  hold is listed as soon as the third bad fill is booked; and one test for
+  each coverage gap in findings 83 and 87; a report failing after the ledger
+  commit leaves the fill booked with no halt, and still latches the loss and
+  judges the slippage, after a buy as after a sell, and so does a failed loss
+  check whose warning line also fails; a ledger commit that fails is a ledger
+  failure that halts live, not a booked fill; an entry that raised before the
+  journal is withheld, one that reached it is not. `tests/test_dashboard.js` also checks that
+  every element id the dashboard script looks up exists in the page.
 
 **Not runnable here.**
 
@@ -271,8 +502,9 @@ New test files and what they prove:
   imports `ccxt.pro` inside the runtime, so a missing websocket dependency
   fails the build rather than the first streaming session.
 * Any test against a real MEXC or Kraken endpoint (both are unreachable from
-  this environment). The websocket feed has only been exercised with a
-  scripted fake client.
+  this environment). The websocket feed has been exercised with scripted
+  clients and with the real CCXT MEXC client fed locally built protobuf
+  frames, never against the exchange itself.
 * `tests/test_dashboard_browser.cjs` (Playwright) was not run.
 * Python 3.14 on Windows: the suite ran on 3.13 here. The pull request's
   Windows job (Python 3.14.9) then ran it: 528 passed, but five module
@@ -338,8 +570,9 @@ What the records can and cannot say:
 ## G. Rollback
 
 Commits 1–10 below reached `main` through pull request #5 (merged 2026-10-26
-01:07 UTC); the follow-up pull request carries commit 11 on top of that merge.
-Oldest first:
+01:07 UTC) and commit 11 through pull request #6 (merged 01:31 UTC). Pull
+request #8 carries commits 12–21, plus documentation and benchmark updates, on top of
+`main` after pull request #7 (automatic releases). Oldest first:
 
 1. `a83667d` Add an independent risk gate, kill switch and structured events
 2. `185b346` Make order execution an explicit state machine shared by paper and live
@@ -351,15 +584,48 @@ Oldest first:
 8. `21c4692` Document the hardened engine: runbook, README summary and review deliverables
 9. `030a8f2` Append the event log per write so Windows can delete the data directory
 10. `14033fc` Ship the new modules in the installer, runtime and source updater
-11. (review) Close the second review round: realised-loss latch, fee assets, correlation, operator events
+11. `2ea317d` Close the second review round: realised-loss latch, fee assets, correlation, operator events
+12. `220edcd` Make MEXC streaming go live; one exit attempt per tick; compare quotes on one clock
+13. `db82565` Close the final review: latch on booking, stream cache sweep, clock steps, decision trail
+14. `5ddd2df` Close the concurrency review: safe rollback, stream lifecycle, kill switch at submit
+15. `be20041` Close the documentation review: breakers that close, one-id order trail, kill switch scope
+16. `31d13bd` Close the final engine review: manual-exit latch, withheld entries, stream start, clock-capped hold, stricter carry
+17. `6ce9aae` Let a rollback through when only paper intents are open, since it drops them
+18. `2fbe3a3` Close the documentation and test reviews: exit triggers, gate refusals withheld, slippage judged at each fill
+19. `1b0fb2e` Keep booked fills booked, end the entry pass on a connection failure, withhold raised entries
+20. `5b76b21` Run the loss and slippage checks after a booked fill whatever happens to its reports
+21. `0bd5a47` Pin the buy side, the loss-check fallback and the commit boundary of the booked-fill fix
 
-`git revert` them newest first, or check out `7207e82` to go back to v1.4.0
-entirely. Data: the schema change is additive (`PRAGMA user_version = 3`, new
-nullable journal columns); an older build opens the same file and ignores the
-new columns. Stop the bot before downgrading so no paper intent is
-non-terminal, because older builds do not distinguish paper journal rows from
-live ones. The new settings keys are ignored by older builds. The event log and
-decision log are informational and can be deleted.
+Commit `0d277d4` (recovery of an interrupted update from another release) and
+its revert `196f2da` cancel out; pull request #9 carries that fix instead
+(finding 65).
+
+`git revert` them newest first. Reverting commits 11–21 needs no data step:
+their data changes are meta keys that older builds ignore.
+
+Going back past commit 1 (to `7207e82`, v1.4.0) crosses the schema change
+(`PRAGMA user_version = 3`, ten new journal columns). Builds from before it
+insert journal rows by position, so on a migrated database every order they
+journal fails, and their first live exit halts instead of being sent
+(finding 61). Before starting such a build, stop the bot, close the app and run
+`python recovery.py --prepare-downgrade --confirm "I AM ROLLING BACK CRYPTOPILOT"`.
+It refuses while any live journal intent is open (open paper intents are
+dropped with the other paper rows), saves a full copy of the database
+under `backups/` in the data folder, keeps the live journal rows in the old
+layout and drops the paper rows, which older builds would read as live. This
+was rehearsed against the real `7207e82` code: before the step its journal
+insert failed, after it the insert succeeded, and the current build migrated
+the file forward again. The new settings keys are ignored by older builds.
+The event log and decision log are informational and can be deleted.
+
+A downgrade by running an older Setup over this installation must not be
+interrupted. If it is, the older release's helper cannot read this release's
+backup record (finding 65), so the app will not start and either Setup asks
+for recovery first. Restore by hand with the app closed: move
+`backups\setup-<stamp>\app` back to `app` (keep any `app` already there under
+another name), copy `backups\setup-<stamp>\installation.json` to the
+installation folder, delete `update-transaction.json`, then run the Setup you
+want.
 
 ---
 
@@ -370,6 +636,10 @@ decision log are informational and can be deleted.
 1. Clock discipline (findings 8, 9, 14, 15): measure the exchange time offset
    periodically (`fetch_time`) for both exchanges and refresh it on a MEXC
    700003 error; use it for Kraken candle cut-off and the re-entry marker.
+   The rejection-spike window and the slippage re-arm also count by journal
+   timestamps on the PC clock (finding 77): after a backward step the spike
+   stays open until the clock catches up, and the slippage breaker samples
+   only fills made after it has.
 2. Manual dust consolidation (7): derive the merged position's stop and target
    from the new fill rather than the blended average, or refuse to merge when
    the blended stop would be above the current bid.
@@ -384,20 +654,34 @@ decision log are informational and can be deleted.
    frozen runtime that calls `engine.stop()` and waits briefly, so closing the
    window behaves like Ctrl+C instead of a hard kill.
 7. One anchor SQLite connection (25) to stop the per-call WAL checkpoint.
+   It may also take back part of the protective tick's extra millisecond
+   (section C; not measured): the branch tick opens 12 connections where
+   `main` opens 7, mostly for the drawdown and realised-loss observers.
 8. Manifest-driven source updates: `maintenance/update_installation.py`
    packages a fixed module list, so a source-only update applied by an
    *older* installed helper cannot add modules that a newer release
    introduces. Hashing the top-level modules actually present (with the
    fixed list as the required minimum) would let later additions flow through
    `--update-source` as well as Setup.
+9. Latch records (risk.py): the kill switch, the realised-loss and drawdown
+   stops and the slippage breaker store their state first, then write the
+   audit line, then the event. A failed audit write right after a latch is
+   stored leaves the latch in force but skips its event, and the caller may
+   then report the step as failed although the latch holds. Writing the event first,
+   as `ledger.accounted` now is (finding 85), would keep it.
 
-**Upgrade path for an existing installation.** If the 1.4.0 build from CI is
-installed anywhere, upgrade it with the new Setup (the in-app updater does
-this), not with `UPDATE_INSTALLED.bat` / `--update-source`: the installed
-helper would copy only the nine modules it knows, and the app would then stop
-at start with `No module named 'decision'`. Recovery from that state is
-`CryptoPilotRuntime.exe --update-source <installation>\backups\update-<stamp>\app`,
-which restores the backed-up source.
+**Upgrade path for an existing installation.** Upgrade an installed copy with
+Setup (the in-app updater downloads and runs it), not with
+`UPDATE_INSTALLED.bat` / `--update-source`. Commit 12 adds the `protobuf`
+dependency, so a source-only update is refused (the lock file differs) and only
+Setup brings the new runtime. Applied to a 1.4.0 installation, a source-only
+update from a tree before commit 12 (`main` with pull requests #5–#7) would
+instead copy only the nine modules the old helper knows, and the app would
+stop at start with `No module named` one of the new modules. To recover, copy
+`<installation>\backups\update-<stamp>\app` to a folder outside the
+installation and run `CryptoPilotRuntime.exe --update-source <that copy>`;
+the helper refuses a source inside the installation folder (finding 64).
+Setup is the simpler fix: it installs the matching app and runtime.
 
 **What only you can verify.**
 
@@ -413,14 +697,20 @@ which restores the backed-up source.
   the start-up probe reports no unresolved intents.
 * After saving a key with **Remember** on Windows, confirm in Credential
   Manager that the `CryptoPilot` entry shows persistence *Local computer*
-  (finding 38 cannot be checked outside Windows).
+  (finding 38 cannot be checked outside Windows). Keys saved by an earlier
+  build keep their old persistence until you connect again with **Remember**
+  (finding 51); whether the app should rewrite them automatically is your
+  call.
 
 **Explicit approvals requested.**
 
-* Approval to merge the follow-up pull request (commit 11) after its Windows
-  build is green. Pull request #5 (commits 1–10) is already merged.
+* Approval to merge pull request #8 (commits 12–21) after its Windows build
+  is green. Pull requests #5 and #6 (commits 1–11) are already merged.
 * Whether to take the follow-ups above in a further branch.
-* Whether this should become a tagged release (the app version is still
-  1.4.0; a tag publishes an installer to GitHub Releases, which the app offers
-  as an update).
+* Whether the daily realised-loss stop should count today's losing trades
+  only instead of net realised P/L (finding 67). Net is the current
+  behaviour; losses-only stops sooner after a mixed day.
+* Since pull request #7, every merge to `main` publishes a release
+  (`1.5.<commits on main>`) that installed copies offer as an update, so
+  merging #8 also ships it to installed copies through Setup.
 * No live enablement is requested or implied.

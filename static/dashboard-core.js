@@ -127,7 +127,14 @@
     if (status.available) return {text: `CryptoPilot ${String(status.latest_version || '')} is available.`, error: false};
     return {text: 'CryptoPilot is up to date.', error: false};
   }
-  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast};
+  // Latched entry stops the operator can clear with the release phrase, from /api/state's risk block.
+  function latchedStops(risk) {
+    const stops = [];
+    if (risk?.drawdown_stop) stops.push({action: 'clear_drawdown_stop', label: 'drawdown stop'});
+    if (risk?.realized_stop) stops.push({action: 'clear_realized_stop', label: 'daily realised-loss stop'});
+    return stops;
+  }
+  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CryptoPilotUI = api;
 })(typeof window === 'undefined' ? globalThis : window);

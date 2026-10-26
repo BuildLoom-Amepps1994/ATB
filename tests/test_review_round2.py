@@ -103,9 +103,11 @@ def test_a_live_fill_with_a_fee_in_another_asset_is_booked_not_halted(engine, mo
     assert engine._buy('BTC/USDT', 800, 100, .04)
     assert not engine.live_halted
     position = engine._active_positions('live')[0]
-    assert position['qty'] == pytest.approx(1.0) and position['cost'] == pytest.approx(100.0)
+    estimate = 100 * engine.cfg['fee_pct'] / 100
+    # Quantity is exact; the cost basis carries the fee estimate so realised P/L bears it.
+    assert position['qty'] == pytest.approx(1.0) and position['cost'] == pytest.approx(100.0 + estimate)
     trade = storage.rows("SELECT fee FROM trades WHERE mode='live' AND side='BUY'")[0]
-    assert trade['fee'] == pytest.approx(100 * engine.cfg['fee_pct'] / 100)
+    assert trade['fee'] == pytest.approx(estimate)
     assert any('fee charged in another asset (0.05 MX)' in message for message in audit_messages())
     unvalued = [fields for kind, fields in events if kind == 'execution.fee_unvalued']
     assert unvalued and unvalued[0]['fees'] == {'MX': .05}
@@ -201,9 +203,12 @@ def test_manual_orders_are_events(engine, monkeypatch):
     assert result['status'] == 'filled'
     kinds = [kind for kind, _ in events]
     assert 'manual_order.requested' in kinds and 'manual_order.completed' in kinds
-    with pytest.raises(storage.ConfigValidationError):
-        engine.manual_trade('BTC/USDT', 'SELL', quote_amount=5)
-    assert [kind for kind, _ in events].count('manual_order.failed') >= 0   # a validation error precedes the request record
+    # A refusal inside the recorded request (no tracked ETH position) is one failed event with its id.
+    request_id = '6f1d3c3e-8c55-4c1f-9d6c-1f0a6b2e9b11'
+    with pytest.raises(storage.ConfigValidationError, match='No tracked position'):
+        engine.manual_trade('ETH/USDT', 'SELL', request_id=request_id)
+    failed = [fields for kind, fields in events if kind == 'manual_order.failed']
+    assert len(failed) == 1 and failed[0]['request_id'] == request_id and failed[0]['error'] == 'ConfigValidationError'
 
 
 # --- Redaction keeps event lines valid JSON ---------------------------------------------------

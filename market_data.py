@@ -180,11 +180,25 @@ class MarketData:
 
         MEXC's book-ticker endpoint costs 10 rate-limit units against 25 for
         the 24h ticker and returns a far smaller body; it carries no turnover,
-        which protective checks do not need. Exchanges without it (Kraken)
-        use the ticker read. Tickers without timestamps age from receipt.
+        which protective checks do not need. A single MEXC pair is requested
+        by name; several pairs read the full book-ticker list once, still
+        lighter than the full 24h list. Exchanges without it (Kraken) use the
+        ticker read. Tickers without timestamps age from receipt.
         """
         if getattr(self.client,'has',{}).get('fetchBidsAsks') is True:
-            result = self.read('fetch_bids_asks',symbols)
+            symbols = list(symbols)
+            if len(symbols) == 1 and getattr(self.client, 'id', None) == 'mexc':
+                # CCXT 4.5 sends MEXC no symbol filter: a one-symbol read would
+                # download the whole book-ticker list, parse it as one entry and
+                # return nothing, forcing a second, throttled ticker read. Name
+                # the market so the endpoint returns just that pair.
+                try:
+                    market_id = self.client.market(symbols[0])['id']
+                except Exception:
+                    return self.tickers(symbols)
+                result = self.read('fetch_bids_asks', symbols, {'symbol': market_id})
+            else:
+                result = self.read('fetch_bids_asks',symbols)
             if not isinstance(result,dict):
                 return {}
             received = self.clock()

@@ -1,17 +1,21 @@
 {
-  "tree": "(checkout root)",
+  "tree": "/tmp/claude-0/-home-claude-ATB/708fc544-a67e-5b0b-9b0b-808594276845/scratchpad/bench_main",
   "revision": "7207e82",
   "python": "3.13.17",
   "has_new_modules": false,
-  "repeat": 40,
+  "repeat": 100,
+  "warmup": 5,
+  "p99_min_samples": 100,
   "decision_cpu": {
     "indicators_plus_rule": {
-      "count": 40,
-      "p50_ms": 1.708,
-      "p95_ms": 1.778,
-      "p99_ms": 1.79,
-      "max_ms": 1.79,
-      "mean_ms": 1.705
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 1.775,
+      "p95_ms": 1.916,
+      "p99_ms": 1.979,
+      "max_ms": 2.045,
+      "tail": "p99",
+      "mean_ms": 1.783
     },
     "decision_record": "not available on this tree"
   },
@@ -19,12 +23,14 @@
     "symbols": 8,
     "rtt_ms": 150.0,
     "scan": {
-      "count": 10,
-      "p50_ms": 169.269,
-      "p95_ms": 172.183,
-      "p99_ms": 172.183,
-      "max_ms": 172.183,
-      "mean_ms": 169.514
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 173.092,
+      "p95_ms": 173.917,
+      "p99_ms": 182.221,
+      "max_ms": 185.08,
+      "tail": "p99",
+      "mean_ms": 173.265
     },
     "requests_per_scan": 1.0,
     "quote_to_decision_per_symbol": "not available on this tree"
@@ -32,51 +38,63 @@
   "monitor_rest": [
     {
       "positions": 1,
+      "open_positions": 1,
       "rtt_ms": 0.0,
       "source": "rest",
       "requests_per_tick": 1.0,
-      "count": 40,
-      "p50_ms": 1.565,
-      "p95_ms": 1.77,
-      "p99_ms": 3.593,
-      "max_ms": 3.593,
-      "mean_ms": 1.618
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 1.818,
+      "p95_ms": 2.017,
+      "p99_ms": 2.425,
+      "max_ms": 2.555,
+      "tail": "p99",
+      "mean_ms": 1.853
     },
     {
       "positions": 5,
+      "open_positions": 5,
       "rtt_ms": 0.0,
       "source": "rest",
       "requests_per_tick": 1.0,
-      "count": 40,
-      "p50_ms": 3.07,
-      "p95_ms": 3.312,
-      "p99_ms": 4.804,
-      "max_ms": 4.804,
-      "mean_ms": 3.111
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 3.867,
+      "p95_ms": 4.02,
+      "p99_ms": 4.055,
+      "max_ms": 4.144,
+      "tail": "p99",
+      "mean_ms": 3.879
     },
     {
       "positions": 1,
+      "open_positions": 1,
       "rtt_ms": 150.0,
       "source": "rest",
       "requests_per_tick": 1.0,
-      "count": 20,
-      "p50_ms": 152.234,
-      "p95_ms": 152.532,
-      "p99_ms": 155.029,
-      "max_ms": 155.029,
-      "mean_ms": 152.379
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 152.826,
+      "p95_ms": 154.372,
+      "p99_ms": 155.098,
+      "max_ms": 155.229,
+      "tail": "p99",
+      "mean_ms": 153.026
     },
     {
       "positions": 5,
+      "open_positions": 5,
       "rtt_ms": 150.0,
       "source": "rest",
       "requests_per_tick": 1.0,
-      "count": 20,
-      "p50_ms": 154.012,
-      "p95_ms": 154.979,
-      "p99_ms": 158.496,
-      "max_ms": 158.496,
-      "mean_ms": 154.27
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 154.667,
+      "p95_ms": 155.694,
+      "p99_ms": 157.014,
+      "max_ms": 158.967,
+      "tail": "p99",
+      "mean_ms": 154.778
     }
   ],
   "monitor_stream": "not available on this tree",
@@ -85,20 +103,24 @@
   },
   "paper_order": {
     "buy": {
-      "count": 40,
-      "p50_ms": 3.024,
-      "p95_ms": 3.368,
-      "p99_ms": 3.507,
-      "max_ms": 3.507,
-      "mean_ms": 3.075
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 3.265,
+      "p95_ms": 4.288,
+      "p99_ms": 5.287,
+      "max_ms": 5.449,
+      "tail": "p99",
+      "mean_ms": 3.411
     },
     "sell": {
-      "count": 40,
-      "p50_ms": 2.769,
-      "p95_ms": 2.912,
-      "p99_ms": 3.86,
-      "max_ms": 3.86,
-      "mean_ms": 2.786
+      "count": 100,
+      "warmup_discarded": 5,
+      "p50_ms": 3.063,
+      "p95_ms": 4.292,
+      "p99_ms": 4.983,
+      "max_ms": 5.258,
+      "tail": "p99",
+      "mean_ms": 3.189
     }
   }
 }

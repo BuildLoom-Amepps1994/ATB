@@ -27,6 +27,14 @@ def supported_python(version: tuple[int, int]) -> str | None:
     return None
 
 
+def installed(name: str) -> bool:
+    """True when ``name`` is importable; a dotted name whose parent is missing is simply absent."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ImportError:
+        return False
+
+
 def main() -> int:
     problem = supported_python(tuple(sys.version_info[:2]))
     if problem:
@@ -46,8 +54,8 @@ def main() -> int:
         fingerprint.update(path.name.encode())
         fingerprint.update(path.read_bytes())
     marker = Path(sys.prefix) / '.cryptopilot-requirements.sha256'
-    needed = ['fastapi', 'uvicorn', 'ccxt', 'pandas', 'numpy', 'keyring'] + (['PyInstaller'] if build else [])
-    complete = all(importlib.util.find_spec(name) is not None for name in needed)
+    needed = ['fastapi', 'uvicorn', 'ccxt', 'pandas', 'numpy', 'keyring', 'google.protobuf'] + (['PyInstaller'] if build else [])
+    complete = all(installed(name) for name in needed)
     if complete and marker.exists() and marker.read_text(encoding='ascii') == fingerprint.hexdigest():
         print('CryptoPilot dependencies are ready.')
         return 0

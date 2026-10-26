@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast} = CryptoPilotUI;
+const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops} = CryptoPilotUI;
 let state = null, online = false, chartSymbol = 'BTC/USDT', chartTF = '1h', chartData = [], btData = [];
 let lastSuccess = 0, pollTimer = null, modalFocus = null;
 let orderDraft = null, orderFocus = null;
@@ -44,6 +44,8 @@ function updateControls() {
   $('killBtn').disabled = !online || busy.has('risk');
   $('killBtn').textContent = engaged ? '⛔ Release kill switch…' : '⛔ Kill switch';
   $('killBtn').classList.toggle('selected', engaged);
+  $('clearStopBtn').hidden = !latchedStops(s.risk).length;
+  $('clearStopBtn').disabled = !online || busy.has('risk');
   $('confirmLive').disabled = !idle || pending || settingsReview || !$('eligible').checked || $('liveConfirm').value !== 'ENABLE LIVE TRADING';
   const orderReady = idle && !pending && !(s.mode === 'live' && (!s.connected || s.live_halted));
   $('orderBuy').disabled = !orderReady || (s.mode === 'live' && settingsReview);
@@ -104,7 +106,7 @@ function render(s) {
   $('connectStatus').className = 'sub ' + (s.connected ? 'green' : '');
   const unresolved = Array.isArray(s.unresolved_orders) ? s.unresolved_orders.length : Number(s.unresolved_orders || 0);
   const legacy = Array.isArray(s.legacy_live_records) ? s.legacy_live_records.length > 0 : !!s.legacy_live_records;
-  const warnings = [s.risk?.kill_switch?.engaged ? 'KILL SWITCH ENGAGED: new orders are blocked' + (s.risk.kill_switch.allow_exits ? '; protective exits continue.' : ' and exits are blocked too.') + ' Release it from the kill switch button when the situation is understood.' : '', s.risk?.drawdown_stop ? 'Drawdown stop latched: new entries are blocked until it is cleared with the phrase RESUME TRADING.' : '', s.risk?.realized_stop ? 'Daily realised-loss stop latched: new entries are blocked until it is cleared with the phrase RESUME TRADING.' : '', s.live_halted ? 'Live trading halted. Review exchange orders and holdings before enabling live trading. Paper simulation remains available.' : '', s.valuation_stale ? 'Portfolio valuation uses stale or unavailable quotes; current exposure may differ.' : '', s.positions.length && !s.running ? 'Automatic exits are inactive while the bot is stopped. Start the bot to monitor software stops.' : '', s.monitor_error ? 'Exit quote monitoring reported a problem; review activity and exchange holdings.' : '', s.risk_block ? String(s.risk_block) : '', unresolved ? unresolved + ' unresolved order(s) require reconciliation.' : '', legacy ? 'Previous live records need manual exchange reconciliation.' : '', s.error ? 'Latest scan reported a problem; review activity.' : ''].filter(Boolean);
+  const warnings = [s.risk?.kill_switch?.engaged ? 'KILL SWITCH ENGAGED: new orders are blocked' + (s.risk.kill_switch.allow_exits ? '; protective exits continue.' : ' and exits are blocked too.') + ' Release it from the kill switch button when the situation is understood.' : '', s.risk?.drawdown_stop ? 'Drawdown stop latched: new entries are blocked until it is cleared from the Clear latched stop button with the phrase RESUME TRADING.' : '', s.risk?.realized_stop ? 'Daily realised-loss stop latched: new entries are blocked until it is cleared from the Clear latched stop button with the phrase RESUME TRADING. After clearing, a further loss the same day latches it again.' : '', s.live_halted ? 'Live trading halted. Review exchange orders and holdings before enabling live trading. Paper simulation remains available.' : '', s.valuation_stale ? 'Portfolio valuation uses stale or unavailable quotes; current exposure may differ.' : '', s.positions.length && !s.running ? 'Automatic exits are inactive while the bot is stopped. Start the bot to monitor software stops.' : '', s.monitor_error ? 'Exit quote monitoring reported a problem; review activity and exchange holdings.' : '', s.risk_block ? String(s.risk_block) : '', unresolved ? unresolved + ' unresolved order(s) require reconciliation.' : '', legacy ? 'Previous live records need manual exchange reconciliation.' : '', s.error ? 'Latest scan reported a problem; review activity.' : ''].filter(Boolean);
   $('riskStatus').hidden = warnings.length === 0; $('riskStatus').textContent = warnings.join(' ');
   $('modeNotice').textContent = s.mode === 'paper' ? 'PAPER simulation enabled. No real buy or sell orders will be sent.' + (s.live_halted ? ' Live trading remains halted pending manual reconciliation.' : '') : s.live_halted ? 'LIVE HALTED: Inspect exchange orders and holdings manually before enabling live trading.' : 'LIVE mode is armed. Start bot submits REAL SPOT orders automatically. Manual orders require a separate confirmation. The bot must be running for software stops.';
   $('orderMode').textContent = s.mode === 'live' ? 'REAL MONEY · live armed' : 'PAPER · simulated orders';
@@ -243,6 +245,14 @@ $('killBtn').onclick = () => {
   const phrase = prompt('Release the kill switch? Type exactly: RESUME TRADING');
   if (phrase === null) return;
   action('risk', '/risk', {action: 'release', confirmation: phrase}, 'Kill switch released.');
+};
+$('clearStopBtn').onclick = async () => {
+  const stops = latchedStops(state?.risk);
+  if (!stops.length) return;
+  const names = stops.map(stop => stop.label).join(' and the ');
+  const phrase = prompt(`Clear the ${names}? New entries can resume. Review the day's losses first. Type exactly: RESUME TRADING`);
+  if (phrase === null) return;
+  for (const stop of stops) await action('risk', '/risk', {action: stop.action, confirmation: phrase}, `Cleared the ${stop.label}.`);
 };
 $('connectBtn').onclick = async () => {
   if (busy.has('connect')) return;

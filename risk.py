@@ -37,6 +37,10 @@ ENTRY_KINDS = ('entry', 'manual_entry')
 EXIT_KINDS = ('exit', 'manual_exit')
 
 
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='milliseconds')
 
@@ -131,6 +135,15 @@ class RiskGate:
         return {'engaged': bool(saved.get('engaged')), 'allow_exits': saved.get('allow_exits') is not False,
                 'engaged_at': saved.get('engaged_at'), 'reason': saved.get('reason')}
 
+    def switch_blocks(self, request: OrderRequest) -> str | None:
+        """The kill switch as it stands now, for the last check before an order leaves."""
+        switch = self.kill_switch()
+        if not switch['engaged']:
+            return None
+        if request.is_entry:
+            return 'Kill switch engaged: new orders blocked'
+        return None if switch['allow_exits'] else 'Kill switch engaged with exits blocked'
+
     def engage_kill_switch(self, reason: str = 'Operator kill switch', *, allow_exits: bool = True) -> dict:
         """Immediate and durable. Needs no confirmation and no idle engine."""
         record = {'engaged': True, 'allow_exits': bool(allow_exits), 'engaged_at': _now_iso(),
@@ -179,12 +192,56 @@ class RiskGate:
         self.metrics.incr('risk.realized_stop_latched')
 
     def clear_realized_stop(self, mode: str, confirmation: str) -> None:
+        """Lift the latch. For the rest of this UTC day it latches again only on a further loss.
+
+        The day's realised total at the moment of clearing is recorded, so the
+        next entry does not re-latch on the loss the operator just reviewed.
+        """
         if confirmation != RELEASE_PHRASE:
             raise storage.ConfigValidationError(f'Type {RELEASE_PHRASE} to clear the realised-loss stop.')
+        realized = self._realized_today(mode)
+        cleared = json.dumps({'date': _today(), 'realized': round(realized, 8)})
         with storage.connection() as db:
             db.execute('DELETE FROM meta WHERE key=?', (self._key('realized_stop', mode),))
-        storage.audit('warning', f'{mode.upper()} daily realised-loss stop cleared after explicit confirmation.')
-        observability.event('risk.realized_stop_cleared', level='warning', mode=mode)
+            db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',
+                       (self._key('realized_stop_cleared', mode), cleared))
+        storage.audit('warning', f'{mode.upper()} daily realised-loss stop cleared after explicit confirmation at '
+                                 f'{realized:.2f} USDT realised today; it latches again if net realised P/L for today goes beyond the limit and below this level.')
+        observability.event('risk.realized_stop_cleared', level='warning', mode=mode, realized=realized)
+
+    def _cleared_floor(self, mode: str) -> float | None:
+        """Today's realised total when the operator last cleared the latch, or None."""
+        try:
+            record = json.loads(storage.get_meta(self._key('realized_stop_cleared', mode)) or 'null')
+        except ValueError:
+            return None
+        if not isinstance(record, dict) or record.get('date') != _today():
+            return None
+        return _finite(record.get('realized'))
+
+    def observe_realized(self, mode: str, equity: float) -> str | None:
+        """Latch the realised-loss stop as soon as today's realised loss crosses the limit.
+
+        Called with every fresh valuation (each monitor poll and scan) as well
+        as from :meth:`authorize`, so a loss booked by an exit latches at once
+        instead of waiting for the next entry attempt, after which a profit or
+        the UTC rollover could have hidden it. Returns the latch time.
+        """
+        value = _finite(equity)
+        latched = self.realized_stop(mode)
+        if latched or value is None or value <= 0:
+            return latched
+        realized = self._realized_today(mode)
+        limit = value * float(self.engine.cfg.get('daily_realized_loss_limit_pct',
+                                                  storage.DEFAULTS['daily_realized_loss_limit_pct'])) / 100
+        floor = self._cleared_floor(mode)
+        crossed = realized <= -limit and (floor is None or realized < floor - 0.005)
+        if crossed:
+            # A durable latch: a later profit, a new UTC day or a settings
+            # save does not lift it; only the release phrase does.
+            self._latch_realized_stop(mode, realized, limit)
+            return self.realized_stop(mode)
+        return None
 
     def observe_equity(self, mode: str, equity: float) -> dict:
         """Track the durable equity peak and latch the drawdown stop.
@@ -240,16 +297,69 @@ class RiskGate:
                            (self.engine.exchange_name, mode, today + '%'))
         return float(row[0]['value'] or 0.0)
 
-    def _reject_spike(self, mode: str) -> bool:
+    def _reject_spike_remaining(self, mode: str) -> float:
+        """Seconds until the rejection-spike breaker closes on its own; 0 when it is closed.
+
+        Only requests that reached the counterparty count (``submitted_at`` is
+        set): an order the engine itself refused before sending (a Stop, the
+        kill switch) is not an exchange rejection.
+        """
         since = (datetime.now(timezone.utc) - timedelta(seconds=REJECT_SPIKE_WINDOW_S)).isoformat(timespec='milliseconds')
-        row = storage.rows("SELECT COUNT(*) AS count FROM order_journal WHERE exchange=? AND mode=? AND status='rejected' AND updated_at>=?",
-                           (self.engine.exchange_name, mode, since))
-        return int(row[0]['count']) >= REJECT_SPIKE_COUNT
+        rows = storage.rows("SELECT updated_at FROM order_journal WHERE exchange=? AND mode=? AND status='rejected' "
+                            'AND submitted_at IS NOT NULL AND updated_at>=? ORDER BY updated_at',
+                            (self.engine.exchange_name, mode, since))
+        if len(rows) < REJECT_SPIKE_COUNT:
+            return 0.0
+        # It closes when enough of the counted rejections have left the window.
+        oldest_needed = rows[len(rows) - REJECT_SPIKE_COUNT]['updated_at']
+        try:
+            closes = datetime.fromisoformat(oldest_needed).timestamp() + REJECT_SPIKE_WINDOW_S
+        except (TypeError, ValueError):
+            return float(REJECT_SPIKE_WINDOW_S)
+        return max(1.0, closes - time.time())
+
+    def _reject_spike(self, mode: str) -> bool:
+        return self._reject_spike_remaining(mode) > 0
+
+    def _slippage_record(self, mode: str) -> dict:
+        raw = storage.get_meta(self._key('slippage_breaker', mode))
+        try:
+            record = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            record = {}
+        return record if isinstance(record, dict) else {}
+
+    def _slippage_remaining(self, mode: str) -> float:
+        record = self._slippage_record(mode)
+        until, now = _finite(record.get('until')), time.time()
+        remaining = (until or 0.0) - now
+        if remaining > BREAKER_HOLD_S:
+            # The PC clock stepped back after the trip. The hold never runs
+            # longer than its nominal length from now, so it still closes.
+            record['until'] = now + BREAKER_HOLD_S
+            storage.set_meta(self._key('slippage_breaker', mode), json.dumps(record))
+            remaining = float(BREAKER_HOLD_S)
+        return max(0.0, remaining)
+
+    def observe_fills(self, mode: str) -> bool:
+        """Judge the slippage breaker after a fill is booked; True while it holds entries."""
+        return self._slippage_breaker(mode)[0]
 
     def _slippage_breaker(self, mode: str) -> tuple[bool, float | None]:
-        rows = storage.rows('SELECT intended_price,filled_price,side FROM order_journal WHERE exchange=? AND mode=? '
+        """Pause entries for ``BREAKER_HOLD_S`` after the last fills ran far worse than assumed.
+
+        The fills that tripped it are then spent: once the hold ends, only
+        orders accounted after them can trip it again, so it closes on its own
+        even when no new order can move the average.
+        """
+        record = self._slippage_record(mode)
+        if self._slippage_remaining(mode) > 0:
+            return True, _finite(record.get('average'))
+        after = record.get('after') if isinstance(record.get('after'), str) else ''
+        rows = storage.rows('SELECT intended_price,filled_price,side,updated_at FROM order_journal WHERE exchange=? AND mode=? '
                             "AND status='accounted' AND intended_price IS NOT NULL AND filled_price IS NOT NULL "
-                            'ORDER BY updated_at DESC LIMIT ?', (self.engine.exchange_name, mode, SLIPPAGE_SAMPLE))
+                            'AND updated_at>? ORDER BY updated_at DESC LIMIT ?',
+                            (self.engine.exchange_name, mode, after, SLIPPAGE_SAMPLE))
         if len(rows) < SLIPPAGE_SAMPLE:
             return False, None
         adverse = []
@@ -259,9 +369,18 @@ class RiskGate:
                 return False, None
             move = (filled - intended) / intended * 100
             adverse.append(move if row['side'] == 'BUY' else -move)
-        average = sum(adverse) / len(adverse)
+        average = round(sum(adverse) / len(adverse), 4)
         assumed = float(self.engine.cfg.get('slippage_pct', 0.2))
-        return average > max(0.05, assumed) * SLIPPAGE_MULTIPLE, round(average, 4)
+        if average <= max(0.05, assumed) * SLIPPAGE_MULTIPLE:
+            return False, average
+        storage.set_meta(self._key('slippage_breaker', mode), json.dumps(
+            {'until': time.time() + BREAKER_HOLD_S, 'after': max(row['updated_at'] for row in rows), 'average': average}))
+        self.metrics.incr('risk.breaker_open')
+        storage.audit('error', f'Circuit breaker: average adverse slippage {average:.3f}% over the last {SLIPPAGE_SAMPLE} fills; '
+                               f'new entries pause for {BREAKER_HOLD_S // 60} minutes.')
+        observability.event('risk.breaker', level='error', breaker='slippage', average_adverse_slippage_pct=average,
+                            hold_seconds=BREAKER_HOLD_S)
+        return True, average
 
     def authorize(self, request: OrderRequest, *, positions: list[dict], cash: float | None,
                   equity: float | None, marks_fresh: bool, symbol_fresh: bool) -> Authorization:
@@ -337,12 +456,7 @@ class RiskGate:
             check('daily_equity_loss', daily_allowed, 'Daily loss limit reached; entries blocked until the next UTC day',
                   loss_pct=loss_today)
             realized = self._realized_today(mode)
-            realized_limit = eq * cfg['daily_realized_loss_limit_pct'] / 100
-            if eq > 0 and realized <= -realized_limit and not self.realized_stop(mode):
-                # A durable latch: a later profit, a new UTC day or a settings
-                # save does not lift it; only the release phrase does.
-                self._latch_realized_stop(mode, realized, realized_limit)
-            latched_at = self.realized_stop(mode)
+            latched_at = self.observe_realized(mode, eq)
             check('daily_realized_loss', not latched_at,
                   f'Realised-loss stop latched at {latched_at}; entries blocked until cleared with {RELEASE_PHRASE}'
                   if latched_at else '', realized=round(realized, 2))
@@ -397,6 +511,10 @@ class RiskGate:
             now = time.monotonic()
             breakers = {name: round(until - now, 1) for name, until in self._breaker_until.items() if until > now}
         mode = self.engine.mode
+        for name, remaining in (('reject_spike', self._reject_spike_remaining(mode)),
+                                ('slippage', self._slippage_remaining(mode))):
+            if remaining > 0:
+                breakers[name] = round(remaining, 1)
         return {'kill_switch': self.kill_switch(), 'drawdown_stop': self.drawdown_stop(mode),
                 'realized_stop': self.realized_stop(mode),
                 'peak_equity': _finite(storage.get_meta(self._key('peak_equity', mode))),

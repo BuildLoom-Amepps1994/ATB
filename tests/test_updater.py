@@ -280,10 +280,11 @@ else:
     ([{'tag': 'v1.5.29', 'draft': False}], '1.5.29', '/releases?', 'failed'),
 ])
 def test_publish_job_never_replaces_or_outranks_a_release(tmp_path, releases, version, broken, outcome):
+    import os
     import shutil
     import subprocess
-    bash = shutil.which('bash')
-    if bash is None or shutil.which('jq') is None:
+    bash, jq = shutil.which('bash'), shutil.which('jq')
+    if bash is None or jq is None:
         pytest.skip('bash and jq are not available')
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
@@ -294,10 +295,15 @@ def test_publish_job_never_replaces_or_outranks_a_release(tmp_path, releases, ve
     state.write_text(json.dumps({'releases': releases, 'calls': [], 'broken': broken}))
     (tmp_path / 'release').mkdir()
     (tmp_path / 'release' / f'CryptoPilot-Setup-{version}.exe').write_bytes(b'MZ')
-    env = {**__import__('os').environ, 'PATH': f'{bin_dir}:/usr/bin:/bin', 'FAKE_GH_STATE': str(state),
+    # The jq found here may live outside /usr/bin, for example from Homebrew or conda.
+    path = os.pathsep.join([str(bin_dir), os.path.dirname(jq), '/usr/bin', '/bin'])
+    env = {**os.environ, 'PATH': path, 'FAKE_GH_STATE': str(state),
            'VERSION': version, 'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_SHA': 'abc123', 'GH_TOKEN': 'x'}
     result = subprocess.run([bash, '-c', publish_script()], cwd=tmp_path, env=env, capture_output=True, text=True)
     assert (result.returncode != 0) == (outcome == 'failed'), result.stdout + result.stderr
+    if outcome == 'failed':
+        # Stopped by the GitHub error itself, not by a missing tool.
+        assert 'HTTP 502' in result.stderr, result.stderr
     calls = json.loads(state.read_text())['calls']
     created = [call for call in calls if call[:2] == ['release', 'create']]
     assert bool(created) == (outcome == 'published'), calls

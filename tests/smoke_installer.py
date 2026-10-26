@@ -206,10 +206,14 @@ def main():
     # The same stop with the new runtime already in place: starting the app finishes the swap.
     token = 'setup-20990101000001'
     staged, interrupted = installation/('.'+token), installation/'backups'/token
-    interrupted.mkdir()
+    for name in ('runtime','maintenance'):
+        (interrupted/name).mkdir(parents=True)
+        (interrupted/name/'previous.marker').write_text('previous')
     shutil.copy2(installation/'installation.json',interrupted/'installation.json')
     shutil.copytree(installation/'app',staged/'app')
-    shutil.copy2(installation/'installation.json',staged/'installation.json')
+    rolled = json.loads((installation/'installation.json').read_text())
+    rolled['installed_version'] = '1.5.1'  # A new release's record differs from the previous one.
+    (staged/'installation.json').write_text(json.dumps(rolled))
     add_marker(staged/'app','rolled-forward-D')
     journal = {'format':1,'product':'CryptoPilot','backup':'backups/'+token,'staging':'.'+token}
     (installation/'update-transaction.json').write_text(json.dumps(journal,separators=(',',':')))
@@ -219,6 +223,41 @@ def main():
     finally:
         stop(child)
     assert not (installation/'update-transaction.json').exists() and (interrupted/'app/app.py').is_file()
+    # A Setup cut off while copying files leaves no journal: the runtime it set aside waits in its
+    # backup and a partly written one is in place. The next Setup puts the saved runtime back first,
+    # so even when its own swap is then blocked, the runtime left in place matches the source.
+    replaced = interrupted
+    token = 'setup-20990101000002'
+    saved = installation/'backups'/token
+    shutil.copytree(installation/'runtime',saved/'runtime')
+    shutil.copytree(installation/'maintenance',saved/'maintenance')
+    (saved/'runtime/saved-runtime.marker').write_text('saved')
+    partial = installation/'runtime/partial-runtime.marker'
+    partial.write_text('partial')
+    record = (installation/'installation.json').read_bytes()
+    holder = subprocess.Popen([getattr(sys,'_base_executable',sys.executable),'-c','import time; time.sleep(900)'],
+                              cwd=installation/'app',creationflags=creation)
+    try:
+        time.sleep(1)
+        failed = run([setup,'/TESTINSTALL=1','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOICONS','/TASKS=',
+                      f'/DIR={installation}',f'/LOG={scratch}/saved-runtime-setup.log'],timeout=600)
+    finally:
+        holder.terminate()
+        holder.wait(15)
+        time.sleep(.5)
+    log = (scratch/'saved-runtime-setup.log').read_text(errors='replace')
+    assert failed.returncode==9, f'Expected exit code 9, got {failed.returncode}; {scratch}/saved-runtime-setup.log'
+    assert 'Put back the runtime saved in backups' in log
+    assert (installation/'runtime/saved-runtime.marker').is_file() and not partial.exists()
+    assert not (saved/'runtime').exists() and not (saved/'maintenance').exists()
+    assert (installation/'installation.json').read_bytes()==record
+    # The runtime saved by the swap the app finished above goes with a replaced source: it is removed.
+    assert not (replaced/'runtime').exists() and not (replaced/'maintenance').exists()
+    child = start()
+    try:
+        prove('rolled-forward-D')
+    finally:
+        stop(child)
     # In-app update path: Setup starts while the app runs and waits for it to exit.
     child = start()
     waiting = subprocess.Popen([str(setup),'/TESTINSTALL=1','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
@@ -231,6 +270,11 @@ def main():
         stop(child)
     assert waiting.wait(timeout=180)==0, f'Waiting Setup failed; {scratch}/waiting-setup.log'
     assert_data()
+    # A successful Setup keeps no saved runtime and no staged source behind.
+    assert not list((installation/'backups').glob('setup-*/runtime'))
+    assert not list((installation/'backups').glob('setup-*/maintenance'))
+    assert not list(installation.glob('.setup-*'))
+    assert not (installation/'runtime/saved-runtime.marker').exists()
     child = start()
     stop(child)
     uninstaller = next(installation.glob('unins*.exe'))
@@ -243,6 +287,21 @@ def main():
     assert not exe.exists()
     assert (installation/'app/app.py').is_file() and (installation/'backups').is_dir()
     assert_data()
+    # A first install whose new source could not be activated leaves only Setup's own files and its
+    # staged source. Setup must take that folder again instead of calling it unrelated.
+    unfinished = scratch/'Unfinished CryptoPilot'
+    first = run([setup,'/TESTINSTALL=1','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOICONS','/TASKS=',
+                 f'/DIR={unfinished}',f'/LOG={scratch}/first-setup.log'])
+    assert first.returncode==0, f'First Setup failed {first.returncode}; {scratch}/first-setup.log'
+    stage = unfinished/'.setup-20990101000003'
+    stage.mkdir()
+    os.replace(unfinished/'app',stage/'app')
+    os.replace(unfinished/'installation.json',stage/'installation.json')
+    retried = run([setup,'/TESTINSTALL=1','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOICONS','/TASKS=',
+                   f'/DIR={unfinished}',f'/LOG={scratch}/retried-setup.log'])
+    assert retried.returncode==0, f'Setup refused to retry {retried.returncode}; {scratch}/retried-setup.log'
+    assert (unfinished/'app/launcher.py').is_file() and (unfinished/'installation.json').is_file()
+    assert not stage.exists()
     result = {'passed':True,'setup':str(setup),'setup_sha256':digest(setup),'test_folder':str(scratch),
               'tests':['isolated install','paper stopped and disconnected default','source assets',
                        'direct installed Python edit applied on restart','running app blocks source update and Setup',
@@ -252,8 +311,11 @@ def main():
                        'blocked source swap keeps the previous runtime and source (exit 9)',
                        'Setup finishes a swap interrupted after the runtime changed',
                        'app start also finishes such a swap',
+                       'a runtime set aside by a Setup that stopped goes back before the next swap',
+                       'a saved runtime of a replaced source is removed',
                        'portfolio/settings survive update and upgrade',
-                       'Setup started by the in-app updater waits for the app to exit','uninstall preserves source/backups/data'],
+                       'Setup started by the in-app updater waits for the app to exit','uninstall preserves source/backups/data',
+                       'Setup runs again where a first install did not finish'],
               'live_orders':0,'exchange_requests':0,'credential_backend':'disabled'}
     (scratch/'result.json').write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result,indent=2))

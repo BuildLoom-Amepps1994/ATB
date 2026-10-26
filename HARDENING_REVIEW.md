@@ -157,6 +157,7 @@ impact on live capital or on the integrity of the record.
 | 76 | Low | A Stop (or a worker exit) landing between the stream's creation and its `start()` took it out of `self.feed` before its thread started; the start then ran anyway and nothing in the engine could reach the thread. | **Fixed**: Start keeps its own reference to the stream it started and stops that one when the generation check sees the Stop. |
 | 77 | Low | The durable slippage hold is an end time on the PC clock, so a clock corrected backwards while it was open stretched the 30-minute pause by the size of the step. | **Fixed**: an end time more than 30 minutes away is pulled back to 30 minutes from now and saved. The rejection-spike window still counts by journal timestamps, so a backward step keeps those rejections counted until the clock catches up; that fails closed and is listed in section H. |
 | 78 | Low | Changing exchange carried the kill switch only when the target's switch was released, so an exits-blocked switch did not tighten an entries-only switch already engaged on the target. | **Fixed**: it is carried when the target is released or when the target allows exits that the carried switch blocks; a stricter target is left as it is. |
+| 79 | Low | `--prepare-downgrade` refused while any paper intent was open, although it drops paper rows anyway; the report and `--clear-halt` list live rows only, and a restart closes stale paper intents only for the configured exchange, so a paper row left open on the other exchange blocked the rollback with nothing to reconcile. | **Fixed**: only an open live intent blocks it, and the message says so. |
 
 ---
 
@@ -191,7 +192,7 @@ impact on live capital or on the integrity of the record.
 | `recovery.py`, `trader.py`, `risk.py`, `RUNBOOK.md` | Findings 61–63: `--prepare-downgrade` for a rollback across the schema change, stream lifecycle on a fast Stop or with streaming off, kill switch re-read at submit. |
 | `tests/test_review_round3.py` | 7 more tests for findings 61–63, also checked to fail with each fix removed. |
 | `risk.py`, `trader.py`, `storage.py`, `RUNBOOK.md`, `tests/test_review_round3.py` | Findings 66–69 and 72: breakers that close and report, the submit event and manual order ids, the kill switch across an exchange change; 7 tests, each checked to fail without its fix. |
-| `trader.py`, `risk.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new) | Findings 74–78: realised-loss latch on every booked exit, withheld records whatever ends the entry pass, the stream started by Start stopped by reference, the slippage hold capped after a clock step, the stricter kill switch carried; 10 tests, each checked to fail with its fix removed (ten mutations). |
+| `trader.py`, `risk.py`, `recovery.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new) | Findings 74–79: realised-loss latch on every booked exit, withheld records whatever ends the entry pass, the stream started by Start stopped by reference, the slippage hold capped after a clock step, the stricter kill switch carried, a rollback not blocked by paper intents; 11 tests, each checked to fail with its fix removed. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -388,7 +389,7 @@ measurements should be repeated on the Windows machine with Python 3.14
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **608 passed** |
+| `python -m pytest tests -q` | 434 passed | **609 passed** |
 | `node --test tests/test_dashboard.js` | 11 passed | 14 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
 | `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
@@ -459,7 +460,7 @@ New test files and what they prove:
   rejection spike reported and ignoring orders never sent; one intent id
   finding the submit, whose token finds the authorization; manual order ids;
   the kill switch carried to the other exchange.
-* `tests/test_review_round4.py` (10): a manual close that crosses the
+* `tests/test_review_round4.py` (11): a manual close that crosses the
   realised-loss limit latches before a later profitable close, and a small
   one does not; a network error on one re-quote withholds only that
   candidate; an error that ends the pass withholds only the candidates not
@@ -468,7 +469,8 @@ New test files and what they prove:
   start leaves no stream thread running; a slippage hold seen after a
   six-hour backward clock step counts down from 30 minutes and closes; an
   exits-blocked switch tightens an entries-only one on the target, and an
-  entries-only switch does not loosen an exits-blocked target.
+  entries-only switch does not loosen an exits-blocked target; an open paper
+  intent on another exchange does not block the rollback that drops it.
 
 **Not runnable here.**
 
@@ -582,7 +584,8 @@ insert journal rows by position, so on a migrated database every order they
 journal fails, and their first live exit halts instead of being sent
 (finding 61). Before starting such a build, stop the bot, close the app and run
 `python recovery.py --prepare-downgrade --confirm "I AM ROLLING BACK CRYPTOPILOT"`.
-It refuses while any journal intent is open, saves a full copy of the database
+It refuses while any live journal intent is open (open paper intents are
+dropped with the other paper rows), saves a full copy of the database
 under `backups/` in the data folder, keeps the live journal rows in the old
 layout and drops the paper rows, which older builds would read as live. This
 was rehearsed against the real `7207e82` code: before the step its journal

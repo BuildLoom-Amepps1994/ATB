@@ -284,7 +284,8 @@ Each hardening step is one commit on the feature branch, so a rollback is a
   python recovery.py --prepare-downgrade --confirm "I AM ROLLING BACK CRYPTOPILOT"
   ```
 
-  It refuses while any journal intent is not final. It saves a full copy of
+  It refuses while any live journal intent is not final (open paper intents
+  are dropped with the other paper rows). It saves a full copy of
   the database to `backups/portfolio-before-downgrade-<time>.sqlite3` in the
   data folder, keeps the live journal rows in the old layout and drops the
   paper ones, which older builds would read as live. The current build

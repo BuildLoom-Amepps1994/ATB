@@ -690,7 +690,7 @@ def test_a_rollback_prepared_by_the_recovery_tool_lets_an_older_build_journal_or
 
 def test_the_rollback_preparation_refuses_open_intents_and_a_wrong_phrase(data_folder):
     import recovery
-    storage.create_order_intent('mexc', 'BTC/USDT', 'BUY', cost=100, mode='paper')   # still 'intent'
+    storage.create_order_intent('mexc', 'BTC/USDT', 'BUY', cost=100, mode='live')    # still 'intent'
     before = (data_folder / 'portfolio.sqlite3').read_bytes()
     with pytest.raises(ValueError, match='phrase'):
         recovery.prepare_downgrade(data_folder, 'yes')

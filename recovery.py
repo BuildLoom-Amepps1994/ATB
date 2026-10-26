@@ -267,10 +267,13 @@ def prepare_downgrade(folder: Path | None, confirmation: str) -> dict:
             if not set(LEGACY_JOURNAL) <= set(journal_columns):
                 raise ValueError('The database schema is not one this tool can update.')
             placeholders = ','.join('?' * len(RESOLVED))
+            # Paper rows are dropped below, so only an open live intent blocks
+            # the rollback (it is also the only kind the report lists).
+            live_only = " AND mode='live'" if 'mode' in journal_columns else ''
             open_intents = connection.execute(
-                f'SELECT COUNT(*) FROM order_journal WHERE status NOT IN ({placeholders})', RESOLVED).fetchone()[0]
+                f'SELECT COUNT(*) FROM order_journal WHERE status NOT IN ({placeholders}){live_only}', RESOLVED).fetchone()[0]
             if open_intents:
-                raise ValueError(f'{open_intents} order intent(s) are not final. Stop the bot and reconcile them '
+                raise ValueError(f'{open_intents} live order intent(s) are not final. Stop the bot and reconcile them '
                                  '(see the report) before rolling back.')
             stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
             backups = location / 'backups'

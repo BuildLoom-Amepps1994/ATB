@@ -200,3 +200,20 @@ def test_an_entries_only_switch_does_not_loosen_an_exits_blocked_target(engine):
     engine.update_config({'exchange': 'kraken'})
     switch = engine.risk.kill_switch()
     assert switch['engaged'] and not switch['allow_exits'] and switch['reason'] == 'kraken incident'
+
+
+# --- A rollback is not blocked by a paper intent it discards anyway ------------------------
+
+from test_review_round3 import data_folder, legacy_insert  # noqa: E402,F401  (fixture)
+
+
+def test_an_open_paper_intent_does_not_block_the_rollback_that_drops_it(data_folder):
+    import sqlite3
+    import recovery
+    paper = storage.create_order_intent('kraken', 'ETH/USDT', 'BUY', cost=50, mode='paper')
+    storage.update_order_intent(paper, 'uncertain', note='paper submit raised')   # left open on another exchange
+    assert recovery.prepare_downgrade(data_folder, recovery.DOWNGRADE_PHRASE)['paper_rows_removed'] == 1
+    database = data_folder / 'portfolio.sqlite3'
+    legacy_insert(database)
+    with sqlite3.connect(str(database)) as db:
+        assert db.execute('SELECT COUNT(*) FROM order_journal WHERE intent_id=?', (paper,)).fetchone()[0] == 0

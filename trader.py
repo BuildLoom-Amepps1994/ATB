@@ -618,7 +618,7 @@ class TradingEngine:
             tickers = {}
         else:
             try:
-                tickers = self.data.tickers(held)
+                tickers = self.data.quotes(held)
             except Exception:
                 tickers = {}
         self.metrics.incr('monitor.source.stream' if streamed else 'monitor.source.rest')

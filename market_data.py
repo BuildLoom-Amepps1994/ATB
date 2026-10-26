@@ -26,7 +26,7 @@ class MarketData:
     so protective price checks never wait behind queued candle downloads.
     """
 
-    PRIORITY_METHODS = ('fetch_ticker', 'fetch_tickers')
+    PRIORITY_METHODS = ('fetch_ticker', 'fetch_tickers', 'fetch_bids_asks')
 
     def __init__(self, client, *, clock=time.time, monotonic=time.monotonic, wait=None,
                  concurrency: int = 1):
@@ -174,6 +174,24 @@ class MarketData:
                 self._received(ticker, received)
             return result
         return {}
+
+    def quotes(self, symbols):
+        """Best bid/ask for protective checks, from the lighter endpoint where one exists.
+
+        MEXC's book-ticker endpoint costs 10 rate-limit units against 25 for
+        the 24h ticker and returns a far smaller body; it carries no turnover,
+        which protective checks do not need. Exchanges without it (Kraken)
+        use the ticker read. Tickers without timestamps age from receipt.
+        """
+        if getattr(self.client,'has',{}).get('fetchBidsAsks') is True:
+            result = self.read('fetch_bids_asks',symbols)
+            if not isinstance(result,dict):
+                return {}
+            received = self.clock()
+            for ticker in result.values():
+                self._received(ticker, received)
+            return result
+        return self.tickers(symbols)
 
     def cached_candles(self, symbol, timeframe, limit=175):
         """Return a fresh immutable cache snapshot without making a request."""

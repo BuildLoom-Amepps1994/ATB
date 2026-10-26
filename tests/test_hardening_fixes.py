@@ -164,3 +164,47 @@ def test_one_candidates_unexpected_failure_ends_a_live_pass(engine, monkeypatch)
     engine._enter_candidates(candidates())
     assert calls == ['BTC/USDT'] and client.orders == []
     assert engine._active_positions('live') == []
+
+
+# --- Lighter REST quotes for protective checks -------------------------------------------
+
+class BookTickerExchange(FakeExchange):
+    has = {'fetchBidsAsks': True, 'fetchTickers': True}
+
+    def __init__(self):
+        super().__init__()
+        self.book_calls, self.ticker_calls = [], []
+
+    def fetch_bids_asks(self, symbols=None, params=None):
+        self.book_calls.append(list(symbols or []))
+        return {s: {'symbol': s, 'bid': self.price * .9999, 'ask': self.price * 1.0001, 'timestamp': None}
+                for s in symbols}
+
+    def fetch_tickers(self, symbols=None, params=None):
+        self.ticker_calls.append(list(symbols or []))
+        return {s: self.fetch_ticker(s) for s in symbols}
+
+
+def test_protective_quotes_prefer_the_book_ticker_endpoint_and_age_from_receipt(engine):
+    from market_data import MarketData
+    client = BookTickerExchange()
+    data = MarketData(client)
+    quotes = data.quotes(['BTC/USDT', 'ETH/USDT'])
+    assert client.book_calls == [['BTC/USDT', 'ETH/USDT']] and client.ticker_calls == []
+    assert set(quotes) == {'BTC/USDT', 'ETH/USDT'} and quotes['BTC/USDT']['timestamp'] is None
+    assert 0 <= time.time() - quotes['BTC/USDT']['_received_at'] < 5
+    price, volume, spread = engine._observe_ticker('BTC/USDT', quotes['BTC/USDT'])
+    assert price == pytest.approx(100 * .9999) and volume == 0 and engine._fresh('BTC/USDT')
+    plain = MarketData(FakeExchange())
+    assert plain.quotes(['BTC/USDT']) == {}          # no bulk endpoint at all: per-symbol reads follow
+
+
+def test_protective_monitor_reads_quotes_not_full_tickers(engine, monkeypatch):
+    engine._buy('BTC/USDT', 800, 100, .04)
+    engine.running = True
+    calls = []
+    monkeypatch.setattr(engine.data, 'quotes', lambda symbols: calls.append(list(symbols)) or {})
+    monkeypatch.setattr(engine.data, 'tickers', lambda symbols: pytest.fail('the monitor must not fetch 24h tickers'))
+    engine.public.price = 90
+    engine._monitor_if_due(force=True)
+    assert calls == [['BTC/USDT']] and engine._active_positions('paper') == []

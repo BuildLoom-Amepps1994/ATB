@@ -175,6 +175,8 @@ def main(argv=None) -> int:
     if not 0 < requested_s <= 7 * 24 * 3600:
         raise SystemExit('the duration must be positive and at most seven days')
     data_dir = isolate(Path(args.data_dir))
+    # The source that runs is the source read now; a checkout that changes during the run is recorded as such.
+    source_at_start = source_identity()
     sys.path.insert(0, str(ROOT))
 
     import credentials
@@ -247,7 +249,8 @@ def main(argv=None) -> int:
         'started_utc': datetime.fromtimestamp(started_wall, timezone.utc).isoformat(timespec='seconds'),
         'ended_utc': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'platform': platform.platform(), 'python': sys.version.split()[0], 'machine': platform.machine(),
-        'source': source_identity(),
+        'source': source_at_start,
+        'source_changed_during_run': source_identity() != source_at_start,
         'profile': str(data_dir), 'mode': engine.mode, 'exchange': engine.exchange_name, 'pairs': pairs,
         'market_data': 'synthetic fixture on the real clock' if args.fixture else 'public endpoints, no account',
         'streaming_quotes': bool(engine.cfg.get('streaming_quotes')),

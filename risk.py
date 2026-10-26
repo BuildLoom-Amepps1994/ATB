@@ -330,8 +330,16 @@ class RiskGate:
         return record if isinstance(record, dict) else {}
 
     def _slippage_remaining(self, mode: str) -> float:
-        until = _finite(self._slippage_record(mode).get('until'))
-        return max(0.0, (until or 0.0) - time.time())
+        record = self._slippage_record(mode)
+        until, now = _finite(record.get('until')), time.time()
+        remaining = (until or 0.0) - now
+        if remaining > BREAKER_HOLD_S:
+            # The PC clock stepped back after the trip. The hold never runs
+            # longer than its nominal length from now, so it still closes.
+            record['until'] = now + BREAKER_HOLD_S
+            storage.set_meta(self._key('slippage_breaker', mode), json.dumps(record))
+            remaining = float(BREAKER_HOLD_S)
+        return max(0.0, remaining)
 
     def _slippage_breaker(self, mode: str) -> tuple[bool, float | None]:
         """Pause entries for ``BREAKER_HOLD_S`` after the last fills ran far worse than assumed.

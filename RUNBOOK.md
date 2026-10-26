@@ -11,7 +11,7 @@ trading stays off until it is enabled deliberately with the phrase
 | Layer | What it guarantees | Where it lives |
 |---|---|---|
 | Risk gate | Every order, automatic or manual, paper or live, needs a fresh authorization from one choke point. A blocked order is never sent. | `risk.py` (`RiskGate.authorize`), enforced in `trader.TradingEngine._submit` |
-| Kill switch | Blocks new orders instantly from the dashboard or `POST /api/risk`; optionally blocks exits too. Survives restarts. Stored per exchange; an engaged switch is carried over when you change exchanges. | `risk.py`, `storage` meta `kill_switch` |
+| Kill switch | Blocks new orders instantly from the dashboard or `POST /api/risk`; optionally blocks exits too. Survives restarts. Stored per exchange; an engaged switch is carried over when you change exchanges, and one that blocks exits also tightens an entries-only switch already engaged there. | `risk.py`, `storage` meta `kill_switch` |
 | Latches | The daily realised-loss stop and the drawdown-from-peak stop block new entries until cleared with `RESUME TRADING`. The daily equity-loss guard blocks them until the next UTC day. | `risk.py`, `trader.py` |
 | Breakers | Three order failures in ten minutes, three exchange rejections in ten minutes, or fills averaging more than three times the assumed slippage pause entries; each closes on its own (section 4). | `risk.py` |
 | Order state machine | Each order is a journaled intent: `pending → acked → filled → accounted`, or `rejected`, or `uncertain`. Illegal transitions are refused. | `storage.py`, `orders.py` |
@@ -68,7 +68,7 @@ Change them while the bot is stopped.
 | `max_position_pct`, `max_exposure_pct`, `max_positions` | 8 %, 40 %, 5 | Position, exposure and count caps. |
 | `risk_pct`, `max_portfolio_risk_pct` | 0.65 %, 3 % | Per-trade loss budget and total open stop risk. |
 | `daily_loss_limit_pct` | 3 % | Equity-based daily guard; latches until the next UTC day. |
-| `daily_realized_loss_limit_pct` | 3 % | Net realised P/L today, UTC: profits offset losses (fees included, also when billed in another asset). Checked at every valuation, so it latches as soon as an exit books the loss; it holds until `RESUME TRADING` (`clear_realized_stop`) or a paper reset. A looser setting or a later profit does not lift it. After a clear, a further loss the same UTC day latches it again. |
+| `daily_realized_loss_limit_pct` | 3 % | Net realised P/L today, UTC: profits offset losses (fees included, also when billed in another asset). Checked when any exit books (automatic or manual) and at every valuation, so it latches as soon as the loss is booked; it holds until `RESUME TRADING` (`clear_realized_stop`) or a paper reset. A looser setting or a later profit does not lift it. After a clear, a further loss the same UTC day latches it again. |
 | `max_drawdown_pct` | 10 % | Equity drawdown from the tracked peak; latches until `RESUME TRADING`. |
 | `max_orders_per_minute` | 6 | Order-rate limit per exchange and mode (exits are allowed three times that). |
 | `data_max_age_seconds` | 120 | A quote older than this is stale; stale quotes block entries and fall back to REST for exits. |
@@ -117,8 +117,9 @@ seconds until it closes:
 * `slippage`: the last three fills averaged more than three times the
   configured slippage against the quote they were priced from. Entries hold
   for thirty minutes, also across a restart; after that only fills made
-  since the trip count, so the same fills cannot trip it again. A paper reset
-  clears a paper hold.
+  since the trip count, so the same fills cannot trip it again. A PC clock
+  corrected backwards cannot stretch the hold past thirty minutes from the
+  moment it is next checked. A paper reset clears a paper hold.
 
 `risk.last_block` names the most recent blocked check. Every block is also
 an activity line starting with `RISK BLOCK` and an event of kind
@@ -215,7 +216,9 @@ the exchange knows an order with that client order id and what state it is in.
   order (`per_scan_cap`, `max_positions`, `held`, `same_candle`,
   `requote_unavailable`, `requote_liquidity`, `requote_moved`, `budget`,
   `stale_marks`, `protective_exit_pending`, `daily_loss_guard`,
-  `settings_review`, `orders_not_allowed`). `decision.exit` names its
+  `settings_review`, `orders_not_allowed`, `entry_error` and `live_halted`
+  for the rest of a live pass that stopped, `entry_pass_error` for the
+  candidates not yet tried when an unexpected error ended the pass). `decision.exit` names its
   `source` (`protective`, `monitor` or `scan`) and `trigger` (`stored`,
   `trailing` or `trend`).
 * **Correlation.** Every entry decision has a `decision_id`, every exit

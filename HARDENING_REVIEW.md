@@ -152,6 +152,11 @@ impact on live capital or on the integrity of the record.
 | 71 | Low | The latency table compared the old code's cold first call with warm calls on the branch at p99, took p95 and p99 of the warm scan from ten samples, and measured a branch commit seven commits old. | See section C. |
 | 72 | Low | The kill switch is stored per exchange, so changing exchanges silently left an engaged switch behind. | **Fixed**: an engaged switch is carried over to the new exchange with its exit policy; the runbook says it is per exchange. |
 | 73 | Low | The upgrade path said the in-app updater would offer the hardening build to a 1.4.0 installation, but the build was also numbered 1.4.0. | **Resolved by pull request #7**: releases are numbered 1.5.<commits on main>, so every merged build is newer than 1.4.0. |
+| 74 | Med. | A loss booked by a manual exit never latched the realised-loss stop. Manual orders need a stopped bot, and the latch ran only at a valuation (monitor, scan, Start, entry authorization), so a later profitable close or the UTC rollover could hide the crossing and the bot resumed entries. | **Fixed**: every booked exit checks the day's realised P/L against the limit straight after the ledger commit, valued from the cash the sale left (no extra exchange read). |
+| 75 | Low | A re-quote failing with a network error (not a `ValueError`) ended the whole entry pass, and a Stop at the end of a scan, an entry error in live mode or a live halt dropped the remaining `enter` decisions with no `decision.withheld` line, so the soak check in the runbook could not pass. | **Fixed**: any re-quote failure withholds that candidate (`requote_unavailable`) and the pass goes on; the scan withholds its candidates when a Stop landed (`orders_not_allowed`); the live breaks withhold the rest (`entry_error`, `live_halted`); and anything else that ends the pass withholds the candidates not yet tried (`entry_pass_error`) before it is reported. |
+| 76 | Low | A Stop (or a worker exit) landing between the stream's creation and its `start()` took it out of `self.feed` before its thread started; the start then ran anyway and nothing in the engine could reach the thread. | **Fixed**: Start keeps its own reference to the stream it started and stops that one when the generation check sees the Stop. |
+| 77 | Low | The durable slippage hold is an end time on the PC clock, so a clock corrected backwards while it was open stretched the 30-minute pause by the size of the step. | **Fixed**: an end time more than 30 minutes away is pulled back to 30 minutes from now and saved. The rejection-spike window still counts by journal timestamps, so a backward step keeps those rejections counted until the clock catches up; that fails closed and is listed in section H. |
+| 78 | Low | Changing exchange carried the kill switch only when the target's switch was released, so an exits-blocked switch did not tighten an entries-only switch already engaged on the target. | **Fixed**: it is carried when the target is released or when the target allows exits that the carried switch blocks; a stricter target is left as it is. |
 
 ---
 
@@ -186,6 +191,7 @@ impact on live capital or on the integrity of the record.
 | `recovery.py`, `trader.py`, `risk.py`, `RUNBOOK.md` | Findings 61–63: `--prepare-downgrade` for a rollback across the schema change, stream lifecycle on a fast Stop or with streaming off, kill switch re-read at submit. |
 | `tests/test_review_round3.py` | 7 more tests for findings 61–63, also checked to fail with each fix removed. |
 | `risk.py`, `trader.py`, `storage.py`, `RUNBOOK.md`, `tests/test_review_round3.py` | Findings 66–69 and 72: breakers that close and report, the submit event and manual order ids, the kill switch across an exchange change; 7 tests, each checked to fail without its fix. |
+| `trader.py`, `risk.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new) | Findings 74–78: realised-loss latch on every booked exit, withheld records whatever ends the entry pass, the stream started by Start stopped by reference, the slippage hold capped after a clock step, the stricter kill switch carried; 10 tests, each checked to fail with its fix removed (ten mutations). |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -261,7 +267,7 @@ machine with Python 3.14 (section H).
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **598 passed** |
+| `python -m pytest tests -q` | 434 passed | **608 passed** |
 | `node --test tests/test_dashboard.js` | 11 passed | 14 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
 | `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
@@ -332,6 +338,16 @@ New test files and what they prove:
   rejection spike reported and ignoring orders never sent; one intent id
   finding the submit, whose token finds the authorization; manual order ids;
   the kill switch carried to the other exchange.
+* `tests/test_review_round4.py` (10): a manual close that crosses the
+  realised-loss limit latches before a later profitable close, and a small
+  one does not; a network error on one re-quote withholds only that
+  candidate; an error that ends the pass withholds only the candidates not
+  yet tried; a Stop at the end of a scan and a live halt leave a withheld line
+  for every remaining `enter`; a Stop between the stream's creation and its
+  start leaves no stream thread running; a slippage hold seen after a
+  six-hour backward clock step counts down from 30 minutes and closes; an
+  exits-blocked switch tightens an entries-only one on the target, and an
+  entries-only switch does not loosen an exits-blocked target.
 
 **Not runnable here.**
 
@@ -470,6 +486,10 @@ want.
 1. Clock discipline (findings 8, 9, 14, 15): measure the exchange time offset
    periodically (`fetch_time`) for both exchanges and refresh it on a MEXC
    700003 error; use it for Kraken candle cut-off and the re-entry marker.
+   The rejection-spike window and the slippage re-arm also count by journal
+   timestamps on the PC clock (finding 77): after a backward step the spike
+   stays open until the clock catches up, and the slippage breaker samples
+   only fills made after it has.
 2. Manual dust consolidation (7): derive the merged position's stop and target
    from the new fill rather than the blended average, or refuse to merge when
    the blended stop would be above the current bid.

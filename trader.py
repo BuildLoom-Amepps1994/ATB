@@ -441,7 +441,10 @@ class TradingEngine:
                 self.live_halted = self._durable_live_block()
                 self._restore_from_keyring()
             self.risk_block = None
-            if carried_switch and carried_switch['engaged'] and not self.risk.kill_switch()['engaged']:
+            target_switch = self.risk.kill_switch() if carried_switch and carried_switch['engaged'] else None
+            # Carried when the target is released, or when it allows exits that the carried one blocks.
+            if target_switch is not None and (not target_switch['engaged']
+                                              or (target_switch['allow_exits'] and not carried_switch['allow_exits'])):
                 self.risk.engage_kill_switch(f'Carried over from {changed_from.upper()}: {carried_switch.get("reason") or "kill switch"}',
                                              allow_exits=carried_switch['allow_exits'])
             self.manual_order_context = str(uuid.uuid4())
@@ -582,22 +585,32 @@ class TradingEngine:
         if not self.cfg.get('streaming_quotes'):
             self._stop_feed()
             return
+        started = None
         try:
-            if self.feed is None or self.feed.state in ('stopped', 'failed'):
-                self.feed = feed.QuoteFeed(self.exchange_name, self._feed_symbols(), metrics=self.metrics,
-                                           heartbeat_seconds=max(5.0, min(60.0, float(self.cfg['data_max_age_seconds']) / 4)))
-            self.feed.start()
+            started = self.feed
+            if started is None or started.state in ('stopped', 'failed'):
+                started = feed.QuoteFeed(self.exchange_name, self._feed_symbols(), metrics=self.metrics,
+                                         heartbeat_seconds=max(5.0, min(60.0, float(self.cfg['data_max_age_seconds']) / 4)))
+                self.feed = started
+            started.start()
         except Exception as exc:
             self.feed = None
             storage.audit('warning', f'Streaming quotes unavailable ({type(exc).__name__}); REST polling remains in use.')
         if generation is not None:
             # stop() bumps the generation before its own _stop_feed, and the
             # worker clears ``running`` before its; either that call sees this
-            # feed, or this check sees the stop.
+            # feed, or this check sees the stop. A Stop that ran between this
+            # feed's creation and its start() already took it out of
+            # self.feed, so it is stopped by reference too.
             with self.lock:
                 abandoned = generation != self.stop_generation or not self.running
             if abandoned:
                 self._stop_feed()
+                if started is not None:
+                    try:
+                        started.stop(timeout=3)
+                    except Exception:
+                        pass
 
     def _stop_feed(self) -> None:
         current, self.feed = self.feed, None
@@ -1581,6 +1594,15 @@ class TradingEngine:
             observability.event('ledger.accounted', intent_id=intent, decision_id=decision_id, mode=mode, symbol=symbol,
                                 side='SELL', order_id=order_id, qty=filled, price=fill_price, proceeds=proceeds, fee=fee,
                                 realized=pnl, remaining=remaining, reason=reason)
+            # Every booked exit is checked against the realised-loss limit at
+            # once: a manual close runs with the worker stopped, so no later
+            # valuation may see the crossing before a profit or the UTC day hides it.
+            try:
+                cash_after = (cash if mode == 'paper' else float(balance['free'].get('USDT', 0) or 0)) + proceeds
+                self.risk.observe_realized(mode, self._equity(mode, cash_after, self._active_positions(mode)))
+            except Exception as exc:
+                storage.audit('warning', f'Realised-loss check after the {symbol} exit failed ({type(exc).__name__}); '
+                                         'it runs again at the next valuation.')
             # Reentry cooldown and fill were committed together above.
             return True
         except Exception as exc:
@@ -1813,10 +1835,13 @@ class TradingEngine:
             if allow_orders and self._orders_allowed():
                 exited_symbols.update(self._monitor_if_due())
                 self._enter_candidates(sorted((c for c in candidates if c[2] not in exited_symbols), reverse=True))
-            elif self.mode == 'paper':
-                positions = self._active_positions('paper')
-                if self._marks_fresh(positions):
-                    self._daily_allowed('paper', self._equity('paper', self._cash('paper'), positions))
+            else:
+                if allow_orders:   # a Stop landed during the scan
+                    self._withhold(sorted(candidates, reverse=True), 'orders_not_allowed')
+                if self.mode == 'paper':
+                    positions = self._active_positions('paper')
+                    if self._marks_fresh(positions):
+                        self._daily_allowed('paper', self._equity('paper', self._cash('paper'), positions))
             return assessments
         except Exception as exc:
             with self.lock:
@@ -2037,6 +2062,16 @@ class TradingEngine:
 
     def _enter_candidates(self, candidates):
         candidates = list(candidates)
+        cursor = [0]
+        try:
+            self._enter_pass(candidates, cursor)
+        except Exception:
+            # Whatever ended the pass early, the rest still say why they were not traded.
+            self._withhold(candidates[cursor[0]:], 'entry_pass_error')
+            raise
+
+    def _enter_pass(self, candidates, cursor):
+        """Try each candidate in order; ``cursor[0]`` is the first one without an outcome yet."""
         if self.mode == 'live' and storage.settings_health()['review_required']:
             self.risk_block = 'Recovered settings require an explicit review and save; new live entries blocked'
             self._withhold(candidates, 'settings_review')
@@ -2068,6 +2103,7 @@ class TradingEngine:
             self.risk_block = None
         count = 0
         for index, candidate in enumerate(candidates):
+            cursor[0] = index
             _score, _volume, symbol, observed_price, atr, candle = candidate[:6]
             signal_close = candidate[6] if len(candidate) > 6 else observed_price
             decision_id = candidate[7] if len(candidate) > 7 else None
@@ -2092,9 +2128,11 @@ class TradingEngine:
             # many coins can otherwise place an entry using an old quote.
             try:
                 price, volume, spread = self._observe_ticker(symbol, self.data.ticker(symbol), for_buy=True)
-            except ValueError:
+            except Exception:
+                # A network error after retries is as unquotable as bad data,
+                # and one unquotable candidate must not end the pass.
                 self._withhold([candidate], 'requote_unavailable')
-                continue  # One unquotable candidate must not end the pass.
+                continue
             if volume < self.cfg['min_quote_volume'] or spread is None or spread > self.cfg['max_spread_pct']:
                 self._withhold([candidate], 'requote_liquidity')
                 continue
@@ -2125,12 +2163,15 @@ class TradingEngine:
                                     error=type(exc).__name__, decision_id=decision_id)
                 self.risk.record_failure('entry_error')
                 if self.mode == 'live':
+                    self._withhold(candidates[index + 1:], 'entry_error')
                     break
                 continue
             if filled:
                 count += 1
             if self.mode == 'live' and self.live_halted:
+                self._withhold(candidates[index + 1:], 'live_halted')
                 break
+        cursor[0] = len(candidates)
 
     def _same_candle_blocked(self, symbol: str, primary_tf: str, candle) -> bool:
         """The durable no-reentry rule _enter_candidates applies: entered or exited on this candle."""

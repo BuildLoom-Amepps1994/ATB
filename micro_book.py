@@ -23,8 +23,11 @@ venue or CCXT changes):
 * A ticker (REST or the stream) is top of book only: one level per side,
   with the quantity from ``bidVolume``/``askVolume`` when the venue sent it.
   CCXT maps MEXC's ``"0"`` and ``""`` quantities to None, so a zero ticker
-  volume is unknown here too, never an empty level. Without both quantities
-  ``depth_known`` is False and no walk may treat the level as liquidity.
+  volume is unknown here too, never an empty level. ``depth_known`` is
+  always False for a ticker, even with both quantities (the contract: entries
+  need a real depth snapshot, an exit estimate on a ticker uses the flat
+  fallback). The quantities are kept for display only. A REST 24h ticker's
+  ``timestamp`` is its window's close time, not the quote's.
 * The stream feed's ``_stream_sequence`` is a local counter, never venue
   evidence, and is ignored.
 
@@ -34,6 +37,15 @@ clock step can neither make an old book look fresh nor a fresh one old.
 ``clock_offset_s`` is local-minus-venue seconds (CCXT ``timeDifference`` /
 1000, as :meth:`market_data.MarketData._clock_offset` reads it): a venue
 timestamp ``ts`` happened at ``ts / 1000 + clock_offset_s`` on this PC.
+
+The two receipt stamps must be taken together, when the response arrives:
+the integration stamps ``time.monotonic()`` next to the feed's or market
+data's wall ``_received_at``, never later and never from another clock. The
+tracker refuses (``ValueError``) a receipt whose stamps disagree with its
+reference pair by more than ``MIXED_CLOCKS_S`` (a wall time passed as the
+monotonic one, or the reverse). A smaller mismatch cannot be told apart from
+a wall-clock step: a wall stamp that lags its monotonic stamp by more than
+a second can read as a rollback and invalidate every book.
 
 ``generation`` is a local per-symbol counter assigned by
 :class:`BookTracker` when it accepts a snapshot. It links a decision or a
@@ -74,6 +86,10 @@ CODES = (BOOK_EMPTY, BOOK_CROSSED, BOOK_INVALID_LEVEL, BOOK_UNSORTED, BOOK_STALE
 FUTURE_TOLERANCE_S = 5.0            # venue timestamp may lead receipt by this much (clock jitter, latency)
 TIMESTAMP_REGRESSION_S = 1.0        # a venue timestamp older than the newest one by more than this is out of order
 CLOCK_ROLLBACK_TOLERANCE_S = 1.0    # wall time may fall this far behind the previous receipt before it is a rollback
+# time.time() and time.monotonic() differ by decades on a real machine, while a wall clock corrected during
+# a run moves far less (a clock years off could not even validate the venue's TLS certificate): a receipt whose
+# wall and monotonic stamps disagree with the tracker's reference pair by more than this came from another clock.
+MIXED_CLOCKS_S = 10 * 365 * 86400.0
 MAX_RAW_LEVELS = 5000               # MEXC's maximum depth; a longer side is not a venue response
 MAX_LEVELS = MAX_RAW_LEVELS
 MAX_VENUE_INT = 2 ** 63             # venue sequences and millisecond timestamps are 64-bit
@@ -94,10 +110,22 @@ class BookError(ValueError):
 
 
 # --------------------------------------------------------------- parsing
+def _as_float(value) -> float | None:
+    """``value`` as a finite float, or None when it is not a number or does not fit one (a huge int)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _finite(value, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    number = _as_float(value)
+    if number is None:
         raise ValueError(f'{name} must be a finite number')
-    return float(value)
+    return number
 
 
 def _venue_int(value, name: str, *, minimum: int) -> int | None:
@@ -198,7 +226,7 @@ class BookSnapshot:
     bids: tuple[tuple[Decimal, Decimal | None], ...]   # best first (price descending)
     asks: tuple[tuple[Decimal, Decimal | None], ...]   # best first (price ascending)
     source: str                       # rest_depth | ticker | stream_ticker | fixture
-    depth_known: bool                 # False when a level quantity is unknown (ticker top of book)
+    depth_known: bool                 # False for a ticker (top of book only) and whenever a quantity is unknown
     venue_timestamp_ms: int | None    # the venue's time for this book, when it sent one
     venue_sequence: int | None        # MEXC REST depth lastUpdateId (CCXT 'nonce'); a venue value, never local
     received_wall: float              # time.time() when the response arrived
@@ -217,6 +245,8 @@ class BookSnapshot:
         unknown_ok = self.source != 'rest_depth'
         bids = _check_side(self.bids, 'bids', descending=True, unknown_quantity_ok=unknown_ok)
         asks = _check_side(self.asks, 'asks', descending=False, unknown_quantity_ok=unknown_ok)
+        if self.depth_known and self.source in ('ticker', 'stream_ticker'):
+            raise ValueError('a ticker is top of book only and never claims known depth')
         if self.depth_known and any(quantity is None for _, quantity in bids + asks):
             raise BookError(BOOK_INVALID_LEVEL, 'depth is marked known but a level quantity is unknown')
         if bids[0][0] >= asks[0][0]:
@@ -276,10 +306,11 @@ class BookSnapshot:
         writer) is age 0; one more than a second before it means the caller
         mixed clocks, so the age is unknown and reported as infinite (stale).
         """
-        if isinstance(now_mono, bool) or not isinstance(now_mono, (int, float)) or not math.isfinite(now_mono):
+        now = _as_float(now_mono)
+        if now is None:
             return math.inf
-        age = float(now_mono) - self.received_mono
-        if age < -CLOCK_ROLLBACK_TOLERANCE_S:
+        age = now - self.received_mono
+        if not age >= -CLOCK_ROLLBACK_TOLERANCE_S:
             return math.inf
         return max(0.0, age)
 
@@ -350,7 +381,7 @@ def _ticker_quantity(value, side: str) -> Decimal | None:
 
 def from_ticker(ticker: dict, *, exchange: str, symbol: str, received_wall: float, received_mono: float,
                 clock_offset_s: float = 0.0, source: str = 'ticker') -> BookSnapshot:
-    """A one-level top-of-book snapshot from a CCXT ticker; depth is known only when both volumes are."""
+    """A one-level top-of-book snapshot from a CCXT ticker; depth is never known (the volumes are display only)."""
     if source not in TICKER_SOURCES:
         raise ValueError(f'a ticker source must be one of {", ".join(TICKER_SOURCES)}')
     if not isinstance(ticker, dict):
@@ -361,9 +392,8 @@ def from_ticker(ticker: dict, *, exchange: str, symbol: str, received_wall: floa
         if ticker.get(price_key) is None:
             raise BookError(BOOK_EMPTY, f'ticker has no {price_key}')
         sides[side] = ((_price(ticker.get(price_key), side, 0), _ticker_quantity(ticker.get(volume_key), side)),)
-    depth_known = sides['bids'][0][1] is not None and sides['asks'][0][1] is not None
     snapshot = BookSnapshot(exchange=exchange, symbol=symbol, bids=sides['bids'], asks=sides['asks'], source=source,
-                            depth_known=depth_known,
+                            depth_known=False,
                             venue_timestamp_ms=_venue_int(ticker.get('timestamp'), 'timestamp', minimum=1),
                             venue_sequence=None, received_wall=received_wall, received_mono=received_mono,
                             clock_offset_s=clock_offset_s)
@@ -379,6 +409,7 @@ class _Track:
     generation: int = 0               # last generation assigned; never reset, so a number names one snapshot
     max_sequence: int | None = None   # newest venue evidence accepted since the last invalidation
     max_timestamp_ms: int | None = None
+    fence_mono: float | None = None   # a book received no later than this was received before an invalidation
     invalidated: str | None = None
     last_error: str | None = None
     accepted: int = 0
@@ -389,22 +420,35 @@ class BookTracker:
     """The newest valid snapshot per symbol, served only while it is fresh.
 
     ``accept`` refuses, and keeps the stored snapshot, when the new one is
-    older by any evidence the two share: a lower venue sequence; otherwise a
-    venue timestamp more than ``TIMESTAMP_REGRESSION_S`` older than the newest
-    accepted; otherwise, when the stored snapshot and the new one share no
-    venue evidence, an earlier receipt. Venue evidence is compared with the
-    newest value accepted since the last invalidation, so a ticker accepted
-    in between cannot let an older depth snapshot back in.
+    older by any evidence: a venue sequence lower than the newest accepted;
+    otherwise a venue timestamp more than ``TIMESTAMP_REGRESSION_S`` older
+    than the newest accepted; and, when it was received before the stored
+    snapshot, unless venue evidence it shares with the stored one shows it is
+    strictly newer than everything accepted. So an equal sequence, an equal
+    timestamp or one inside the jitter tolerance never outranks the receipt
+    order. Venue evidence is compared with the newest value accepted since
+    the last invalidation, so a ticker accepted in between cannot let an
+    older depth snapshot back in.
 
     A wall clock that stepped back (receipt wall time more than
     ``CLOCK_ROLLBACK_TOLERANCE_S`` before the previous accepted receipt while
-    the monotonic clock advanced) invalidates every symbol: venue timestamps
-    and anything derived from wall time must be rebuilt from new snapshots.
-    Snapshots received before the rollback was detected are refused after it.
+    the monotonic clock advanced) invalidates every symbol's snapshot:
+    anything derived from wall time must be rebuilt from new snapshots.
+    Snapshots received before the rollback was detected are refused after
+    it. The venue evidence is kept: a local clock step says nothing about the
+    venue's update ids or the venue's own clock.
 
-    ``invalidate`` (a stream reconnect, a rollback) clears the served snapshot
-    and the venue evidence, so a venue that restarted its counters cannot
-    lock a symbol out; ``generation`` keeps counting.
+    ``invalidate`` (a stream reconnect) clears the served snapshot and the
+    venue evidence, so a venue that restarted its counters cannot lock a
+    symbol out, and fences the receipt clock: a snapshot received no later
+    than the newest receipt the tracker had seen was received before the
+    invalidation and is refused, whatever its venue evidence says.
+    ``generation`` keeps counting.
+
+    A receipt whose wall and monotonic stamps disagree with the tracker's
+    reference pair by more than ``MIXED_CLOCKS_S`` raises ``ValueError`` and
+    changes nothing, so one mis-stamped snapshot can neither switch rollback
+    detection off nor lock its symbol out.
     """
 
     def __init__(self, *, max_age_s: float, future_tolerance_s: float = FUTURE_TOLERANCE_S):
@@ -416,7 +460,8 @@ class BookTracker:
         self.exchange: str | None = None
         self.rollbacks = 0
         self._tracks: dict[str, _Track] = {}
-        self._clock_ref: tuple[float, float] | None = None   # (wall, mono) of the latest receipt accepted
+        # (wall, mono) of the latest receipt accepted, or of the one that revealed a rollback
+        self._clock_ref: tuple[float, float] | None = None
         self._rollback_mono: float | None = None
 
     def accept(self, snapshot: BookSnapshot) -> BookSnapshot:
@@ -426,6 +471,7 @@ class BookTracker:
         with self.lock:
             if self.exchange is not None and snapshot.exchange != self.exchange:
                 raise ValueError(f'this tracker holds {self.exchange} books, not {snapshot.exchange}')
+            self._check_clock_pair(snapshot)
             track = self._tracks.setdefault(snapshot.symbol, _Track())
             try:
                 self._check_clock(snapshot)
@@ -448,6 +494,17 @@ class BookTracker:
             self.exchange = stored.exchange
             return stored
 
+    def _check_clock_pair(self, snapshot: BookSnapshot) -> None:
+        """Refuse a receipt stamped from another clock before it can become the reference or a stored book."""
+        if self._clock_ref is None:
+            return
+        ref_wall, ref_mono = self._clock_ref
+        drift = (snapshot.received_wall - ref_wall) - (snapshot.received_mono - ref_mono)
+        if not abs(drift) <= MIXED_CLOCKS_S:
+            raise ValueError(f'{snapshot.symbol} receipt stamps disagree with the previous receipts by '
+                             f'{abs(drift) / 86400:.0f} days: received_wall must be time.time() and received_mono '
+                             'time.monotonic(), taken together when the response arrived')
+
     def _check_clock(self, snapshot: BookSnapshot) -> None:
         if self._rollback_mono is not None and snapshot.received_mono < self._rollback_mono:
             raise BookError(CLOCK_ROLLBACK, f'{snapshot.symbol} book was received before the wall-clock rollback '
@@ -460,12 +517,15 @@ class BookTracker:
             self._clock_ref = (snapshot.received_wall, snapshot.received_mono)
             self._rollback_mono = snapshot.received_mono
             self.rollbacks += 1
-            self._invalidate(None, f'wall clock stepped back {stepped:.1f} s')
+            self._invalidate(None, f'wall clock stepped back {stepped:.1f} s', keep_evidence=True)
             raise BookError(CLOCK_ROLLBACK, f'wall clock stepped back {stepped:.1f} s while the monotonic clock '
                                             'advanced; every book was invalidated')
 
     @staticmethod
     def _check_order(track: _Track, snapshot: BookSnapshot) -> None:
+        if track.fence_mono is not None and snapshot.received_mono <= track.fence_mono:
+            raise BookError(BOOK_OUT_OF_ORDER, f'{snapshot.symbol} book was received before the book was '
+                                               f'invalidated ({track.invalidated or "invalidated"})')
         sequence, timestamp = snapshot.venue_sequence, snapshot.venue_timestamp_ms
         if sequence is not None and track.max_sequence is not None:
             if sequence < track.max_sequence:
@@ -477,11 +537,17 @@ class BookTracker:
                 raise BookError(BOOK_OUT_OF_ORDER, f'{snapshot.symbol} venue timestamp is {behind:.1f} s older '
                                                    'than one already accepted')
         stored = track.snapshot
-        if stored is None:
+        if stored is None or snapshot.received_mono >= stored.received_mono:
             return
-        shared = ((sequence is not None and stored.venue_sequence is not None)
-                  or (timestamp is not None and stored.venue_timestamp_ms is not None))
-        if not shared and snapshot.received_mono < stored.received_mono:
+        # Received before the stored book: only venue evidence shared with it, strictly newer than everything
+        # accepted, outranks the receipt order (an equal value or a timestamp inside the jitter tolerance does not).
+        if sequence is not None and stored.venue_sequence is not None:
+            newer = sequence > max(stored.venue_sequence, track.max_sequence or 0)
+        elif timestamp is not None and stored.venue_timestamp_ms is not None:
+            newer = timestamp > max(stored.venue_timestamp_ms, track.max_timestamp_ms or 0)
+        else:
+            newer = False
+        if not newer:
             raise BookError(BOOK_OUT_OF_ORDER, f'{snapshot.symbol} book was received before the stored one and '
                                                'carries no venue evidence that it is newer')
 
@@ -504,11 +570,23 @@ class BookTracker:
         with self.lock:
             self._invalidate(symbol, reason or 'invalidated')
 
-    def _invalidate(self, symbol: str | None, reason: str) -> None:
+    def _invalidate(self, symbol: str | None, reason: str, *, keep_evidence: bool = False) -> None:
+        """Stop serving the books.
+
+        A rollback keeps the venue evidence (``_rollback_mono`` already refuses the receipts before it).
+        An explicit invalidation clears the evidence and fences receipts at the newest one seen so far.
+        """
         tracks = self._tracks.values() if symbol is None else [self._tracks[symbol]] if symbol in self._tracks else []
+        # Every receipt the tracker has seen was handed to accept() before this call, so nothing received no
+        # later than the newest of them can be news from after the invalidation.
+        fence = self._clock_ref[1] if self._clock_ref is not None else None
         for track in tracks:
-            track.snapshot, track.max_sequence, track.max_timestamp_ms = None, None, None
-            track.invalidated = reason
+            track.snapshot, track.invalidated = None, reason
+            if keep_evidence:
+                continue
+            track.max_sequence, track.max_timestamp_ms = None, None
+            if fence is not None:
+                track.fence_mono = fence if track.fence_mono is None else max(fence, track.fence_mono)
 
     def status(self, now_mono: float) -> dict:
         """Per symbol: generation, age, source, venue sequence, last refusal and whether the book is served."""

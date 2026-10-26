@@ -291,11 +291,18 @@ def test_ticker_without_volumes_is_top_of_book_with_unknown_depth():
     assert snapshot.source == 'stream_ticker'
 
 
-def test_ticker_with_volumes_is_a_known_one_level_depth():
-    snapshot = from_ticker(ticker(bidVolume='0.387864', askVolume=6.544908, timestamp=WALL_MS - 200))
-    assert snapshot.depth_known is True and snapshot.level_count == 1
+@pytest.mark.parametrize('source', ['ticker', 'stream_ticker', 'fixture'])
+def test_ticker_volumes_are_kept_but_a_ticker_never_claims_known_depth(source):
+    # The contract: a ticker is top of book only (depth_known=False), so entries need a real depth
+    # snapshot and an exit estimate on a ticker takes the flat fallback, even when both volumes are sent.
+    snapshot = from_ticker(ticker(bidVolume='0.387864', askVolume=6.544908, timestamp=WALL_MS - 200), source=source)
+    assert snapshot.depth_known is False and snapshot.level_count == 1
     assert snapshot.bids == ((D('2000.1'), D('0.387864')),) and snapshot.asks == ((D('2000.2'), D('6.544908')),)
     assert snapshot.venue_timestamp_ms == WALL_MS - 200
+    assert snapshot.as_dict()['bids'] == [['2000.1', '0.387864']]     # the volumes stay visible
+    if source != 'fixture':
+        with pytest.raises(ValueError):                                # nor can a ticker be relabelled as depth
+            dataclasses.replace(snapshot, depth_known=True)
 
 
 @pytest.mark.parametrize('volumes', [{'bidVolume': '1'}, {'askVolume': 2.5}, {'bidVolume': 0, 'askVolume': '1'},
@@ -347,6 +354,28 @@ def test_age_is_monotonic_whatever_the_wall_clock_says():
     assert book(mono=100.0).age_seconds(99.5) == 0.0               # a reader racing the writer
 
 
+@pytest.mark.parametrize('huge', [10 ** 400, -10 ** 400], ids=['huge', 'huge_negative'])
+def test_huge_integer_times_are_stale_or_refused_never_an_overflow(huge):
+    snapshot = book(mono=100.0)
+    assert snapshot.age_seconds(huge) == float('inf')          # unusable input is stale
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(snapshot)
+    assert tracker.latest('ETH/USDT', now_mono=huge) is None
+    row = tracker.status(huge)['ETH/USDT']
+    assert row['state'] == 'stale' and row['age_s'] is None
+    with pytest.raises(ValueError):
+        tracker.latest('ETH/USDT', now_mono=100.0, max_age_s=huge)
+    for kwargs in ({'max_age_s': huge}, {'max_age_s': 5, 'future_tolerance_s': huge}):
+        with pytest.raises(ValueError):
+            BookTracker(**kwargs)
+    for field in ('received_wall', 'received_mono', 'clock_offset_s'):
+        times = {'received_wall': WALL, 'received_mono': MONO, 'clock_offset_s': 0.0, field: huge}
+        with pytest.raises(ValueError):
+            micro_book.from_ccxt_order_book(depth(), exchange='mexc', symbol='ETH/USDT', **times)
+        with pytest.raises(ValueError):
+            micro_book.from_ticker(ticker(), exchange='mexc', symbol='ETH/USDT', **times)
+
+
 def test_a_caller_can_tighten_but_not_loosen_the_age_limit():
     tracker = BookTracker(max_age_s=5)
     tracker.accept(book(mono=100.0))
@@ -395,6 +424,25 @@ def test_without_shared_venue_evidence_the_earlier_receipt_loses():
     tracker.accept(from_ticker(ticker(), received_mono=100.1))
 
 
+def test_within_the_timestamp_tolerance_an_earlier_receipt_still_loses():
+    tracker = BookTracker(max_age_s=5)
+    first = tracker.accept(from_ticker(ticker(timestamp=WALL_MS), received_mono=100.0))
+    # older by the venue clock (inside the jitter tolerance) AND received earlier: older by every piece of evidence
+    late = from_ticker(ticker(timestamp=WALL_MS - 800, bid=1999), received_mono=99.0)
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, late)
+    tied = from_ticker(ticker(timestamp=WALL_MS, bid=1999), received_mono=99.5)    # same venue time, received earlier
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, tied)
+    assert tracker.latest('ETH/USDT', now_mono=100.1) is first
+    # a strictly newer venue timestamp still outranks the receipt order
+    newer = tracker.accept(from_ticker(ticker(timestamp=WALL_MS + 1), received_mono=99.8))
+    assert tracker.latest('ETH/USDT', now_mono=100.1) is newer
+    # the same holds for a sequence: an equal update id received earlier is not newer
+    tracker = BookTracker(max_age_s=5)
+    kept = tracker.accept(seq(1000, mono=100.0))
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(1000, mono=99.0, bid='1999'))
+    assert tracker.latest('ETH/USDT', now_mono=100.1) is kept
+
+
 def test_wall_clock_rollback_while_monotonic_advances_invalidates_every_symbol():
     tracker = BookTracker(max_age_s=5)
     tracker.accept(seq(10, wall=WALL, mono=100.0, symbol='ETH/USDT'))
@@ -412,6 +460,45 @@ def test_wall_clock_rollback_while_monotonic_advances_invalidates_every_symbol()
     rebuilt = tracker.accept(seq(22, wall=WALL - 29, mono=103.0, symbol='BTC/USDT'))
     assert rebuilt.generation == 2 and tracker.latest('BTC/USDT', now_mono=103.5) is rebuilt
     assert tracker.accept(seq(13, wall=WALL - 28.5, mono=103.2, symbol='ETH/USDT')).generation == 3
+
+
+def test_a_clock_rollback_keeps_the_venue_evidence():
+    # a local wall-clock step says nothing about the venue's update ids or the venue's own clock
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(1000, wall=WALL, mono=100.0))
+    tracker.accept(book(depth(timestamp=WALL_MS, symbol='BTC/USDT'), wall=WALL, mono=100.1, symbol='BTC/USDT'))
+    refused(micro_book.CLOCK_ROLLBACK, tracker.accept, seq(1001, wall=WALL - 30, mono=101.0))
+    assert tracker.latest('ETH/USDT', now_mono=101.1) is None and tracker.latest('BTC/USDT', now_mono=101.1) is None
+    # a lagging replica or a request in flight: received after the rollback, but the venue said 1000 already existed
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(900, wall=WALL - 29.5, mono=101.5))
+    older_venue_time = book(depth(timestamp=WALL_MS - 5000, symbol='BTC/USDT'), wall=WALL - 29.5, mono=101.5,
+                            offset=-30.0, symbol='BTC/USDT')
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, older_venue_time)
+    assert tracker.latest('ETH/USDT', now_mono=101.6) is None
+    rebuilt = tracker.accept(seq(1002, wall=WALL - 29, mono=102.0))
+    assert tracker.latest('ETH/USDT', now_mono=102.1) is rebuilt
+    assert tracker.accept(book(depth(timestamp=WALL_MS + 2000, symbol='BTC/USDT'), wall=WALL - 28.9, mono=102.1,
+                               offset=-30.0, symbol='BTC/USDT')).generation == 2
+
+
+def test_a_receipt_stamped_from_another_clock_is_refused_and_cannot_disable_rollback_detection():
+    def xrp_ticker(*, wall, mono):        # no venue evidence: only the receipt order can order it
+        return micro_book.from_ticker(ticker(symbol='XRP/USDT'), exchange='mexc', symbol='XRP/USDT',
+                                      received_wall=wall, received_mono=mono)
+    tracker = BookTracker(max_age_s=5)
+    eth = tracker.accept(seq(1, wall=WALL, mono=100.0))
+    with pytest.raises(ValueError):       # a wall time passed as the monotonic stamp
+        tracker.accept(xrp_ticker(wall=WALL, mono=WALL + 0.1))
+    with pytest.raises(ValueError):       # a monotonic time passed as the wall stamp
+        tracker.accept(xrp_ticker(wall=100.2, mono=100.2))
+    assert tracker.latest('ETH/USDT', now_mono=100.3) is eth and tracker.latest('XRP/USDT', now_mono=100.3) is None
+    assert tracker.rollbacks == 0
+    # rollback detection still works, and honest XRP receipts are not locked out
+    refused(micro_book.CLOCK_ROLLBACK, tracker.accept, seq(2, wall=WALL - 30, mono=101.0))
+    assert tracker.rollbacks == 1
+    xrp = tracker.accept(xrp_ticker(wall=WALL - 29, mono=102.0))
+    assert tracker.latest('XRP/USDT', now_mono=102.1) is xrp
+    assert tracker.accept(xrp_ticker(wall=WALL - 28, mono=103.0)).generation == 2
 
 
 def test_wall_clock_behind_an_earlier_receipt_without_monotonic_progress_is_not_a_rollback():
@@ -436,6 +523,31 @@ def test_invalidate_on_reconnect_stops_serving_and_starts_the_evidence_over():
     tracker.invalidate()
     assert tracker.latest('ETH/USDT', now_mono=100.6) is None and tracker.latest('BTC/USDT', now_mono=100.6) is None
     tracker.invalidate('NEVER/SEEN')        # nothing to invalidate is not an error
+
+
+def test_a_book_received_before_an_invalidation_is_refused_after_it():
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(1000, mono=100.0))
+    late = seq(990, mono=99.0, bid='1999')      # an older response another thread hands over after the reconnect
+    tracker.invalidate('ETH/USDT', reason='stream reconnect')
+    error = refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, late)
+    assert 'invalidated' in str(error)
+    # whatever its venue evidence says: it was received before the reconnect
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(1001, mono=100.0))
+    assert tracker.latest('ETH/USDT', now_mono=100.2) is None
+    status = tracker.status(100.2)['ETH/USDT']
+    assert status['state'] == 'invalidated' and status['refused'] == 2
+    # a venue that restarted its counters still recovers with a snapshot received after the invalidation
+    fresh = tracker.accept(seq(3, mono=100.5))
+    assert tracker.latest('ETH/USDT', now_mono=100.6) is fresh
+    # the fence is the newest receipt the tracker had seen, whichever symbol it was for
+    tracker.accept(seq(7, mono=100.8, symbol='BTC/USDT'))
+    in_flight = seq(4, mono=100.7)              # received after ETH's last book, but before BTC's and the invalidation
+    tracker.invalidate('ETH/USDT', reason='stream reconnect')
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, in_flight)
+    tracker.invalidate()                        # every symbol gets the fence
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(8, mono=100.8, symbol='BTC/USDT'))
+    assert tracker.accept(seq(1, mono=100.9, symbol='BTC/USDT')).generation == 2
 
 
 def test_generation_is_a_local_count_of_accepted_snapshots_never_venue_evidence():

@@ -208,3 +208,38 @@ def test_protective_monitor_reads_quotes_not_full_tickers(engine, monkeypatch):
     engine.public.price = 90
     engine._monitor_if_due(force=True)
     assert calls == [['BTC/USDT']] and engine._active_positions('paper') == []
+
+
+# --- Event log file handling ---------------------------------------------------------
+
+def test_event_log_keeps_no_open_handle_rotates_and_stays_valid_json(engine, tmp_path, monkeypatch):
+    import observability
+    monkeypatch.setattr(storage, 'DATA_DIR', tmp_path / 'data')
+    path = observability.log_path()
+    observability.event('test.one', value=1)
+    assert path.exists() and json.loads(path.read_text().splitlines()[-1])['kind'] == 'test.one'
+    # Nothing holds the file: it can be moved away between events and is recreated.
+    path.rename(path.with_name('moved.jsonl'))
+    observability.event('test.two', value=2)
+    assert json.loads(path.read_text().splitlines()[-1])['kind'] == 'test.two'
+    # Oversized structured fields are summarised instead of cutting the JSON line.
+    huge = observability.event('test.big', payload={'x': 'y' * (observability.MAX_EVENT_BYTES + 100)}, note='kept')
+    line = json.loads(path.read_text().splitlines()[-1])
+    assert line['truncated'] is True and line['note'] == 'kept' and line['payload'].startswith('<omitted') and huge['note'] == 'kept'
+    # Rotation keeps three backups.
+    monkeypatch.setattr(observability, 'MAX_LOG_BYTES', 400)
+    for index in range(40):
+        observability.event('test.fill', index=index, pad='p' * 50)
+    names = sorted(p.name for p in path.parent.iterdir())
+    assert 'events.jsonl.1' in names and 'events.jsonl.3' in names and 'events.jsonl.4' not in names
+    assert all(json.loads(l) for l in path.read_text().splitlines())
+
+
+def test_full_decision_record_fits_in_one_event_line(engine, monkeypatch):
+    import observability
+    lines_before = observability.log_path().read_text().count('\n') if observability.log_path().exists() else 0
+    engine.scan_once(allow_orders=False)
+    lines = observability.log_path().read_text().splitlines()[lines_before:]
+    entries = [json.loads(l) for l in lines if '"kind":"decision.entry"' in l]
+    assert len(entries) == 8
+    assert all('truncated' not in e and e['record']['checks'] and e['record']['inputs']['features'] for e in entries)

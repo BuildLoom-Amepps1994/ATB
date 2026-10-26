@@ -238,7 +238,12 @@ New test files and what they prove:
   this environment). The websocket feed has only been exercised with a
   scripted fake client.
 * `tests/test_dashboard_browser.cjs` (Playwright) was not run.
-* Python 3.14 on Windows: the suite ran on 3.13 here.
+* Python 3.14 on Windows: the suite ran on 3.13 here. The pull request's
+  Windows job (Python 3.14.9) then ran it: 528 passed, but five module
+  teardowns failed because the event log kept `events.jsonl` open while the
+  temporary data directory was being deleted. The log is now appended per
+  event with no handle held between writes (commit 9), and oversized events
+  are summarised instead of being cut mid-JSON.
 
 ---
 
@@ -305,7 +310,8 @@ The branch is seven commits on top of `7207e82`, oldest first:
 5. `cc5b6ef` Add a quote-to-order latency benchmark and a decision replay check
 6. `b99b0a8` Close audit findings on quote ordering, shutdown, the decision trail and entry errors
 7. `eee9f1c` Read protective quotes from the lighter book-ticker endpoint where one exists
-8. (docs) README, RUNBOOK and this review
+8. `21c4692` Document the hardened engine: runbook, README summary and review deliverables
+9. (fix) Append the event log per write so Windows can delete the data directory
 
 `git revert` them newest first, or check out `7207e82` to go back to v1.4.0
 entirely. Data: the schema change is additive (`PRAGMA user_version = 3`, new

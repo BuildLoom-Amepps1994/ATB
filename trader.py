@@ -1468,6 +1468,7 @@ class TradingEngine:
             storage.audit('trade', f'{mode.upper()} BUY {symbol}: {qty:.7g} at {fill_price:.7g}; cost {cost:.2f} USDT.')
             observability.event('ledger.accounted', intent_id=intent, decision_id=decision_id, mode=mode, symbol=symbol,
                                 side='BUY', order_id=order_id, qty=qty, price=fill_price, cost=cost, fee=fee)
+            self._observe_fills(mode)
             return True
         except Exception as exc:
             self._ledger_failure(f'{mode.upper()} BUY {symbol}: {type(exc).__name__}; portfolio ledger requires review',
@@ -1603,12 +1604,26 @@ class TradingEngine:
             except Exception as exc:
                 storage.audit('warning', f'Realised-loss check after the {symbol} exit failed ({type(exc).__name__}); '
                                          'it runs again at the next valuation.')
+            self._observe_fills(mode)
             # Reentry cooldown and fill were committed together above.
             return True
         except Exception as exc:
             self._ledger_failure(f'{mode.upper()} SELL {symbol}: {type(exc).__name__}; portfolio ledger requires review',
                                  intent_id=intent)
             return False
+
+    def _observe_fills(self, mode: str) -> None:
+        """Judge the slippage breaker as soon as a fill is booked.
+
+        Its hold then starts, and is reported, when the bad fill lands rather
+        than at the next entry attempt. A failure here never undoes the booking;
+        the next entry authorization checks the breaker again.
+        """
+        try:
+            self.risk.observe_fills(mode)
+        except Exception as exc:
+            storage.audit('warning', f'Slippage check after a fill failed ({type(exc).__name__}); '
+                                     'the next entry checks it again.')
 
     def _protect_positions(self, symbol: str, price: float):
         """Stored stop/target check at an observed bid; no trailing update here."""
@@ -1620,7 +1635,8 @@ class TradingEngine:
                     exit_id = observability.new_id('exit')
                     observability.event('decision.exit', decision_id=exit_id, symbol=symbol, reason=verdict['reason'],
                                         price=price, stop=float(position['stop']), target=float(position['target']),
-                                        highest=float(position['highest']), source='protective')
+                                        highest=float(position['highest']), source='protective',
+                                        trigger=verdict['trigger'])
                     self._sell(position, price, verdict['reason'], decision_id=exit_id)
 
     def _mark_positions(self, symbol: str, price: float, atr: float, trend_broken: bool, *,
@@ -2168,6 +2184,14 @@ class TradingEngine:
                 continue
             if filled:
                 count += 1
+            elif not (decision_id and storage.rows('SELECT 1 FROM order_journal WHERE decision_id=? LIMIT 1', (decision_id,))):
+                # Nothing reached the journal: the gate refused it (its
+                # risk.blocked event names the check) or it was never prepared.
+                with self.lock:
+                    last = self._last_authorization
+                refused = (last is not None and not last.allowed and last.request.symbol == symbol
+                           and last.request.decision_id == decision_id)
+                self._withhold([candidate], 'risk_gate' if refused else 'not_submitted')
             if self.mode == 'live' and self.live_halted:
                 self._withhold(candidates[index + 1:], 'live_halted')
                 break

@@ -125,3 +125,15 @@ test('latched entry stops map to the clear actions the risk endpoint accepts', (
   assert.deepEqual(latchedStops({drawdown_stop: '2026-10-26T01:00:00Z', realized_stop: '2026-10-26T02:00:00Z'}).map(stop => stop.action),
     ['clear_drawdown_stop', 'clear_realized_stop']);
 });
+
+test('every element the dashboard script looks up exists in the page', () => {
+  // A missing id makes a top-level handler assignment throw, and the dashboard then loads no state at all.
+  const fs = require('node:fs'), path = require('node:path');
+  const folder = path.join(__dirname, '..', 'static');
+  const script = fs.readFileSync(path.join(folder, 'dashboard.js'), 'utf8');
+  const page = fs.readFileSync(path.join(folder, 'index.html'), 'utf8');
+  const ids = new Set([...page.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]));
+  const used = [...new Set([...script.matchAll(/\$\('([A-Za-z0-9_-]+)'\)/g)].map(match => match[1]))];
+  assert.ok(used.length > 50);
+  assert.deepEqual(used.filter(id => !ids.has(id)), []);
+});

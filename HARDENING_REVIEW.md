@@ -158,6 +158,10 @@ impact on live capital or on the integrity of the record.
 | 77 | Low | The durable slippage hold is an end time on the PC clock, so a clock corrected backwards while it was open stretched the 30-minute pause by the size of the step. | **Fixed**: an end time more than 30 minutes away is pulled back to 30 minutes from now and saved. The rejection-spike window still counts by journal timestamps, so a backward step keeps those rejections counted until the clock catches up; that fails closed and is listed in section H. |
 | 78 | Low | Changing exchange carried the kill switch only when the target's switch was released, so an exits-blocked switch did not tighten an entries-only switch already engaged on the target. | **Fixed**: it is carried when the target is released or when the target allows exits that the carried switch blocks; a stricter target is left as it is. |
 | 79 | Low | `--prepare-downgrade` refused while any paper intent was open, although it drops paper rows anyway; the report and `--clear-halt` list live rows only, and a restart closes stale paper intents only for the configured exchange, so a paper row left open on the other exchange blocked the rollback with nothing to reconcile. | **Fixed**: only an open live intent blocks it, and the message says so. |
+| 80 | Low | `decision.exit` lines from the protective path (stored stop and target, which handles most exits) carried no `trigger`, although the runbook and finding 60 say every exit names it. | **Fixed**: `trigger` is set on that path too (`stored`). |
+| 81 | Low | An `enter` decision the risk gate refused (kill switch, caps, breakers) left no `decision.withheld` line and no journal row; only a `risk.blocked` event with the decision id. | **Fixed**: withheld as `risk_gate`, or `not_submitted` when nothing reached the journal for another reason. |
+| 82 | Low | The slippage breaker was judged only at the next entry attempt, so after three bad fills the state view showed no breaker and the 30-minute hold started whenever the next candidate appeared, possibly hours later. | **Fixed**: it is judged as each fill is booked, so the hold starts, and is listed, when the third bad fill lands. |
+| 83 | Low | The test review found fix paths no test pinned: a clear floor from an earlier day, the launcher's Ctrl+C wiring, intent ids on seven failure sites, the fee clamp, the worker-exit stream branch, the stream symbols a scan pushes, the fee estimate on a dust merge, eleven of twelve withheld reasons, the manual SELL id, a carried entries-only switch, the rejection-spike countdown, the rollback command line, the MEXC single-pair fallback and the dashboard's element ids. Each was shown by a mutant that passed the whole suite. | **Fixed**: one test per gap, each checked to fail on its mutant (section B). |
 
 ---
 
@@ -190,9 +194,9 @@ impact on live capital or on the integrity of the record.
 | `static/index.html`, `static/dashboard.js`, `static/dashboard-core.js` | **Clear latched stop** button and warning text (finding 46). |
 | `tests/test_review_round3.py` (new), `tests/test_dashboard.js` | 32 + 1 tests for findings 39–60. Each new test was checked to fail with its fix removed. |
 | `recovery.py`, `trader.py`, `risk.py`, `RUNBOOK.md` | Findings 61–63: `--prepare-downgrade` for a rollback across the schema change, stream lifecycle on a fast Stop or with streaming off, kill switch re-read at submit. |
-| `tests/test_review_round3.py` | 7 more tests for findings 61–63, also checked to fail with each fix removed. |
+| `tests/test_review_round3.py` | 7 more tests for findings 61–63, checked to fail with each fix removed, except the `allow_exits=True` case of the exit kill-switch test, a guard that passes without the fix. |
 | `risk.py`, `trader.py`, `storage.py`, `RUNBOOK.md`, `tests/test_review_round3.py` | Findings 66–69 and 72: breakers that close and report, the submit event and manual order ids, the kill switch across an exchange change; 7 tests, each checked to fail without its fix. |
-| `trader.py`, `risk.py`, `recovery.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new) | Findings 74–79: realised-loss latch on every booked exit, withheld records whatever ends the entry pass, the stream started by Start stopped by reference, the slippage hold capped after a clock step, the stricter kill switch carried, a rollback not blocked by paper intents; 11 tests, each checked to fail with its fix removed. |
+| `trader.py`, `risk.py`, `recovery.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new), `tests/test_dashboard.js` | Findings 74–83: realised-loss latch on every booked exit, withheld records whatever ends the entry pass or the gate refuses, the stream started by Start stopped by reference, the slippage hold capped after a clock step and judged at each fill, the stricter kill switch carried, a rollback not blocked by paper intents, the protective exit trigger, and the test review's gaps; 37 + 1 tests. Each fails on the mutation it targets (the reviewer's 16 mutants and 14 more), except the small-manual-loss test, a guard against latching too eagerly. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -389,8 +393,8 @@ measurements should be repeated on the Windows machine with Python 3.14
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **609 passed** |
-| `node --test tests/test_dashboard.js` | 11 passed | 14 passed |
+| `python -m pytest tests -q` | 434 passed | **635 passed** |
+| `node --test tests/test_dashboard.js` | 11 passed | 15 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
 | `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
 
@@ -460,7 +464,7 @@ New test files and what they prove:
   rejection spike reported and ignoring orders never sent; one intent id
   finding the submit, whose token finds the authorization; manual order ids;
   the kill switch carried to the other exchange.
-* `tests/test_review_round4.py` (11): a manual close that crosses the
+* `tests/test_review_round4.py` (37): a manual close that crosses the
   realised-loss limit latches before a later profitable close, and a small
   one does not; a network error on one re-quote withholds only that
   candidate; an error that ends the pass withholds only the candidates not
@@ -470,7 +474,11 @@ New test files and what they prove:
   six-hour backward clock step counts down from 30 minutes and closes; an
   exits-blocked switch tightens an entries-only one on the target, and an
   entries-only switch does not loosen an exits-blocked target; an open paper
-  intent on another exchange does not block the rollback that drops it.
+  intent on another exchange does not block the rollback that drops it; a
+  protective exit names its trigger; gate refusals are withheld; the slippage
+  hold is listed as soon as the third bad fill is booked; and one test for
+  each coverage gap in finding 83. `tests/test_dashboard.js` also checks that
+  every element id the dashboard script looks up exists in the page.
 
 **Not runnable here.**
 

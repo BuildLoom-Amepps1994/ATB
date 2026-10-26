@@ -341,6 +341,10 @@ class RiskGate:
             remaining = float(BREAKER_HOLD_S)
         return max(0.0, remaining)
 
+    def observe_fills(self, mode: str) -> bool:
+        """Judge the slippage breaker after a fill is booked; True while it holds entries."""
+        return self._slippage_breaker(mode)[0]
+
     def _slippage_breaker(self, mode: str) -> tuple[bool, float | None]:
         """Pause entries for ``BREAKER_HOLD_S`` after the last fills ran far worse than assumed.
 

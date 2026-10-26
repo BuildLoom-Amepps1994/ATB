@@ -68,7 +68,7 @@ Change them while the bot is stopped.
 | `max_position_pct`, `max_exposure_pct`, `max_positions` | 8 %, 40 %, 5 | Position, exposure and count caps. |
 | `risk_pct`, `max_portfolio_risk_pct` | 0.65 %, 3 % | Per-trade loss budget and total open stop risk. |
 | `daily_loss_limit_pct` | 3 % | Equity-based daily guard; latches until the next UTC day. |
-| `daily_realized_loss_limit_pct` | 3 % | Net realised P/L today, UTC: profits offset losses (fees included, also when billed in another asset). Checked when any exit books (automatic or manual) and at every valuation, so it latches as soon as the loss is booked; it holds until `RESUME TRADING` (`clear_realized_stop`) or a paper reset. A looser setting or a later profit does not lift it. After a clear, a further loss the same UTC day latches it again. |
+| `daily_realized_loss_limit_pct` | 3 % | Net realised P/L today, UTC: profits offset losses (fees included, also when billed in another asset). Checked when any exit books (automatic or manual) and at every valuation, so it latches as soon as the loss is booked; it holds until `RESUME TRADING` (`clear_realized_stop`) or a paper reset. A looser setting or a later profit does not lift it. After a clear, it latches again if today's net realised P/L falls below the level at which it was cleared (a clear on an earlier day does not count). |
 | `max_drawdown_pct` | 10 % | Equity drawdown from the tracked peak; latches until `RESUME TRADING`. |
 | `max_orders_per_minute` | 6 | Order-rate limit per exchange and mode (exits are allowed three times that). |
 | `data_max_age_seconds` | 120 | A quote older than this is stale; stale quotes block entries and fall back to REST for exits. |
@@ -115,8 +115,9 @@ seconds until it closes:
   closes as those rejections age out of the window. Orders the engine refused
   itself before sending (a Stop, the kill switch) do not count.
 * `slippage`: the last three fills averaged more than three times the
-  configured slippage against the quote they were priced from. Entries hold
-  for thirty minutes, also across a restart; after that only fills made
+  configured slippage against the quote they were priced from. It is judged
+  as each fill is booked, so it is listed and the hold starts when the third
+  bad fill lands. Entries hold for thirty minutes, also across a restart; after that only fills made
   since the trip count, so the same fills cannot trip it again. A PC clock
   corrected backwards cannot stretch the hold past thirty minutes from the
   moment it is next checked. A paper reset clears a paper hold.
@@ -216,9 +217,12 @@ the exchange knows an order with that client order id and what state it is in.
   order (`per_scan_cap`, `max_positions`, `held`, `same_candle`,
   `requote_unavailable`, `requote_liquidity`, `requote_moved`, `budget`,
   `stale_marks`, `protective_exit_pending`, `daily_loss_guard`,
-  `settings_review`, `orders_not_allowed`, `entry_error` and `live_halted`
-  for the rest of a live pass that stopped, `entry_pass_error` for the
-  candidates not yet tried when an unexpected error ended the pass). `decision.exit` names its
+  `settings_review`, `orders_not_allowed`, `risk_gate` when the risk gate
+  refused it (the matching `risk.blocked` event carries the same
+  `decision_id` and names the check), `not_submitted` when no order reached
+  the journal for another reason, `entry_error` and `live_halted` for the
+  rest of a live pass that stopped, `entry_pass_error` for the candidates not
+  yet tried when an unexpected error ended the pass). `decision.exit` names its
   `source` (`protective`, `monitor` or `scan`) and `trigger` (`stored`,
   `trailing` or `trend`).
 * **Correlation.** Every entry decision has a `decision_id`, every exit

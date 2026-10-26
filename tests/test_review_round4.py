@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import ccxt
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import decision
@@ -120,7 +121,7 @@ def test_a_live_halt_withholds_the_candidates_after_it(engine, monkeypatch):
     monkeypatch.setattr(engine, '_buy', halting_buy)
     engine._enter_candidates(candidates('BTC/USDT', 'ETH/USDT', 'SOL/USDT'))
     withheld = {fields['decision_id']: fields['reason'] for kind, fields in events if kind == 'decision.withheld'}
-    assert withheld == {'dec_1': 'live_halted', 'dec_2': 'live_halted'}
+    assert withheld == {'dec_0': 'not_submitted', 'dec_1': 'live_halted', 'dec_2': 'live_halted'}
 
 
 # --- A Stop inside the feed's own start cannot leave an unreachable stream -----------------
@@ -217,3 +218,282 @@ def test_an_open_paper_intent_does_not_block_the_rollback_that_drops_it(data_fol
     legacy_insert(database)
     with sqlite3.connect(str(database)) as db:
         assert db.execute('SELECT COUNT(*) FROM order_journal WHERE intent_id=?', (paper,)).fetchone()[0] == 0
+
+
+# --- Every exit decision names its trigger; gate refusals are withheld; slippage at the fill ---
+
+def test_a_protective_exit_decision_names_its_trigger(engine, monkeypatch):
+    events = capture_events(monkeypatch)
+    assert engine._buy('BTC/USDT', 800, 100, .04)
+    engine.running = True
+    engine.public.price = 90.                                    # under the stored stop
+    engine._monitor_if_due(force=True)
+    exits = [fields for kind, fields in events if kind == 'decision.exit']
+    assert exits and exits[0]['source'] == 'protective' and exits[0]['trigger'] == 'stored'
+    assert not engine._active_positions('paper')
+
+
+def test_entries_the_risk_gate_refuses_are_withheld_as_such(engine, monkeypatch):
+    events = capture_events(monkeypatch)
+    engine.running = True
+    engine.risk.engage_kill_switch('drill', allow_exits=True)
+    engine._enter_candidates(candidates('BTC/USDT', 'ETH/USDT'))
+    withheld = {fields['decision_id']: fields['reason'] for kind, fields in events if kind == 'decision.withheld'}
+    blocked = {fields.get('decision_id') for kind, fields in events if kind == 'risk.blocked'}
+    assert withheld == {'dec_0': 'risk_gate', 'dec_1': 'risk_gate'} and blocked == {'dec_0', 'dec_1'}
+
+
+def test_the_slippage_hold_opens_and_is_reported_when_the_bad_fill_lands(engine):
+    client = arm_fake_live(engine)
+    engine.cfg['max_positions'] = 8
+    client.fill = {**client.fill, 'average': 101.0, 'cost': 101.0, 'filled': 1.0}   # 1 % worse every time
+    for symbol in ('BTC/USDT', 'ETH/USDT', 'SOL/USDT'):
+        assert engine._buy(symbol, 150, 100, .04)
+        observe(engine, symbol)
+    # No further entry attempt: the state view already shows the full hold.
+    assert engine.risk.status()['breakers_open']['slippage'] > risk.BREAKER_HOLD_S - 60
+
+
+# --- Coverage gaps the final test review found (each test fails on the mutant it names) -----
+
+from test_engine import arm_fake_live  # noqa: E402
+from test_review_round3 import LifecycleFeed, book_sell, mexc_market  # noqa: E402
+
+
+def journal(mode):
+    return storage.rows('SELECT * FROM order_journal WHERE mode=? ORDER BY created_at', (mode,))
+
+
+def test_a_clear_floor_from_an_earlier_day_does_not_shield_todays_loss(engine):
+    # Mutant: the clear floor applied on any day.
+    storage.set_meta(engine.risk._key('realized_stop_cleared', 'paper'),
+                     json.dumps({'date': '2000-01-01', 'realized': -400}))
+    book_sell(engine, -350.)
+    engine._daily_allowed('paper', engine._equity('paper', engine._cash('paper'), []))
+    assert engine.risk.realized_stop('paper')
+
+
+def test_the_launcher_runs_the_engine_first_server_and_its_exit_stops_the_engine(monkeypatch, tmp_path):
+    # Mutants: main() building a plain uvicorn.Server; request_exit not stopping the engine.
+    import socket
+    import uvicorn
+    import app as webapp
+    import launcher
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setenv('CRYPTOPILOT_PORT', str(port))
+    monkeypatch.setenv('CRYPTOPILOT_DATA_DIR', str(tmp_path))
+    monkeypatch.setenv('CRYPTOPILOT_NO_BROWSER', '1')
+    stops, seen = [], {}
+    monkeypatch.setattr(webapp.engine, 'stop', lambda: stops.append(1))
+
+    def fake_run(self, sockets=None):
+        seen['class'] = type(self).__name__
+        webapp.app.state.request_exit()
+        seen['should_exit'] = self.should_exit
+    monkeypatch.setattr(uvicorn.Server, 'run', fake_run)
+    try:
+        assert launcher.main() == 0
+    finally:
+        webapp.app.state.request_exit = None
+    deadline = time.monotonic() + 3
+    while not stops and time.monotonic() < deadline:
+        time.sleep(.02)
+    assert seen['class'] == 'EngineFirstServer'
+    assert seen['should_exit'] and stops == [1]
+
+
+@pytest.mark.parametrize('side', ['BUY', 'SELL'])
+def test_a_live_fill_accounting_failure_names_its_intent(engine, monkeypatch, side):
+    # Mutants: intent ids dropped from the failure sites; live fill failures back to a bare halt.
+    client = arm_fake_live(engine)
+    if side == 'SELL':
+        assert engine._buy('BTC/USDT', 800, 100, .04)
+    events = capture_events(monkeypatch)
+    client.fill = {**client.fill, 'fee': None, 'fees': 'garbage'}
+    if side == 'BUY':
+        assert not engine._buy('ETH/USDT', 800, 100, .04)
+    else:
+        assert not engine._sell(engine._active_positions('live')[0], 100, 'test exit')
+    row = journal('live')[-1]
+    failure = next(fields for kind, fields in events if kind == 'ledger.failure')
+    halt = next(fields for kind, fields in events if kind == 'execution.halt')
+    assert failure['intent_id'] == row['intent_id'] == halt['intent_id']
+
+
+def test_an_unfilled_order_whose_journal_write_fails_names_its_intent(engine, monkeypatch):
+    import orders
+    events = capture_events(monkeypatch)
+    arm_fake_live(engine)
+    monkeypatch.setattr(engine, '_confirm_filled', lambda *a, **k: (_ for _ in ()).throw(orders.Unfilled('none')))
+    original = storage.update_order_intent
+
+    def failing(intent, status, **kwargs):
+        if status == 'rejected':
+            raise OSError('disk')
+        return original(intent, status, **kwargs)
+    monkeypatch.setattr(storage, 'update_order_intent', failing)
+    assert not engine._buy('BTC/USDT', 800, 100, .04)
+    failure = next(fields for kind, fields in events if kind == 'ledger.failure')
+    assert failure['intent_id'] == journal('live')[-1]['intent_id']
+
+
+def test_a_paper_fill_accounting_failure_names_its_intent(engine, monkeypatch):
+    events = capture_events(monkeypatch)
+    monkeypatch.setattr(engine, '_fill_details', lambda *a: (_ for _ in ()).throw(ValueError('bad')))
+    assert not engine._buy('BTC/USDT', 800, 100, .04)
+    failure = next(fields for kind, fields in events if kind == 'ledger.failure')
+    assert failure['intent_id'] == journal('paper')[-1]['intent_id']
+
+
+def test_a_usdt_fee_above_the_configured_rate_is_booked_in_full(engine):
+    # Mutant: the third-asset estimate not clamped at zero.
+    client = arm_fake_live(engine)
+    client.fill = {**client.fill, 'fee': None, 'fees': [{'currency': 'USDT', 'cost': .3}, {'currency': 'MX', 'cost': .01}]}
+    assert engine._buy('BTC/USDT', 800, 100, .04)
+    trade = storage.rows("SELECT gross,fee FROM trades WHERE mode='live' AND side='BUY'")[0]
+    assert trade['fee'] == pytest.approx(.3)
+    assert engine._active_positions('live')[0]['cost'] == pytest.approx(trade['gross'] + .3)
+
+
+def test_a_worker_exit_while_start_prepares_the_stream_stops_it(engine, monkeypatch):
+    # Mutant: the abandon check ignoring ``running``.
+    engine.cfg = {**engine.cfg, 'streaming_quotes': True}
+    created = []
+    monkeypatch.setattr(feed, 'QuoteFeed', lambda *a, **k: created.append(LifecycleFeed()) or created[-1])
+    monkeypatch.setattr(engine, '_loop', lambda: None)
+    prepare = engine._feed_symbols
+
+    def worker_exited(symbols=None):
+        with engine.lock:
+            engine.running = False                                 # as the worker's finally does
+        return prepare(symbols)
+    monkeypatch.setattr(engine, '_feed_symbols', worker_exited)
+    engine.start()
+    assert created and created[0].started and created[0].stopped and engine.feed is None
+
+
+def test_a_scan_pushes_only_listed_pairs_to_the_stream(engine):
+    # Mutant: scan_once passing its raw symbol list to set_symbols.
+    engine.cfg['watchlist'] = list(engine.cfg['watchlist']) + ['NOTLISTED/USDT']
+
+    class Sink:
+        state = 'live'
+
+        def __init__(self):
+            self.calls = []
+
+        def set_symbols(self, symbols):
+            self.calls.append(list(symbols))
+
+        def ticker(self, *args, **kwargs):
+            return None
+
+        def status(self):
+            return {'state': 'live', 'enabled': True}
+
+        def stop(self, timeout=None):
+            pass
+    engine.feed = sink = Sink()
+    engine.scan_once(allow_orders=False)
+    assert sink.calls and all('NOTLISTED/USDT' not in call for call in sink.calls)
+
+
+def test_a_dust_merge_carries_the_third_asset_fee_estimate(engine):
+    # Mutant: the merged cost basis without the estimate.
+    engine.paper.fee_currency = 'MX'
+    with storage.connection() as db:
+        db.execute('''INSERT INTO positions(exchange,mode,symbol,qty,entry_price,cost,highest,stop,target,opened_at)
+                      VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                   (engine.exchange_name, 'paper', 'BTC/USDT', .05, 100, 5., 100, 96, 111, storage._now()))
+    observe(engine, 'BTC/USDT')
+    cash_before = engine._cash('paper')
+    assert engine._buy('BTC/USDT', 200, 100, .04, merge_dust=True), engine.risk_block
+    spent = cash_before - engine._cash('paper')
+    trade = storage.rows("SELECT fee FROM trades WHERE mode='paper' AND side='BUY'")[0]
+    assert trade['fee'] > 0
+    assert engine._active_positions('paper')[0]['cost'] == pytest.approx(5. + spent + trade['fee'])
+
+
+def _withhold_setup(name, engine, monkeypatch):
+    if name == 'stale_marks':
+        monkeypatch.setattr(engine, '_marks_fresh', lambda positions: False)
+    elif name == 'max_positions':
+        engine.cfg['max_positions'] = 0
+    elif name == 'same_candle':
+        monkeypatch.setattr(engine, '_same_candle_blocked', lambda *a: True)
+    elif name == 'requote_moved':
+        monkeypatch.setattr(trader, 'entry_price_ok', lambda *a, **k: False)
+    elif name == 'requote_liquidity':
+        engine.cfg['min_quote_volume'] = 1e15
+    elif name == 'requote_unavailable':
+        monkeypatch.setattr(engine, '_observe_ticker', lambda *a, **k: (_ for _ in ()).throw(ValueError('x')))
+    elif name == 'budget':
+        monkeypatch.setattr(engine, '_entry_budget', lambda *a: (5., 100., .04))
+    elif name == 'daily_loss_guard':
+        monkeypatch.setattr(engine, '_daily_allowed', lambda *a: (False, 9.0))
+
+
+@pytest.mark.parametrize('reason', ['stale_marks', 'max_positions', 'same_candle', 'requote_moved',
+                                    'requote_liquidity', 'requote_unavailable', 'budget', 'daily_loss_guard'])
+def test_each_withheld_reason_is_recorded_with_its_decision(engine, monkeypatch, reason):
+    # Mutant: every other _withhold call removed.
+    events = capture_events(monkeypatch)
+    engine.running = True
+    _withhold_setup(reason, engine, monkeypatch)
+    engine._enter_candidates(candidates('BTC/USDT'))
+    withheld = {fields['decision_id']: fields['reason'] for kind, fields in events if kind == 'decision.withheld'}
+    assert withheld == {'dec_0': reason}
+
+
+def test_a_manual_sell_journals_its_own_request_id(engine):
+    # Mutant: the manual SELL without its decision id.
+    buy_id = '0f1e2d3c-4b5a-4968-8776-655443322110'
+    sell_id = '1f1e2d3c-4b5a-4968-8776-655443322111'
+    assert engine.manual_trade('BTC/USDT', 'BUY', quote_amount=100, request_id=buy_id)['status'] == 'filled'
+    assert engine.manual_trade('BTC/USDT', 'SELL', request_id=sell_id)['status'] in ('filled', 'partial')
+    row = storage.rows("SELECT decision_id FROM order_journal WHERE mode='paper' AND side='SELL'")[0]
+    assert row['decision_id'] == f'manual_{sell_id}'
+
+
+def test_a_carried_switch_keeps_protective_exits_allowed(engine):
+    # Mutant: the carried switch engaged with exits blocked.
+    engine.risk.engage_kill_switch('incident', allow_exits=True)
+    engine.update_config({'exchange': 'kraken'})
+    switch = engine.risk.kill_switch()
+    assert switch['engaged'] and switch['allow_exits']
+
+
+def test_the_rejection_spike_closes_when_the_second_oldest_counted_rejection_ages_out(engine):
+    # Mutant: the countdown taken from the oldest row.
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    for age in (500, 400, 300, 200):
+        intent = storage.create_order_intent(engine.exchange_name, 'BTC/USDT', 'BUY', cost=100, mode='paper')
+        stamp = (now - timedelta(seconds=age)).isoformat(timespec='milliseconds')
+        with storage.connection() as db:
+            db.execute("UPDATE order_journal SET status='rejected', submitted_at=?, updated_at=? WHERE intent_id=?",
+                       (stamp, stamp, intent))
+    assert engine.risk._reject_spike_remaining('paper') == pytest.approx(risk.REJECT_SPIKE_WINDOW_S - 400, abs=5)
+
+
+def test_the_rollback_preparation_runs_from_the_command_line(data_folder, capsys):
+    # Mutant: the --prepare-downgrade flag not wired to the step.
+    import sqlite3
+    import recovery
+    live = storage.create_order_intent('mexc', 'BTC/USDT', 'BUY', cost=100, mode='live')
+    storage.update_order_intent(live, 'rejected', note='test')
+    assert recovery.main(['--prepare-downgrade', '--confirm', recovery.DOWNGRADE_PHRASE]) == 0
+    assert json.loads(capsys.readouterr().out)['changed'] is True
+    with sqlite3.connect(str(data_folder / 'portfolio.sqlite3')) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
+
+
+def test_a_single_mexc_pair_falls_back_to_the_bulk_read_when_the_market_is_unknown():
+    from market_data import MarketData
+    client = ccxt.mexc({'enableRateLimit': False})
+    client.set_markets([mexc_market('BTCUSDT', 'BTC/USDT')])
+    client.market = lambda symbol: (_ for _ in ()).throw(ccxt.ExchangeError('mexc markets not loaded'))
+    client.fetch_tickers = lambda symbols=None, params={}: {'BTC/USDT': {'symbol': 'BTC/USDT', 'bid': 100., 'ask': 100.1}}
+    assert MarketData(client).quotes(['BTC/USDT'])['BTC/USDT']['bid'] == 100.

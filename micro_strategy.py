@@ -18,7 +18,11 @@ Features (``FEATURE_VERSION``), from completed bars only. The caller drops the
 open candle (``strategy.frame_from_ohlcv``) and the last row passed is the
 decision bar. Only the newest ``WINDOW_1M`` / ``WINDOW_5M`` rows are read, and
 5m bars that close after the decision bar closes are ignored, so neither
-older history nor a newer higher-timeframe bar can change a decision.
+older history nor a newer higher-timeframe bar can change a decision. A 5m
+frame whose newest usable bar closed more than one 5m bar before the decision
+bar closed is a feed that stopped, not a slower one: no features
+(``STALE: ...``). ``Features`` refuses non-finite or mistyped fields, so a
+record rebuilt by other code cannot carry a NaN past a ``>`` test.
 
 * EMAs: ``ewm(span, adjust=False)`` seeded at the first row read; 9 and 21 on
   1m closes, 20 and 50 on 5m closes.
@@ -63,11 +67,31 @@ NOT_SELECTED, CAPACITY, COOLDOWN), then whether the data can be trusted
 WEAK_TREND), then the economics (FEES, NO_ECONOMIC_EDGE), and ERROR last.
 WEAK_TREND covers both a regime that offers no candidate and a candidate
 whose own conditions are not met on this bar. A gate that was not supplied is
-unknown and fails; it is never read as a pass.
+unknown and fails; it is never read as a pass, and a block value that is
+neither None, False nor a reason string (a NaN, a number) is a block.
+
+Entry checks beyond the contract's list, each failing closed:
+
+* the decision bar has closed by ``now`` (an open candle is ERROR) and closed
+  at most ``MAX_BAR_AGE_S`` before it (else STALE_DATA). ``now`` is on the
+  candle clock, the venue's time, as the candle cut-off is.
+* the sizing result names this symbol, and an eligible one keeps
+  ``max_debit = gross_quote + fee_reserve <= target_budget <= budget_cap <=
+  MICRO_MAX_ALL_IN_USDT`` (else ERROR): the proposal is scaled from that cap.
+* the spread used is the larger of the reported one and the one the best bid
+  and ask imply.
+* ``stop_beyond_entry_cost``: selling at the best bid the moment the position
+  is bought already loses the round-trip cost (``max_debit * (1 - best_bid /
+  break_even_bid)``). The contract's ``clamp(2 ATR, 25, max_loss)`` stop does
+  not count it, so a stop inside it fires on the first exit check with the
+  book unchanged. The stop must sit at least ``STOP_MIN_ROOM_ATR`` ATR beyond
+  that cost (else NO_ECONOMIC_EDGE).
 
 Exit (``evaluate_exit``): safety exits (stop loss, maximum hold, regime shift)
 need no profit, no entry signal and no depth; profit exits (take profit,
-profit protection) need an estimate from a walk of the bid book.
+profit protection) need an estimate from a walk of the bid book, which the
+estimate itself must state (``depth_model == 'book'`` and ``depth_exhausted is
+False``; a missing flag is not depth evidence).
 """
 from __future__ import annotations
 
@@ -152,11 +176,27 @@ FEES_SPREAD_SHARE = 0.35             # the spread may be at most this share of t
 PROTECT_PEAK_SHARE = Decimal('0.75')
 PROTECT_FLOOR_SHARE = Decimal('0.25')
 AMOUNT_STEP = Decimal('0.00000001')  # proposal amounts: target rounded up, stop rounded down
+# micro_economics.MICRO_MAX_ALL_IN_USDT, repeated here so that a defective or
+# stale sizing record cannot scale a proposal above the absolute micro cap.
+MICRO_MAX_ALL_IN_USDT = Decimal('25')
+MAX_BAR_AGE_S = 2 * BAR_MS_1M / 1000  # the decision bar closed at most two 1m bars before now
+STOP_MIN_ROOM_ATR = 1.0              # the stop sits at least one ATR beyond the loss carried at entry
+MAX_RECORD_INT = 2 ** 63 - 1         # a larger integer is not stored in a decision record
+
+# MicroParams ranges: the contract's settings bounds where a setting exists
+# (target 5..200 bps, loss cap 20..400 bps, hold 2..240 min); elsewhere the
+# range beyond which a threshold in effect switches its gate off. A None
+# minimum means "above zero".
+PARAM_LIMITS = {'target_net_bps': (5.0, 200.0), 'max_loss_bps': (20.0, 400.0), 'max_hold_s': (120.0, 14_400.0),
+                'uncertainty_floor_bps': (0.0, 100.0), 'max_spread_bps': (None, 100.0),
+                'max_vol_bps': (None, 1000.0), 'min_efficiency_trend': (0.0, 1.0),
+                'max_efficiency_range': (0.0, 1.0), 'edge_ratio': (None, 1.0)}
 
 GATE_KEYS = ('selected', 'capacity', 'cooldown_remaining_s', 'fresh_after_exit', 'review_block', 'risk_block',
              'latched')
+BLOCK_KEYS = ('review_block', 'risk_block', 'latched')
 BOOK_KEYS = ('best_bid', 'best_ask', 'spread_bps', 'generation', 'sequence', 'age_s', 'source')
-SIZING_KEYS = ('eligible', 'code', 'detail', 'budget_cap', 'target_budget', 'gross_quote', 'fee_reserve',
+SIZING_KEYS = ('symbol', 'eligible', 'code', 'detail', 'budget_cap', 'target_budget', 'gross_quote', 'fee_reserve',
                'max_debit', 'expected_base', 'sellable_base', 'entry_vwap', 'break_even_bid', 'target_bid',
                'required_move_bps', 'minimum_feasible_budget')
 EXIT_TRIGGERS = ('stop_loss', 'max_hold', 'regime_shift', 'take_profit', 'profit_protection')
@@ -189,20 +229,51 @@ def _decimal(value) -> Decimal | None:
 
 
 def _plain(value):
-    """A JSON-safe copy: Decimals as text, non-finite numbers as None, containers recursively."""
+    """A JSON-safe, bounded copy: Decimals as text, containers recursively.
+
+    A non-finite number, a Decimal ``money.parse`` refuses (a huge exponent
+    would expand into an unbounded digit string) and an integer beyond
+    ``MAX_RECORD_INT`` become None (unknown). Other objects are kept as one
+    bounded line of text.
+    """
     if isinstance(value, np.generic):
         value = value.item()
-    if value is None or isinstance(value, (bool, str, int)):
+    if value is None or isinstance(value, (bool, str)):
         return value
+    if isinstance(value, int):
+        return value if abs(value) <= MAX_RECORD_INT else None
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, Decimal):
-        return money.text(value) if value.is_finite() else None
+        try:
+            return money.text(money.parse(value, field='record value', allow_negative=True))
+        except money.MoneyError:
+            return None
     if isinstance(value, dict):
         return {str(key): _plain(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_plain(item) for item in value]
-    return str(value)
+    return _sentence(value, 120)
+
+
+def _gate_value(key: str, value):
+    """A gate value as recorded. A block that is neither None, False nor a reason
+    string is an unreadable block, and stays a block after the JSON round trip
+    (``_plain`` would turn a NaN into None, which reads as "no block")."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if key in BLOCK_KEYS and not (value is None or isinstance(value, (bool, str))):
+        return f'unreadable {type(value).__name__} value'
+    return _plain(value)
+
+
+def _reason_code(reason: str) -> str:
+    """The code of a ``compute_features`` reason: ``ERROR: ...``, ``STALE: ...`` or a warmup."""
+    if reason.startswith('ERROR'):
+        return ERROR
+    if reason.startswith('STALE'):
+        return STALE_DATA
+    return WARMUP
 
 
 def _sentence(text, limit: int = 240) -> str:
@@ -232,6 +303,38 @@ class Features:
     higher_trend_up: bool    # 5m ema20 > ema50 and 5m close > ema50
     higher_slope_bps: float  # 5m ema50 change over 6 bars, bps of the 5m close
     last_change_bps: float | None = None   # decision bar close vs previous close; None is unknown
+
+    def __post_init__(self):
+        # compute_features only builds finite features, but a Features rebuilt
+        # from a record or by other code is not filtered by it. A NaN fails
+        # every comparison, so "vol_bps > max_vol_bps" would read as calm.
+        if not isinstance(self.symbol, str):
+            raise ValueError('symbol must be a string')
+        for name in ('bar_ts_ms', 'bars_1m', 'bars_5m', 'down_bars'):
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 0:
+                raise ValueError(f'{name} must be a non-negative integer')
+            object.__setattr__(self, name, int(value))
+        if self.bar_ts_ms <= 0:
+            raise ValueError('bar_ts_ms must be a positive time')
+        if not isinstance(self.higher_trend_up, (bool, np.bool_)):
+            raise ValueError('higher_trend_up must be a boolean')
+        object.__setattr__(self, 'higher_trend_up', bool(self.higher_trend_up))
+        for name in ('close', 'ema_fast', 'ema_slow', 'atr_bps', 'vol_bps', 'efficiency', 'slope_bps', 'zscore',
+                     'volume_ratio', 'drop_bps', 'higher_slope_bps', 'last_change_bps'):
+            value = getattr(self, name)
+            if value is None and name == 'last_change_bps':
+                continue
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)) \
+                    or not math.isfinite(float(value)):
+                raise ValueError(f'{name} must be a finite number')
+            object.__setattr__(self, name, float(value))
+        for name in ('close', 'ema_fast', 'ema_slow'):
+            if getattr(self, name) <= 0:
+                raise ValueError(f'{name} must be positive')
+        for name in ('atr_bps', 'vol_bps', 'volume_ratio'):
+            if getattr(self, name) < 0:
+                raise ValueError(f'{name} must not be negative')
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -265,7 +368,7 @@ def _ema(values: np.ndarray, span: int) -> np.ndarray:
 
 
 def compute_features(symbol: str, frame_1m, frame_5m) -> tuple[Features | None, str | None]:
-    """Features of the last completed 1m bar, or ``(None, 'WARMUP: ...' | 'ERROR: ...')``."""
+    """Features of the last completed 1m bar, or ``(None, 'WARMUP: ...' | 'STALE: ...' | 'ERROR: ...')``."""
     one, problem = _bars(frame_1m, '1m')
     if problem:
         return None, problem
@@ -282,6 +385,13 @@ def compute_features(symbol: str, frame_1m, frame_5m) -> tuple[Features | None, 
         five = {name: values[usable] for name, values in five.items()}
     if len(five['close']) < WARMUP_BARS_5M:
         return None, f'WARMUP: {len(five["close"])} of {WARMUP_BARS_5M} completed 5m bars'
+    # The newest usable 5m bar must close within one 5m bar of the decision
+    # bar's close; a feed that stopped earlier would set the higher-timeframe
+    # trend from hours-old data.
+    lag_ms = cutoff - (five['timestamp'][-1] + BAR_MS_5M)
+    if lag_ms > BAR_MS_5M:
+        return None, (f'STALE: the newest 5m bar closed {lag_ms / 60_000:.0f} min before the decision bar '
+                      f'(at most {BAR_MS_5M // 60_000} min)')
     one = {name: values[-WINDOW_1M:] for name, values in one.items()}
     five = {name: values[-WINDOW_5M:] for name, values in five.items()}
 
@@ -335,21 +445,20 @@ class MicroParams:
 
     def __post_init__(self):
         # A NaN threshold makes every comparison False, which would read as
-        # "not too wide", "not too volatile": refuse it here instead.
+        # "not too wide", "not too volatile": refuse it here instead. An
+        # absurd finite one (a 1e300 bps spread limit) switches its gate off
+        # just as well, and a target beyond money.parse's range would raise
+        # on the enter path: every field is bounded by PARAM_LIMITS.
         for item in fields(self):
             value = getattr(self, item.name)
             number = None if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) else float(value)
             if number is None or not math.isfinite(number):
                 raise ValueError(f'{item.name} must be a finite number')
+            low, high = PARAM_LIMITS[item.name]
+            if (number <= 0 if low is None else number < low) or number > high:
+                raise ValueError(f'{item.name} must be {"above 0" if low is None else f"at least {low:g}"} '
+                                 f'and at most {high:g}')
             object.__setattr__(self, item.name, number)
-        for name in ('target_net_bps', 'max_loss_bps', 'max_hold_s', 'max_spread_bps', 'max_vol_bps', 'edge_ratio'):
-            if getattr(self, name) <= 0:
-                raise ValueError(f'{name} must be positive')
-        if self.uncertainty_floor_bps < 0:
-            raise ValueError('uncertainty_floor_bps must not be negative')
-        for name in ('min_efficiency_trend', 'max_efficiency_range'):
-            if not 0 <= getattr(self, name) <= 1:
-                raise ValueError(f'{name} must be between 0 and 1')
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -448,6 +557,57 @@ def _dominant_code(codes) -> str | None:
     return CODE_PRIORITY[min(ranked)] if ranked else None
 
 
+def _sizing_amounts(sizing: dict) -> tuple[dict | None, str]:
+    """The amounts of an eligible sizing result, or ``(None, why they cannot be used)``.
+
+    The proposal's target and stop are scaled from ``budget_cap``, so the
+    contract's all-in invariant is checked here again rather than trusted:
+    ``max_debit = gross_quote + fee_reserve <= target_budget <= budget_cap <=
+    MICRO_MAX_ALL_IN_USDT``, every amount present and the cap above zero.
+    """
+    names = ('budget_cap', 'target_budget', 'gross_quote', 'fee_reserve', 'max_debit')
+    amounts = {name: _decimal(sizing.get(name)) for name in names}
+    missing = [name for name in names if amounts[name] is None]
+    if missing:
+        return None, f'{", ".join(missing)} missing or unreadable'
+    cap, target, debit = amounts['budget_cap'], amounts['target_budget'], amounts['max_debit']
+    gross, reserve = amounts['gross_quote'], amounts['fee_reserve']
+    if not money.ZERO < cap <= MICRO_MAX_ALL_IN_USDT:
+        return None, (f'budget cap {money.text(cap)} is outside the micro all-in cap '
+                      f'(0 to {money.text(MICRO_MAX_ALL_IN_USDT)} USDT)')
+    if gross <= 0 or reserve < 0 or money.add(gross, reserve) != debit:
+        return None, (f'max debit {money.text(debit)} is not gross {money.text(gross)} plus fee reserve '
+                      f'{money.text(reserve)}')
+    if not debit <= target <= cap:
+        return None, (f'max debit {money.text(debit)} <= target {money.text(target)} <= cap {money.text(cap)} '
+                      'does not hold')
+    return amounts, ''
+
+
+def _stop_room(check, stop_bps: float, atr_bps: float, *, budget_cap: Decimal, max_debit: Decimal, break_even,
+               best_bid) -> None:
+    """Record ``stop_beyond_entry_cost``: the stop must clear the loss carried at entry by one ATR.
+
+    The estimated net of selling ``sellable`` at exit bid ``X`` is linear in
+    ``X`` and zero at the break-even bid, so selling at the current best bid
+    the moment the position is bought nets ``-max_debit * (1 - best_bid /
+    break_even_bid)``: fees, latency and the spread of both legs. A stop
+    smaller than that fires on the first exit check with the book unchanged.
+    """
+    even, bid = _decimal(break_even), _decimal(best_bid)
+    if even is None or even <= 0 or bid is None or bid <= 0:
+        check('stop_beyond_entry_cost', False, ERROR, 'break-even bid unknown: the loss carried at entry cannot be '
+              'measured', break_even_bid=break_even)
+        return
+    carried = money.mul(max_debit, money.sub(money.ONE, money.div(bid, even))) if even > bid else money.ZERO
+    carried_bps = float(money.mul(money.div(carried, budget_cap), money.BPS))
+    room, need = stop_bps - carried_bps, STOP_MIN_ROOM_ATR * atr_bps
+    check('stop_beyond_entry_cost', room >= need, NO_ECONOMIC_EDGE,
+          f'stop {stop_bps:.1f} bps leaves {room:.1f} bps beyond the {carried_bps:.1f} bps lost at entry (needs '
+          f'{need:.1f} bps, {STOP_MIN_ROOM_ATR:g} ATR)', stop_net_bps=stop_bps, entry_cost_bps=carried_bps,
+          room_bps=room, min_room_bps=need, break_even_bid=even, best_bid=bid)
+
+
 def evaluate_entry(*, symbol, features, regime, regime_reasons, sizing: dict, book_summary: dict,
                    params: MicroParams, gates: dict, now: float, feature_reason: str | None = None) -> MicroDecision:
     """Entry decision for one symbol on its last completed bar.
@@ -455,8 +615,10 @@ def evaluate_entry(*, symbol, features, regime, regime_reasons, sizing: dict, bo
     Returns ``enter`` only when every gate, data, liquidity, sizing, regime,
     candidate and economic check passes. ``feature_reason`` (optional, an
     addition to the contract) is the second value of :func:`compute_features`:
-    when features are missing it tells a warmup (WARMUP) from unusable candles
-    (ERROR); without it a missing feature set is recorded as WARMUP. The
+    when features are missing it tells a warmup (WARMUP) from a stale 5m feed
+    (STALE_DATA) and unusable candles (ERROR); without it a missing feature set
+    is recorded as WARMUP. ``now`` is on the candle clock (the venue's time,
+    as the candle cut-off is): the decision bar must have closed by then. The
     manager's risk gate still has the final word at order time.
     """
     if not isinstance(params, MicroParams):
@@ -467,7 +629,7 @@ def evaluate_entry(*, symbol, features, regime, regime_reasons, sizing: dict, bo
     bad_features = features is not None and not isinstance(features, Features)
     inputs = {
         'feature_version': FEATURE_VERSION,
-        'features': features.as_dict() if isinstance(features, Features) else None,
+        'features': _plain(features.as_dict()) if isinstance(features, Features) else None,
         'feature_reason': _sentence(feature_reason) if feature_reason is not None else (
             'ERROR: features have an unexpected type' if bad_features else None),
         'regime': str(regime) if regime is not None else None,
@@ -477,7 +639,8 @@ def evaluate_entry(*, symbol, features, regime, regime_reasons, sizing: dict, bo
         if isinstance(book_summary, dict) else None,
         'sizing': {key: _plain(sizing[key]) for key in SIZING_KEYS if key in sizing}
         if isinstance(sizing, dict) else None,
-        'gates': {key: _plain(gates[key]) for key in GATE_KEYS if key in gates} if isinstance(gates, dict) else {},
+        'gates': {key: _gate_value(key, gates[key]) for key in GATE_KEYS if key in gates}
+        if isinstance(gates, dict) else {},
         'params': params.as_dict(),
     }
     # Everything below reads the JSON-safe inputs only, so a decision rebuilt
@@ -526,15 +689,30 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
 
     # ---- can the data be trusted
     feature_reason = inputs['feature_reason'] or ''
+    supplied = features is not None
     if features is None:
-        code = ERROR if feature_reason.startswith('ERROR') else WARMUP
-        check('features', False, code, feature_reason or 'features unavailable (warmup or unusable candles)')
+        check('features', False, _reason_code(feature_reason),
+              feature_reason or 'features unavailable (warmup or unusable candles)')
     elif features.symbol != symbol:
         check('features', False, ERROR, f'features were computed for {features.symbol}, not {symbol}')
         features = None
     else:
-        check('features', True, WARMUP, f'{features.bars_1m} 1m and {features.bars_5m} 5m completed bars',
-              bar_ts_ms=features.bar_ts_ms)
+        # The decision bar must be complete at ``now`` (no look-ahead into an
+        # open candle) and recent (a bar hours old is not this market).
+        closes_ms = features.bar_ts_ms + BAR_MS_1M
+        age_s = now - closes_ms / 1000
+        timing = dict(bar_ts_ms=features.bar_ts_ms, bar_close_ms=closes_ms, bar_age_s=age_s)
+        if age_s < 0:
+            check('features', False, ERROR, f'the decision bar closes {-age_s:.1f} s after now: an open candle is '
+                  'not a completed bar', **timing)
+            features = None
+        elif age_s > MAX_BAR_AGE_S:
+            check('features', False, STALE_DATA, f'the decision bar closed {age_s:.0f} s ago (at most '
+                  f'{MAX_BAR_AGE_S:g} s)', **timing)
+            features = None
+        else:
+            check('features', True, WARMUP, f'{features.bars_1m} 1m and {features.bars_5m} 5m completed bars; '
+                  f'the decision bar closed {age_s:.1f} s ago', **timing)
     bid, ask = _number(book.get('best_bid')), _number(book.get('best_ask'))
     quote_ok = bid is not None and ask is not None and 0 < bid < ask
     check('book', quote_ok, STALE_DATA, 'best bid below best ask' if quote_ok else 'no valid best bid and ask',
@@ -542,14 +720,23 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
           age_s=book.get('age_s'))
 
     # ---- can the pair be traded at this size
-    spread = _number(book.get('spread_bps'))
-    if spread is None or spread < 0:
-        check('spread', False, SPREAD, 'spread is unknown', value=spread)
+    # A reported spread narrower than the best bid and ask imply is not
+    # believed: the larger of the two is the spread every check below uses.
+    reported, quoted = _number(book.get('spread_bps')), None
+    if quote_ok:
+        bid_d, ask_d = _decimal(book.get('best_bid')), _decimal(book.get('best_ask'))
+        if bid_d is not None and ask_d is not None:
+            mid = money.div(money.add(bid_d, ask_d), Decimal(2))
+            quoted = float(money.mul(money.div(money.sub(ask_d, bid_d), mid), money.BPS))
+    if reported is None or reported < 0:
+        check('spread', False, SPREAD, 'spread is unknown', value=reported, from_quote=quoted)
         spread = None
     else:
+        spread = reported if quoted is None else max(reported, quoted)
         check('spread', spread <= params.max_spread_bps, SPREAD,
-              f'spread {spread:.2f} bps against the {params.max_spread_bps:g} bps limit', value=spread,
-              threshold=params.max_spread_bps)
+              f'spread {spread:.2f} bps against the {params.max_spread_bps:g} bps limit (reported {reported:.2f}'
+              + (f', from the best bid and ask {quoted:.2f})' if quoted is not None else ')'),
+              value=spread, reported=reported, from_quote=quoted, threshold=params.max_spread_bps)
 
     # ---- the market
     candidate = CANDIDATES.get(regime) if features is not None else None
@@ -557,8 +744,8 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
         check('regime', True, WEAK_TREND, f'regime {regime}')
     else:
         if regime == 'stale_uncertain':
-            stale = REASON_NOT_FRESH in regime_reasons or features is not None
-            code = STALE_DATA if stale else (ERROR if feature_reason.startswith('ERROR') else WARMUP)
+            stale = REASON_NOT_FRESH in regime_reasons or supplied
+            code = STALE_DATA if stale else _reason_code(feature_reason)
         elif regime == 'illiquid':
             code = INSUFFICIENT_DEPTH if REASON_DEPTH in regime_reasons else SPREAD
         elif regime == 'excessively_volatile':
@@ -571,20 +758,29 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
         check('regime', False, code, detail if regime in REGIMES else f'unknown regime {regime!r}')
 
     # ---- sizing (micro_economics.SizingResult.as_dict())
-    budget_cap = None
+    budget_cap = max_debit = None
+    own_sizing = False               # a sizing result for this symbol (another market's numbers are never used)
     if sizing is None:
         check('sizing', False, ERROR, 'no sizing result')
+    elif sizing.get('symbol') != symbol:
+        named = sizing.get('symbol')
+        check('sizing', False, ERROR, f'the sizing result is for {named}, not {symbol}' if named is not None
+              else 'the sizing result does not name its symbol', sizing_symbol=named)
     else:
+        own_sizing = True
         eligible, sizing_code = sizing.get('eligible') is True, sizing.get('code')
         detail = str(sizing.get('detail') or '')
         if eligible and sizing_code is None:
-            budget_cap = _decimal(sizing.get('budget_cap'))
-            sized = budget_cap is not None and budget_cap > 0
-            check('sizing', sized, ERROR, f'eligible: max debit {sizing.get("max_debit")} of a '
-                  f'{sizing.get("budget_cap")} cap' if sized else 'eligible sizing without a valid budget cap',
-                  max_debit=sizing.get('max_debit'), budget_cap=sizing.get('budget_cap'))
-            if not sized:
-                budget_cap = None
+            amounts, problem = _sizing_amounts(sizing)
+            values = {key: sizing.get(key) for key in ('max_debit', 'target_budget', 'budget_cap')}
+            if amounts is None:
+                check('sizing', False, ERROR, f'eligible sizing refused: {problem}', **values,
+                      micro_max=MICRO_MAX_ALL_IN_USDT)
+            else:
+                budget_cap, max_debit = amounts['budget_cap'], amounts['max_debit']
+                check('sizing', True, ERROR, f'eligible: max debit {money.text(max_debit)} of a '
+                      f'{money.text(amounts["target_budget"])} target and a {money.text(budget_cap)} cap', **values,
+                      micro_max=MICRO_MAX_ALL_IN_USDT)
         else:
             code = ERROR if eligible else SIZING_CODES.get(sizing_code, ERROR)
             check('sizing', False, code, detail or f'sizing refused ({sizing_code})', sizing_code=sizing_code)
@@ -624,7 +820,10 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
               f'stop {stop_bps:.1f} bps within the {params.max_loss_bps:g} bps loss cap' if stop_bps is not None else
               f'a 2 ATR stop ({2 * features.atr_bps:.1f} bps) exceeds the {params.max_loss_bps:g} bps loss cap')
         expected_range = features.atr_bps * math.sqrt(params.max_hold_s / 60)
-    if sizing is not None:
+        if stop_bps is not None and budget_cap is not None and quote_ok:
+            _stop_room(check, stop_bps, features.atr_bps, budget_cap=budget_cap, max_debit=max_debit,
+                       break_even=sizing.get('break_even_bid'), best_bid=book.get('best_bid'))
+    if own_sizing:
         required = _number(sizing.get('required_move_bps'))
         if required is not None and required <= 0:
             check('required_move', False, ERROR, f'required move {required:.2f} bps is not positive')
@@ -641,14 +840,24 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
               f'spread {spread:.2f} bps against {FEES_SPREAD_SHARE:g} x the {required:.1f} bps required move',
               value=spread, threshold=FEES_SPREAD_SHARE * required)
 
+    target_net = stop_net = None
+    if candidate is not None and budget_cap is not None and stop_bps is not None:
+        try:
+            target_net = money.q_up(money.mul(budget_cap, money.bps(money.parse(params.target_net_bps))),
+                                    AMOUNT_STEP)
+            stop_net = money.q_down(money.mul(budget_cap, money.bps(money.parse(stop_bps))), AMOUNT_STEP)
+            problem = None if target_net > 0 and stop_net > 0 else 'target or stop rounds to zero'
+        except money.MoneyError as exc:
+            problem = str(exc)
+        if problem is not None:      # recorded only when it fails: amounts are not a market condition
+            check('amounts', False, ERROR, f'target and stop amounts cannot be computed ({problem})')
+
     failed = [item for item in checks if not item['passed']]
     codes = tuple(item['code'] for item in failed)
     reasons = tuple(item['detail'] for item in failed)
     proposal = None
     if not failed and candidate is not None:
         action, code = 'enter', None
-        target_net = money.q_up(money.mul(budget_cap, money.bps(money.parse(params.target_net_bps))), AMOUNT_STEP)
-        stop_net = money.q_down(money.mul(budget_cap, money.bps(money.parse(stop_bps))), AMOUNT_STEP)
         proposal = {'opportunity_key': f'{symbol}|{candidate}|{features.bar_ts_ms}',
                     'target_net': money.text(target_net), 'stop_net': money.text(stop_net),
                     'stop_net_bps': stop_bps, 'max_hold_s': params.max_hold_s,
@@ -694,9 +903,11 @@ def evaluate_exit(*, estimate: dict | None, depth_model: str, target_net: Decima
     ``stop_loss``; held ``>= max_hold_s`` -> ``max_hold``; regime
     ``excessively_volatile`` or ``trending_down`` with ``est_net < 0`` ->
     ``regime_shift``; then, only when both ``depth_model`` and the estimate
-    say ``'book'`` and the walk was not exhausted: ``est_net - uncertainty >=
-    target_net`` -> ``take_profit``; ``peak >= 0.75 target``, ``0 < est_net -
-    uncertainty <= 0.25 target`` -> ``profit_protection``; else ``hold``.
+    say ``'book'`` and the estimate says the walk was not exhausted
+    (``depth_exhausted is False``; a missing flag is no evidence):
+    ``est_net - uncertainty >= target_net`` -> ``take_profit``; ``peak >= 0.75
+    target``, ``0 < est_net - uncertainty <= 0.25 target`` ->
+    ``profit_protection``; else ``hold``.
 
     Safer readings, all on the side of exiting or of not claiming a profit:
     ``est_net`` is the smaller of the estimate's ``est_net_pnl`` and
@@ -741,8 +952,8 @@ def evaluate_exit(*, estimate: dict | None, depth_model: str, target_net: Decima
         est_net = min(est_net, money.sub(net_proceeds, basis))
     uncertainty = _decimal(estimate.get('uncertainty'))
     uncertainty = uncertainty if uncertainty is not None and uncertainty >= 0 else None
-    book_based = (depth_model == 'book' and estimate.get('depth_model', depth_model) == 'book'
-                  and estimate.get('depth_exhausted') is not True)
+    book_based = (depth_model == 'book' and estimate.get('depth_model') == 'book'
+                  and estimate.get('depth_exhausted') is False)
     new_peak = peak
     if book_based and est_net is not None:
         new_peak = est_net if peak is None else max(peak, est_net)

@@ -9,6 +9,7 @@ import dataclasses
 import json
 import math
 import sys
+import types
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,11 +18,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import micro_strategy as ms
+import money
 import strategy
 
 D = Decimal
 START_MS = 1_761_436_800_000          # a 5-minute boundary
-NOW = START_MS / 1000 + 86_400.25
+NOW = START_MS / 1000 + 86_400.25     # used where no features fix the time (exits, missing features)
 PARAMS = ms.MicroParams(target_net_bps=20, max_loss_bps=80, max_hold_s=1800, uncertainty_floor_bps=5,
                         max_spread_bps=10, max_vol_bps=60, min_efficiency_trend=0.3, max_efficiency_range=0.25,
                         edge_ratio=0.5)
@@ -60,6 +62,16 @@ def frames(closes, **kwargs):
             strategy.frame_from_ohlcv(five_minute(rows), drop_open_candle=False))
 
 
+def closed_at(n):
+    """A quarter second after the n-th 1m bar of the fixtures (``rows[:n]``) closed."""
+    return START_MS / 1000 + n * 60 + 0.25
+
+
+def fresh(features):
+    """A quarter second after the features' decision bar closed: the time a live scan would decide."""
+    return (features.bar_ts_ms + ms.BAR_MS_1M) / 1000 + 0.25
+
+
 def path(steps_bps, start=100.0):
     return list(start * np.exp(np.cumsum(np.asarray(steps_bps, dtype=float) / 1e4)))
 
@@ -78,15 +90,48 @@ def ranging(seed=7, dip=(0.999, 0.998, 0.9975), bars=400):
 
 
 def sizing(required='15', **changes):
-    """The shape of micro_economics.SizingResult.as_dict() for an eligible 25 USDT cycle."""
+    """The shape of micro_economics.SizingResult.as_dict() for an eligible 25 USDT cycle.
+
+    A low-cost venue: the break-even bid is 5 bps above the best bid, so the
+    stop keeps room beyond the loss carried at entry. ``contract_sizing``
+    below derives every figure from the contract's formulas instead.
+    """
     record = dict(symbol='ETH/USDT', eligible=True, code=None, detail='eligible', checks=[{'check': 'budget'}],
                   budget_cap='25', target_budget='25', gross_quote='24.97', fee_reserve='0.03', max_debit='25.00',
                   expected_base='0.2496', expected_fee_base='0.0002496', sellable_base='0.2493',
-                  predicted_residual_base='0.0000504', entry_vwap='100.03', break_even_bid='100.24',
+                  predicted_residual_base='0.0000504', entry_vwap='100.03', break_even_bid='100.04',
                   target_bid='100.16', required_move_bps=required, minimum_feasible_budget='5.03',
                   minimum_feasible_detail='', cost={'taker_fee': '0.001'})
     record.update(changes)
     return record
+
+
+def contract_sizing(*, target_bps, budget=D('25'), bid=D('99.99'), ask=D('100.01'), fee=D('0.001'),
+                    latency_bps=D('3'), cost_step=D('0.01'), amount_step=D('0.0001'), tick=D('0.01')):
+    """An eligible sizing record computed with the contract's sizing formulas (quote-billed fees, deep book)."""
+    gross = money.q_down(money.div(budget, money.add(money.ONE, fee)), cost_step)
+    reserve = money.q_up(money.mul(gross, fee), cost_step)
+    while money.add(gross, reserve) > budget:
+        gross = money.sub(gross, cost_step)
+        reserve = money.q_up(money.mul(gross, fee), cost_step)
+    max_debit = money.add(gross, reserve)
+    latency = money.bps(latency_bps)
+    base = money.div(gross, money.mul(ask, money.add(money.ONE, latency)))
+    sellable = money.q_down(base, amount_step)
+    keep = money.mul(sellable, money.sub(money.ONE, latency), money.sub(money.ONE, fee))
+    target_net = money.mul(budget, money.bps(D(target_bps)))
+    break_even = money.q_up(money.div(max_debit, keep), tick)
+    target_bid = money.q_up(money.div(money.add(max_debit, target_net), keep), tick)
+    required = money.mul(money.sub(money.div(target_bid, ask), money.ONE), money.BPS)
+    record = sizing(required=money.text(required), budget_cap=money.text(budget), target_budget=money.text(budget),
+                    gross_quote=money.text(gross), fee_reserve=money.text(reserve), max_debit=money.text(max_debit),
+                    expected_base=money.text(base), expected_fee_base='0', sellable_base=money.text(sellable),
+                    predicted_residual_base=money.text(money.sub(base, sellable)),
+                    break_even_bid=money.text(break_even), target_bid=money.text(target_bid))
+    # What an exit estimate says the moment the position is bought, on the same book.
+    immediate = money.sub(money.mul(sellable, bid, money.sub(money.ONE, latency), money.sub(money.ONE, fee)),
+                          max_debit)
+    return record, immediate
 
 
 def features_of(closes, symbol='ETH/USDT'):
@@ -97,7 +142,9 @@ def features_of(closes, symbol='ETH/USDT'):
 
 
 def decide(features, *, symbol='ETH/USDT', regime=None, spread_bps=None, depth_ok=True, data_fresh=True,
-           params=PARAMS, gates=None, book=None, sizing_record=None, now=NOW, feature_reason=None):
+           params=PARAMS, gates=None, book=None, sizing_record=None, now=None, feature_reason=None):
+    if now is None:
+        now = fresh(features) if isinstance(features, ms.Features) else NOW
     book = dict(BOOK if book is None else book)
     if spread_bps is not None:
         book['spread_bps'] = spread_bps
@@ -146,12 +193,12 @@ def test_walk_forward_decisions_replay_exactly_from_truncated_history():
         seen_1m = strategy.frame_from_ohlcv(rows[:n], drop_open_candle=False)
         seen_5m = strategy.frame_from_ohlcv(five_minute(rows[:n]), drop_open_candle=False)
         features, reason = ms.compute_features('ETH/USDT', seen_1m, seen_5m)
-        live[n] = decide(features, now=NOW + n, feature_reason=reason)
+        live[n] = decide(features, now=closed_at(n), feature_reason=reason)
     for n, made in live.items():
         # Later: the full history exists. Truncating 1m to n rows and passing the
         # whole 5m frame (future 5m bars included) gives the same decision.
         features, reason = ms.compute_features('ETH/USDT', full_1m.iloc[:n], full_5m)
-        again = decide(features, now=NOW + n, feature_reason=reason)
+        again = decide(features, now=closed_at(n), feature_reason=reason)
         assert again == made and again.decision_id == made.decision_id
     assert len({d.decision_id for d in live.values()}) == len(live)
 
@@ -225,6 +272,41 @@ def test_short_or_unusable_frames_return_a_reason_instead_of_features():
     broken = f1.copy()
     broken.loc[broken.index[-1], 'close'] = float('nan')
     assert ms.compute_features('ETH/USDT', broken, f5) == (None, 'ERROR: the 1m candles hold non-finite values')
+
+
+def test_a_5m_feed_that_stopped_is_stale_not_a_higher_timeframe_trend():
+    f1, f5 = frames(uptrend())                      # 400 1m bars, 80 5m bars, both ending at the same close
+    assert ms.compute_features('ETH/USDT', f1, f5)[0].bars_5m == 80
+    # One 5m bar behind (the 5m frame refreshed a moment later than the 1m frame) is tolerated ...
+    assert ms.compute_features('ETH/USDT', f1, f5.iloc[:79])[0] is not None
+    # ... a feed that stopped earlier is not: its trend and slope are old news.
+    late = ms.compute_features('ETH/USDT', f1, f5.iloc[:78])
+    assert late[0] is None and late[1].startswith('STALE: the newest 5m bar closed 10 min')
+    features, reason = ms.compute_features('ETH/USDT', f1, f5.iloc[:60])
+    assert features is None and reason.startswith('STALE: the newest 5m bar closed 100 min')
+    decision = decide(None, feature_reason=reason)
+    assert_abstains(decision, ms.STALE_DATA)
+    assert [c['check'] for c in decision.checks if not c['passed']][0] == 'features'
+
+
+@pytest.mark.parametrize('field,value', [('vol_bps', float('nan')), ('drop_bps', float('nan')),
+                                         ('atr_bps', float('inf')), ('last_change_bps', float('nan')),
+                                         ('zscore', '1.0'), ('higher_trend_up', 1), ('bars_1m', 1.5),
+                                         ('down_bars', True), ('close', 0.0), ('atr_bps', -1.0), ('symbol', None),
+                                         ('bar_ts_ms', 0), ('efficiency', None)])
+def test_features_refuse_non_finite_or_mistyped_fields(momentum, field, value):
+    """A NaN fails every comparison: vol_bps NaN would pass the volatility gate and break the JSON record."""
+    with pytest.raises(ValueError):
+        dataclasses.replace(momentum, **{field: value})
+
+
+def test_valid_features_survive_construction_and_a_strict_json_record(momentum):
+    assert dataclasses.replace(momentum, last_change_bps=None).last_change_bps is None
+    assert dataclasses.replace(momentum, atr_bps=9).atr_bps == 9.0 and isinstance(
+        dataclasses.replace(momentum, atr_bps=9).atr_bps, float)
+    assert dataclasses.replace(momentum, down_bars=np.int64(2)).down_bars == 2
+    record = json.loads(json.dumps(decide(momentum).as_dict(), allow_nan=False))
+    assert ms.Features(**record['inputs']['features']) == momentum
 
 
 # ------------------------------------------------------------------- regime
@@ -325,9 +407,9 @@ def test_range_reversion_does_not_keep_buying_through_a_collapse(rate, noise, se
     entries, forced_entries = [], []
     for n in range(401, len(closes) + 1):
         features, _ = ms.compute_features('ETH/USDT', f1.iloc[:n], f5)
-        if decide(features, now=NOW + n).action == 'enter':
+        if decide(features, now=closed_at(n)).action == 'enter':
             entries.append(n - 400)
-        if decide(features, regime='ranging', now=NOW + n).action == 'enter':
+        if decide(features, regime='ranging', now=closed_at(n)).action == 'enter':
             forced_entries.append(n - 400)
     # The first few bars of a decline look like any dip; after more than four
     # lower closes or a four-ATR drop the guards hold on every remaining bar.
@@ -344,6 +426,86 @@ def test_the_reversion_guards_alone_refuse_a_falling_knife(ranging_features):
     assert_abstains(decide(sliding, regime='ranging'), ms.WEAK_TREND)
 
 
+@pytest.mark.parametrize('changes,problem', [
+    (dict(budget_cap='1000', target_budget='1000', gross_quote='998.00', fee_reserve='2.00', max_debit='1000.00'),
+     'outside the micro all-in cap'),
+    (dict(budget_cap='25.01', target_budget='25.01', gross_quote='24.98', fee_reserve='0.03', max_debit='25.01'),
+     'outside the micro all-in cap'),
+    (dict(budget_cap='0', target_budget='0'), 'outside the micro all-in cap'),
+    (dict(max_debit='400'), 'is not gross'),
+    (dict(fee_reserve='0.02'), 'is not gross'),
+    (dict(gross_quote='399.97', max_debit='400.00'), 'does not hold'),
+    (dict(target_budget='26'), 'does not hold'),
+    (dict(target_budget='24.99'), 'does not hold'),
+    (dict(max_debit=None, gross_quote=None), 'gross_quote, max_debit missing'),
+    (dict(target_budget='lots'), 'target_budget missing'),
+])
+def test_an_eligible_sizing_must_keep_the_all_in_invariant_under_the_micro_cap(momentum, changes, problem):
+    """The proposal's target and stop are scaled from the cap: a defective record must not enter."""
+    decision = decide(momentum, sizing_record=sizing(**changes))
+    assert_abstains(decision, ms.ERROR)
+    failed = [c for c in decision.checks if not c['passed']]
+    assert failed[0]['check'] == 'sizing' and problem in failed[0]['detail']
+    assert 'stop_beyond_entry_cost' not in [c['check'] for c in decision.checks]   # no cap, no scaled amounts
+
+
+def test_a_smaller_consistent_sizing_still_enters_and_scales_from_its_own_cap(momentum):
+    small = sizing(budget_cap='10', target_budget='10', gross_quote='9.98', fee_reserve='0.02', max_debit='10.00')
+    decision = decide(momentum, sizing_record=small)
+    assert decision.action == 'enter'
+    assert D(decision.proposal['target_net']) == D('0.02') and D(decision.proposal['stop_net']) == D('0.025')
+    assert decide(momentum).proposal['target_net'] == '0.050'      # the 25 USDT cap itself is allowed
+
+
+def test_a_sizing_result_for_another_symbol_is_never_used(momentum):
+    foreign = decide(momentum, sizing_record=sizing(symbol='BTC/USDT'))
+    assert_abstains(foreign, ms.ERROR)
+    assert [c['check'] for c in foreign.checks if not c['passed']] == ['sizing']
+    assert 'BTC/USDT' in foreign.reasons[0]
+    # Another market's required move never reaches the economic gate, and the record shows the mix-up.
+    assert not {'economic_edge', 'fees', 'stop_beyond_entry_cost'} & {c['check'] for c in foreign.checks}
+    assert foreign.inputs['sizing']['symbol'] == 'BTC/USDT'
+    unnamed = {key: value for key, value in sizing().items() if key != 'symbol'}
+    assert_abstains(decide(momentum, sizing_record=unnamed), ms.ERROR)
+    # An ineligible record for another pair does not lend its code either.
+    other_refusal = decide(momentum, sizing_record=sizing(symbol='BTC/USDT', eligible=False,
+                                                          code='BUDGET_BELOW_VENUE_MINIMUM'))
+    assert other_refusal.codes == (ms.ERROR,)
+    assert decide(momentum).inputs['sizing']['symbol'] == 'ETH/USDT'
+
+
+def test_the_stop_must_clear_the_loss_the_position_carries_at_entry(momentum):
+    """A stop inside the round-trip cost fires on the first exit check while the book is unchanged."""
+    params = dataclasses.replace(PARAMS, target_net_bps=5)
+    record, immediate = contract_sizing(target_bps=5)
+    assert D('33') < D(record['required_move_bps']) < D('34.2')
+    volatile = dataclasses.replace(momentum, atr_bps=12.5)          # 2 ATR = 25 bps: the floor
+    limit = params.edge_ratio * volatile.atr_bps * math.sqrt(params.max_hold_s / 60)
+    assert float(record['required_move_bps']) <= limit                # the contract's economic gate passes
+    stop_net = D('25') * D('25') / 10000
+    assert immediate <= -stop_net                                      # selling now already hits the stop
+    exit_now = exit_for(estimate(money.text(immediate), uncertainty='0.0125'), target=D('0.0125'), stop=stop_net)
+    assert (exit_now.action, exit_now.trigger) == ('exit', 'stop_loss')
+    decision = decide(volatile, params=params, sizing_record=record)
+    assert_abstains(decision, ms.NO_ECONOMIC_EDGE)
+    assert [c['check'] for c in decision.checks if not c['passed']] == ['stop_beyond_entry_cost']
+    room = next(c for c in decision.checks if c['check'] == 'stop_beyond_entry_cost')
+    assert room['stop_net_bps'] == 25.0 and 30 < room['entry_cost_bps'] < 31 and room['room_bps'] < 0
+    # The default 20 bps target: a 36 bps stop clears the 31 bps cost by 5 bps, far less than one 18 bps ATR.
+    record20, _ = contract_sizing(target_bps=20)
+    wider = dataclasses.replace(momentum, atr_bps=18.0)
+    assert float(record20['required_move_bps']) <= PARAMS.edge_ratio * 18.0 * math.sqrt(30)
+    assert_abstains(decide(wider, sizing_record=record20), ms.NO_ECONOMIC_EDGE)
+    # A market whose ATR leaves a full ATR beyond the cost may enter on the same sizing.
+    roomy = dataclasses.replace(momentum, atr_bps=31.5)
+    entered = decide(roomy, sizing_record=record20)
+    assert entered.action == 'enter' and entered.proposal['stop_net_bps'] == 63.0
+    # An eligible sizing that hides its break-even bid cannot show the stop clears the cost.
+    hidden = decide(momentum, sizing_record=sizing(break_even_bid=None))
+    assert_abstains(hidden, ms.ERROR)
+    assert [c['check'] for c in hidden.checks if not c['passed']] == ['stop_beyond_entry_cost']
+
+
 @pytest.mark.parametrize('seed', [1, 2, 3, 4, 5])
 def test_a_random_walk_abstains_on_the_vast_majority_of_bars(seed):
     """Brief test 13: no edge in the data, no forced trades. Zero entries is a valid outcome."""
@@ -354,7 +516,7 @@ def test_a_random_walk_abstains_on_the_vast_majority_of_bars(seed):
         decisions = []
         for n in range(310, len(closes) + 1):
             features, reason = ms.compute_features('ETH/USDT', f1.iloc[:n], f5)
-            decisions.append(decide(features, sizing_record=sizing(required=required), now=NOW + n,
+            decisions.append(decide(features, sizing_record=sizing(required=required), now=closed_at(n),
                                     feature_reason=reason))
         entered = sum(d.action == 'enter' for d in decisions)
         assert entered <= ceiling * len(decisions), (required, entered)
@@ -386,7 +548,7 @@ GATE_FAILURES = [
     ('cash', {'sizing': {'eligible': False, 'code': 'CASH_INSUFFICIENT'}}, ms.BUDGET_MINIMUM),
     ('allocation', {'sizing': {'eligible': False, 'code': 'ALLOCATION_EXHAUSTED'}}, ms.BUDGET_MINIMUM),
     ('volatile', {'params': {'max_vol_bps': 1.0}}, ms.VOLATILITY),
-    ('stop_beyond_cap', {'params': {'max_loss_bps': 10.0}}, ms.VOLATILITY),
+    ('stop_beyond_cap', {'params': {'max_loss_bps': 20.0}, 'feature_changes': {'atr_bps': 11.0}}, ms.VOLATILITY),
     ('down_trend', {'regime': 'trending_down'}, ms.WEAK_TREND),
     ('no_edge_regime', {'regime': 'no_reliable_edge'}, ms.WEAK_TREND),
     ('fees', {'spread_bps': '5.5'}, ms.FEES),
@@ -397,6 +559,12 @@ GATE_FAILURES = [
     ('negative_move', {'sizing': {'required_move_bps': '-3'}}, ms.ERROR),
     ('unknown_regime', {'regime': 'sideways'}, ms.ERROR),
     ('wrong_symbol', {'symbol': 'BTC/USDT'}, ms.ERROR),
+    ('foreign_sizing', {'sizing': {'symbol': 'BTC/USDT'}}, ms.ERROR),
+    ('sizing_above_cap', {'sizing': {'budget_cap': '1000', 'target_budget': '1000', 'gross_quote': '998.00',
+                                     'fee_reserve': '2.00', 'max_debit': '1000.00'}}, ms.ERROR),
+    ('crossed_quote_spread', {'book': {**BOOK, 'best_bid': '90'}}, ms.SPREAD),
+    ('open_candle', {'now_offset': -45}, ms.ERROR),
+    ('old_bar', {'now_offset': 6 * 3600}, ms.STALE_DATA),
     ('bad_candles', {'features': None, 'feature_reason': 'ERROR: the 1m candles lack volume'}, ms.ERROR),
 ]
 
@@ -410,6 +578,10 @@ def scenario(features, change: dict):
         kwargs['params'] = dataclasses.replace(PARAMS, **change.pop('params'))
     if 'features' in change:
         features = change.pop('features')
+    if 'feature_changes' in change:
+        features = dataclasses.replace(features, **change.pop('feature_changes'))
+    if 'now_offset' in change:          # seconds from the decision bar's close
+        kwargs['now'] = (features.bar_ts_ms + ms.BAR_MS_1M) / 1000 + change.pop('now_offset')
     kwargs.update(change)
     return decide(features, **kwargs)
 
@@ -430,34 +602,71 @@ def test_a_gate_that_was_not_supplied_is_unknown_and_fails(momentum, key):
     assert_abstains(decision, expected)
 
 
+@pytest.mark.parametrize('value', [float('nan'), D('NaN'), float('inf'), 0, 1.5, D('0'), np.float64('nan')],
+                         ids=['nan', 'decimal_nan', 'inf', 'zero', 'number', 'decimal_zero', 'numpy_nan'])
+@pytest.mark.parametrize('key,code', [('review_block', ms.REVIEW), ('risk_block', ms.RISK), ('latched', ms.RISK)])
+def test_an_unreadable_block_value_blocks_and_still_blocks_after_a_json_round_trip(momentum, key, code, value):
+    decision = decide(momentum, gates={**GATES, key: value})
+    assert_abstains(decision, code)
+    stored = decision.inputs['gates'][key]
+    assert isinstance(stored, str) and stored.startswith('unreadable')
+    replayed = decide(momentum, gates=json.loads(json.dumps(decision.inputs['gates'])))
+    assert replayed == decision
+    # Only None, False or a reason string are block states; a numpy False is still False.
+    assert decide(momentum, gates={**GATES, key: np.bool_(False)}).action == 'enter'
+
+
+EXPECTED_MOMENTUM_CHECKS = ['review', 'risk', 'latch', 'selected', 'capacity', 'cooldown', 'fresh_after_exit',
+                            'features', 'book', 'spread', 'regime', 'sizing', 'above_slow_ema', 'pullback',
+                            'last_bar_up', 'no_collapse', 'stop_within_loss_cap', 'stop_beyond_entry_cost',
+                            'economic_edge', 'fees']
+EXPECTED_RANGE_CHECKS = ['review', 'risk', 'latch', 'selected', 'capacity', 'cooldown', 'fresh_after_exit',
+                         'features', 'book', 'spread', 'regime', 'sizing', 'oversold', 'down_bars', 'no_collapse',
+                         'higher_slope', 'stop_within_loss_cap', 'stop_beyond_entry_cost', 'economic_edge', 'fees']
+
+
+def test_every_check_is_recorded_in_contract_order(momentum, ranging_features):
+    assert [c['check'] for c in decide(momentum).checks] == EXPECTED_MOMENTUM_CHECKS
+    assert [c['check'] for c in decide(ranging_features).checks] == EXPECTED_RANGE_CHECKS
+
+
 def test_all_failed_checks_are_listed_in_order_and_the_dominant_code_follows_the_priority(momentum):
-    layers = [  # (code, change), highest priority first
-        (ms.REVIEW, {'gates': {'review_block': True}}),
-        (ms.RISK, {'gates': {'risk_block': 'drawdown'}}),
-        (ms.NOT_SELECTED, {'gates': {'selected': False}}),
-        (ms.CAPACITY, {'gates': {'capacity': False}}),
-        (ms.COOLDOWN, {'gates': {'cooldown_remaining_s': 12.5}}),
-        (ms.STALE_DATA, {'data_fresh': False}),
-        (ms.SPREAD, {'spread_bps': '12'}),
-        (ms.BUDGET_MINIMUM, {'sizing': {'eligible': False, 'code': 'BUDGET_BELOW_VENUE_MINIMUM'}}),
-        (ms.VOLATILITY, {'params': {'max_loss_bps': 10.0}}),
-        (ms.NO_ECONOMIC_EDGE, {'sizing': {'required_move_bps': '200'}}),
+    layers = [  # (code, change, the checks this layer fails), highest priority first
+        (ms.REVIEW, {'gates': {'review_block': True}}, ['review']),
+        (ms.RISK, {'gates': {'risk_block': 'drawdown'}}, ['risk']),
+        (ms.NOT_SELECTED, {'gates': {'selected': False}}, ['selected']),
+        (ms.CAPACITY, {'gates': {'capacity': False}}, ['capacity']),
+        (ms.COOLDOWN, {'gates': {'cooldown_remaining_s': 12.5}}, ['cooldown']),
+        (ms.STALE_DATA, {'data_fresh': False}, ['regime']),
+        (ms.SPREAD, {'spread_bps': '12'}, ['spread', 'regime']),
+        (ms.BUDGET_MINIMUM, {'sizing': {'eligible': False, 'code': 'BUDGET_BELOW_VENUE_MINIMUM'}}, ['sizing']),
+        (ms.VOLATILITY, {'params': {'max_loss_bps': 20.0}, 'feature_changes': {'atr_bps': 11.0}},
+         ['stop_within_loss_cap']),
+        (ms.NO_ECONOMIC_EDGE, {'sizing': {'required_move_bps': '200'}}, ['economic_edge']),
     ]
+    always = ['review', 'risk', 'latch', 'selected', 'capacity', 'cooldown', 'fresh_after_exit', 'features', 'book',
+              'spread', 'regime', 'sizing', 'stop_within_loss_cap', 'economic_edge', 'fees']
     for start in range(len(layers) + 1):
         active = layers[start:]
         change: dict = {}
-        for _, layer in reversed(active):       # higher-priority layers win where they touch the same input
+        for _, layer, _ in reversed(active):    # higher-priority layers win where they touch the same input
             for key, value in layer.items():
                 change[key] = {**change.get(key, {}), **value} if isinstance(value, dict) else value
         decision = scenario(momentum, change)
-        if not active:
-            assert decision.action == 'enter'
-            continue
-        assert_abstains(decision, active[0][0])
-        assert {code for code, _ in active} <= set(decision.codes)
         order = [check['check'] for check in decision.checks]
         failed = [check['check'] for check in decision.checks if not check['passed']]
-        assert failed == [name for name in order if name in failed]   # evaluation order, nothing dropped
+        # Recorded checks follow the contract order (an explicit list, not one built from
+        # this decision), the core checks are always recorded, and exactly the active
+        # layers' checks fail, in that order.
+        assert order == [name for name in EXPECTED_MOMENTUM_CHECKS if name in order]
+        assert set(always) <= set(order)
+        own = {name for _, _, names in active for name in names}
+        assert failed == [name for name in EXPECTED_MOMENTUM_CHECKS if name in own]
+        if not active:
+            assert decision.action == 'enter' and order == EXPECTED_MOMENTUM_CHECKS
+            continue
+        assert_abstains(decision, active[0][0])
+        assert {code for code, _, _ in active} <= set(decision.codes)
     assert list(ms.CODE_PRIORITY) == ['REVIEW', 'RISK', 'NOT_SELECTED', 'CAPACITY', 'COOLDOWN', 'STALE_DATA',
                                       'WARMUP', 'SPREAD', 'INSUFFICIENT_DEPTH', 'BUDGET_MINIMUM', 'VOLATILITY',
                                       'WEAK_TREND', 'FEES', 'NO_ECONOMIC_EDGE', 'ERROR']
@@ -476,6 +685,22 @@ def test_warmup_abstains_even_when_everything_else_passes():
     assert both.code == ms.STALE_DATA and ms.WARMUP in both.codes
 
 
+def test_the_decision_bar_must_have_closed_by_now_and_be_recent(momentum):
+    closes = (momentum.bar_ts_ms + ms.BAR_MS_1M) / 1000
+    for early in (45, 0.001):                    # an open candle is not a completed bar: no look-ahead
+        decision = decide(momentum, now=closes - early)
+        assert_abstains(decision, ms.ERROR)
+        assert decision.reasons[0].startswith('the decision bar closes') and decision.candidate is None
+    assert decide(momentum, now=closes).action == 'enter'
+    assert decide(momentum, now=closes + ms.MAX_BAR_AGE_S).action == 'enter'
+    for late in (ms.MAX_BAR_AGE_S + 1, 6 * 3600):
+        decision = decide(momentum, now=closes + late)
+        assert_abstains(decision, ms.STALE_DATA)
+        assert [c['check'] for c in decision.checks if not c['passed']] == ['features']
+    timing = next(c for c in decide(momentum).checks if c['check'] == 'features')
+    assert timing['bar_close_ms'] == momentum.bar_ts_ms + 60_000 and timing['bar_age_s'] == pytest.approx(0.25)
+
+
 # ---------------------------------------------------------------- replay
 def test_decision_ids_replay_from_the_record_and_change_with_any_input(momentum):
     first = decide(momentum)
@@ -491,8 +716,8 @@ def test_decision_ids_replay_from_the_record_and_change_with_any_input(momentum)
     assert replayed == first
     # The sizing record's bulky parts (checks, cost model) are not part of the replay inputs.
     assert 'checks' not in inputs['sizing'] and 'cost' not in inputs['sizing']
-    assert decide(momentum, now=NOW + 0.001).decision_id != first.decision_id
-    assert decide(momentum, now=NOW + 0.0001).decision_id == first.decision_id   # rounded to the millisecond
+    assert decide(momentum, now=fresh(momentum) + 0.001).decision_id != first.decision_id
+    assert decide(momentum, now=fresh(momentum) + 0.0001).decision_id == first.decision_id   # rounded to the ms
     assert decide(momentum, gates={**GATES, 'capacity': 2}).decision_id != first.decision_id
     assert decide(momentum, book={**BOOK, 'generation': 8}).decision_id != first.decision_id
     assert decide(dataclasses.replace(momentum, bar_ts_ms=momentum.bar_ts_ms + 60_000)).decision_id != \
@@ -516,14 +741,54 @@ def test_entry_inputs_are_json_safe_whatever_the_caller_passes(momentum):
         ms.classify_regime(momentum, spread_bps=2, depth_ok=True, data_fresh=True, params={'edge_ratio': 0.5})
 
 
+def test_huge_numbers_never_expand_into_the_record(momentum):
+    for generation in (D('1E+10000000'), D('1E+999999999'), 10 ** 5000):
+        decision = decide(momentum, book={**BOOK, 'generation': generation})
+        assert decision.inputs['book']['generation'] is None
+        assert len(json.dumps(decision.as_dict(), allow_nan=False)) < 20_000
+    # An unreadable best bid is unknown, so the book check fails rather than storing a giant string.
+    assert_abstains(decide(momentum, book={**BOOK, 'best_bid': D('1E+10000000')}), ms.STALE_DATA)
+    assert decide(momentum, book={**BOOK, 'generation': 2 ** 40}).inputs['book']['generation'] == 2 ** 40
+
+
+def test_the_spread_is_never_narrower_than_the_best_bid_and_ask_imply(momentum):
+    wide = decide(momentum, book={**BOOK, 'best_bid': '90', 'best_ask': '100.01', 'spread_bps': '2'})
+    assert_abstains(wide, ms.SPREAD)
+    spread = next(c for c in wide.checks if c['check'] == 'spread')
+    assert spread['reported'] == 2.0 and spread['from_quote'] == pytest.approx(1053.6, abs=0.1)
+    assert spread['value'] == spread['from_quote']
+    # The best bid and ask imply 2 bps here; a wider reported spread is kept (it is the safer figure).
+    assert next(c for c in decide(momentum, spread_bps='6').checks if c['check'] == 'spread')['value'] == 6.0
+    assert decide(momentum).action == 'enter'
+
+
 # ---------------------------------------------------------- params, stops
 @pytest.mark.parametrize('field,value', [('edge_ratio', float('nan')), ('max_spread_bps', float('inf')),
                                          ('max_vol_bps', True), ('max_hold_s', 0), ('target_net_bps', -1),
                                          ('max_efficiency_range', 1.5), ('uncertainty_floor_bps', -0.1),
-                                         ('max_loss_bps', None), ('min_efficiency_trend', '0.3')])
+                                         ('max_loss_bps', None), ('min_efficiency_trend', '0.3'),
+                                         ('target_net_bps', 1e16), ('target_net_bps', 1e-31),
+                                         ('target_net_bps', 4.9), ('target_net_bps', 200.1),
+                                         ('max_spread_bps', 1e300), ('edge_ratio', 1e300), ('edge_ratio', 1.01),
+                                         ('max_vol_bps', 1e300), ('max_loss_bps', 10.0), ('max_loss_bps', 401),
+                                         ('max_hold_s', 60), ('max_hold_s', 1e9),
+                                         ('uncertainty_floor_bps', 1e300)])
 def test_params_refuse_values_that_would_silently_pass_a_gate(field, value):
     with pytest.raises(ValueError):
         dataclasses.replace(PARAMS, **{field: value})
+
+
+def test_params_accept_the_settings_bounds_and_amount_errors_abstain(momentum):
+    for field, values in (('target_net_bps', (5, 200)), ('max_loss_bps', (20, 400)), ('max_hold_s', (120, 14_400)),
+                          ('edge_ratio', (0.01, 1.0)), ('uncertainty_floor_bps', (0, 100))):
+        for value in values:
+            assert getattr(dataclasses.replace(PARAMS, **{field: value}), field) == value
+    # Should an amount still fall outside money's range, the decision is an ERROR abstain, not an exception.
+    broken = dataclasses.replace(PARAMS)
+    object.__setattr__(broken, 'target_net_bps', 1e16)
+    decision = decide(momentum, params=broken)
+    assert_abstains(decision, ms.ERROR)
+    assert [c['check'] for c in decision.checks if not c['passed']] == ['amounts']
 
 
 def test_stop_is_twice_atr_floored_at_25_and_never_beyond_the_loss_cap(momentum):
@@ -533,7 +798,10 @@ def test_stop_is_twice_atr_floored_at_25_and_never_beyond_the_loss_cap(momentum)
     assert stop(5.0) == 25.0 and stop(20.0) == 40.0 and stop(40.0) == 80.0
     assert stop(40.01) is None                     # a 2 ATR stop the cap cannot hold: too volatile
     assert stop(8.0, cap=20.0) == 20.0             # a cap below the floor wins
-    assert stop(float('nan')) is None
+    # Features refuse a NaN ATR; anything else carrying one gets no stop.
+    with pytest.raises(ValueError):
+        dataclasses.replace(momentum, atr_bps=float('nan'))
+    assert ms.stop_net_bps(types.SimpleNamespace(atr_bps=float('nan')), PARAMS) is None
 
 
 # --------------------------------------------------------------------- exit
@@ -586,6 +854,17 @@ def test_profit_exits_need_a_book_depth_estimate():
     assert exit_for(estimate('0.08', depth_model='flat_fallback')).action == 'hold'
     assert exit_for(rich, depth_model='flat_fallback').action == 'hold'          # the two must agree
     assert exit_for(estimate('0.08', exhausted=True)).action == 'hold'
+    # Missing depth evidence is not depth evidence: the estimate itself must say 'book' and not exhausted.
+    unproven = [{k: v for k, v in rich.items() if k != 'depth_exhausted'},
+                {k: v for k, v in rich.items() if k != 'depth_model'},
+                dict(rich, depth_exhausted=None), dict(rich, depth_exhausted='true'), dict(rich, depth_exhausted=0),
+                dict(rich, depth_model=None)]
+    for est in unproven:
+        decision = exit_for(est, depth_model='book')
+        assert decision.action == 'hold' and not decision.needs_depth, est
+    # Safety exits still fire on such an estimate.
+    assert exit_for(dict(unproven[0], est_net_pnl='-0.20', net_proceeds='24.80'), depth_model='book').trigger == \
+        'stop_loss'
     # Safety exits come first in the documented order even when a profit is available.
     assert exit_for(rich, now=OPENED + 1800).trigger == 'max_hold'
 

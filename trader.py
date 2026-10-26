@@ -744,8 +744,9 @@ class TradingEngine:
         self._next_monitor = time.monotonic() + interval
         # A micro cycle owns its position and its exits; the stored stop and
         # target of that row are display values the legacy monitor never acts on.
-        micro_owned = self.micro.owned_symbols() if self.mode == 'paper' else set()
-        positions = [p for p in self._active_positions(self.mode) if p['symbol'] not in micro_owned]
+        positions = self._active_positions(self.mode)
+        micro_owned = self.micro.owned_symbols() if positions and self.mode == 'paper' else set()
+        positions = [p for p in positions if p['symbol'] not in micro_owned]
         exited, failures, observed = set(), 0, 0
         with self.lock:
             self.last_monitor, self.monitor_error = now(), None

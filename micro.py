@@ -272,15 +272,16 @@ class MicroManager:
         cycle table cannot be read, every paper position counts as micro-owned."""
         exchange = self.engine.exchange_name
         try:
-            owned = self.open_symbols()
-            rows = storage.rows("SELECT DISTINCT c.symbol FROM micro_cycles c JOIN positions p ON p.exchange=c.exchange "
-                                "AND p.mode=c.mode AND p.symbol=c.symbol WHERE c.exchange=? AND c.mode='paper' "
-                                "AND c.state='CLOSED' AND c.residual_base IS NOT NULL AND c.residual_base NOT IN ('0', '')",
-                                (exchange,))
+            # One statement on one connection: the legacy monitor calls this on every protective tick.
+            rows = storage.rows("SELECT DISTINCT c.symbol FROM micro_cycles c WHERE c.exchange=? AND c.mode='paper' "
+                                "AND (c.state NOT IN ('CLOSED','ABANDONED') OR (c.state='CLOSED' "
+                                "AND c.residual_base IS NOT NULL AND c.residual_base NOT IN ('0', '') "
+                                "AND EXISTS (SELECT 1 FROM positions p WHERE p.exchange=c.exchange AND p.mode=c.mode "
+                                "AND p.symbol=c.symbol)))", (exchange,))
         except Exception:
             return {row['symbol'] for row in storage.rows("SELECT symbol FROM positions WHERE exchange=? AND mode='paper'",
                                                           (exchange,))}
-        return owned | {row['symbol'] for row in rows}
+        return {row['symbol'] for row in rows}
 
     def rules(self, symbol: str) -> venue_rules.VenueRules:
         cached = self.rules_cache.get(symbol)

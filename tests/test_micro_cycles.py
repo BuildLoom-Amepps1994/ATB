@@ -1306,3 +1306,32 @@ def test_recovery_explanations_follow_the_selected_exchange(world):
                                 'explanation': 'an explanation for MEXC', 'action': 'apply_recovery'}]
     w.engine.update_config(micro_settings(exchange='kraken'))
     assert w.engine.micro.status()['recovery'] == []
+
+
+def test_owned_symbols_are_open_cycles_and_closed_residuals_still_in_the_ledger_and_fail_closed(world, monkeypatch):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    assert w.engine.micro.owned_symbols() == {'ETH/USDT'}                 # an open cycle owns its pair
+    with storage.connection() as db:
+        db.execute("UPDATE micro_cycles SET state='CLOSED', residual_base='0.000001' WHERE cycle_id=?",
+                   (held['cycle_id'],))
+    assert w.engine.micro.owned_symbols() == {'ETH/USDT'}                 # a closed remainder still in the ledger
+    with storage.connection() as db:
+        db.execute("UPDATE micro_cycles SET residual_base='0' WHERE cycle_id=?", (held['cycle_id'],))
+    assert w.engine.micro.owned_symbols() == set()                        # nothing left: the legacy monitor's again
+    with storage.connection() as db:
+        db.execute("UPDATE micro_cycles SET residual_base='0.000001' WHERE cycle_id=?", (held['cycle_id'],))
+        db.execute("DELETE FROM positions WHERE symbol='ETH/USDT'")
+    assert w.engine.micro.owned_symbols() == set()                        # no ledger row: nothing to own
+    real_rows = storage.rows
+
+    def broken(sql, args=()):
+        if 'micro_cycles' in sql:
+            raise sqlite3.OperationalError('no such table: micro_cycles')
+        return real_rows(sql, args)
+    monkeypatch.setattr(storage, 'rows', broken)
+    with storage.connection() as db:
+        db.execute("INSERT INTO positions(exchange, mode, symbol, qty, entry_price, cost, highest, stop, target, "
+                   "opened_at) VALUES (?, 'paper', 'SOL/USDT', 1, 1, 1, 1, 0.9, 1.1, '2026-10-26T00:00:00+00:00')",
+                   (w.engine.exchange_name,))
+    assert w.engine.micro.owned_symbols() == {'SOL/USDT'}                 # unreadable cycles: every paper position

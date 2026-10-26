@@ -148,17 +148,24 @@ def test_interrupted_update_restores_previous_source(installation,phase):
     assert not (root/update.JOURNAL).exists()
 
 
-def interrupted_setup(root, source, phase):
+# Modules shipped by earlier releases that Setup upgrades in place (same AppId and folder).
+RELEASE_1_3_0 = ('app.py', 'credentials.py', 'launcher.py', 'market_data.py',
+                 'recovery.py', 'storage.py', 'strategy.py', 'trader.py')
+RELEASE_1_4_0 = (*RELEASE_1_3_0, 'updater.py')
+
+
+def interrupted_setup(root, source, phase, previous_modules=RELEASE_1_4_0):
     """Lay out an install as Setup leaves it when it stops partway through its source swap.
 
-    The previous record comes from a release with fewer modules, like the 1.4.0 installs.
+    The previous record comes from an earlier release with fewer modules.
     """
     token = 'setup-20261026010000'
     backup, staging = root/'backups'/token, root/('.' + token)
     backup.mkdir(parents=True)
     previous = json.loads((root/'installation.json').read_text())
     previous['installed_version'] = '1.4.0'
-    previous['app_files'] = {k: v for k, v in previous['app_files'].items() if k not in ('risk.py', 'orders.py')}
+    previous['app_files'] = {k: v for k, v in previous['app_files'].items()
+                             if not k.endswith('.py') or k in previous_modules}
     (root/'installation.json').write_text(json.dumps(previous))
     shutil.copy2(root/'installation.json', backup/'installation.json')
     (staging/'app').parent.mkdir()
@@ -179,11 +186,12 @@ def interrupted_setup(root, source, phase):
     return backup, staging
 
 
+@pytest.mark.parametrize('previous_modules', [RELEASE_1_3_0, RELEASE_1_4_0])
 @pytest.mark.parametrize('phase', ['before_old_move', 'after_old_move', 'after_new_move', 'after_record_move'])
-def test_interrupted_setup_finishes_with_the_new_source(installation, phase):
+def test_interrupted_setup_finishes_with_the_new_source(installation, phase, previous_modules):
     # Setup replaced the runtime before the swap, so only the new source matches it.
     root, source, _ = installation
-    backup, staging = interrupted_setup(root, source, phase)
+    backup, staging = interrupted_setup(root, source, phase, previous_modules)
     with update.InstallationLock(root):
         assert update.recover_if_needed(root)
     assert (root/'app/app.py').read_text() == 'VALUE = 2\n'
@@ -192,6 +200,18 @@ def test_interrupted_setup_finishes_with_the_new_source(installation, phase):
     assert not (root/update.JOURNAL).exists() and not staging.exists()
     with update.InstallationLock(root):
         assert not update.recover_if_needed(root)
+
+
+def test_interrupted_setup_whose_record_was_already_activated_finishes(installation):
+    # An older Setup moved the new record into place, then failed and moved the source back to staging.
+    root, source, _ = installation
+    backup, staging = interrupted_setup(root, source, 'before_old_move')
+    os.replace(staging/'installation.json', root/'installation.json')
+    with update.InstallationLock(root):
+        assert update.recover_if_needed(root)
+    assert (root/'app/app.py').read_text() == 'VALUE = 2\n'
+    assert update.read_manifest(root)['installed_version'] == '1.5.31'
+    assert (backup/'app/app.py').read_text() == 'VALUE = 1\n' and not (root/update.JOURNAL).exists()
 
 
 def test_interrupted_setup_with_a_damaged_new_record_changes_nothing(installation):

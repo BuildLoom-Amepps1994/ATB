@@ -140,19 +140,28 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          # Any GitHub error stops the job: guessing "no release" could publish over a newer one.
+          releases=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+          matches=$(jq -r --arg tag "v$VERSION" '.[] | select(.tag_name == $tag) | "\(.id) \(.draft)"' <<<"$releases")
           # A re-run of the same commit has the same version; never replace a published release.
-          draft=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || true)
-          if [ "$draft" = "false" ]; then
+          if grep -q ' false$' <<<"$matches"; then
             echo "Release v$VERSION already exists."
             exit 0
           fi
-          if [ "$draft" = "true" ]; then
-            # An interrupted upload leaves a draft; installed copies never see drafts, so start again.
-            echo "Removing the unfinished draft of v$VERSION."
-            gh release delete "v$VERSION" --repo "$GITHUB_REPOSITORY" --yes
-          fi
+          # An interrupted upload leaves a draft; installed copies never see drafts, so start again.
+          for id in $(awk '$2 == "true" { print $1 }' <<<"$matches"); do
+            echo "Removing an unfinished draft of v$VERSION."
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" > /dev/null
+          done
           # Re-running an older main build must not replace a newer Latest release.
-          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)
+          if latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" 2> latest.err); then
+            latest=$(jq -r .tag_name <<<"$latest")
+          elif grep -q 'HTTP 404' latest.err; then
+            latest=''
+          else
+            cat latest.err >&2
+            exit 1
+          fi
           if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "${latest#v}" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
             echo "$latest is newer than v$VERSION and already includes this commit; nothing to publish."
             exit 0

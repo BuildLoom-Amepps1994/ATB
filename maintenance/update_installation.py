@@ -270,8 +270,9 @@ def _finish_setup_activation(root: Path, marker: Path, backup: Path, staging: Pa
         _plain_path(path)
     try:
         if staged_app.is_dir():
-            # Check the new record before anything moves.
-            _validate_manifest(_load_json(staged_record))
+            # Check the new record before anything moves. Once Setup has activated the
+            # record, only the source is left in staging and the record is already in place.
+            _validate_manifest(_load_json(staged_record if staged_record.exists() else root / 'installation.json'))
             if application.exists():
                 kept = backup / 'app'
                 if kept.exists():

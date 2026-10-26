@@ -181,18 +181,27 @@ def main():
         prove('kept-after-failed-update-C')
     finally:
         stop(child)
-    # A Setup that stopped mid-swap (power cut) left a journal and no app\ folder. The next Setup
-    # recovers it itself instead of asking for an app start that cannot work.
+    # A Setup stopped mid-swap (power cut) after moving app\ to its backup. As in a real stop, its new
+    # runtime is in place, its previous runtime waits in the backup and the new source is still staged.
+    # The next Setup finishes that swap itself, with the source that matches the runtime in place.
     token = 'setup-20990101000000'
-    interrupted = installation/'backups'/token
-    interrupted.mkdir()
+    interrupted, staged = installation/'backups'/token, installation/('.'+token)
+    for name in ('runtime','maintenance'):
+        (interrupted/name).mkdir(parents=True)
+        (interrupted/name/'previous.marker').write_text('previous')
     shutil.copy2(installation/'installation.json',interrupted/'installation.json')
+    shutil.copytree(installation/'app',staged/'app')
+    shutil.copy2(installation/'installation.json',staged/'installation.json')
+    add_marker(staged/'app','staged-new-E')
     os.replace(installation/'app',interrupted/'app')
     journal = {'format':1,'product':'CryptoPilot','backup':'backups/'+token,'staging':'.'+token}
     (installation/'update-transaction.json').write_text(json.dumps(journal,separators=(',',':')))
     install()
     assert not (installation/'update-transaction.json').exists()
-    assert any('kept-after-failed-update-C' in p.read_text() for p in (installation/'backups').glob('setup-*/app/app.py'))
+    assert not (interrupted/'runtime').exists() and not (interrupted/'maintenance').exists()
+    assert 'kept-after-failed-update-C' in (interrupted/'app/app.py').read_text()
+    assert any('staged-new-E' in p.read_text() for p in (installation/'backups').glob('setup-*/app/app.py')
+               if p.parent.parent!=interrupted), 'Setup rolled the interrupted swap back instead of forward'
     assert_data()
     # The same stop with the new runtime already in place: starting the app finishes the swap.
     token = 'setup-20990101000001'
@@ -241,8 +250,8 @@ def main():
                        'backup contains prior edits','Setup upgrade preserves prior source backup',
                        'Setup installs a fresh runtime and drops the old one once active',
                        'blocked source swap keeps the previous runtime and source (exit 9)',
-                       'Setup recovers a swap interrupted before the runtime changed',
-                       'app start finishes a swap interrupted after the runtime changed',
+                       'Setup finishes a swap interrupted after the runtime changed',
+                       'app start also finishes such a swap',
                        'portfolio/settings survive update and upgrade',
                        'Setup started by the in-app updater waits for the app to exit','uninstall preserves source/backups/data'],
               'live_orders':0,'exchange_requests':0,'credential_backend':'disabled'}

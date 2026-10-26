@@ -236,62 +236,71 @@ state['calls'].append(args)
 releases = state['releases']
 def save():
     json.dump(state, open(state_path, 'w'))
-if args[:2] == ['release', 'view']:
-    tag = args[2] if not args[2].startswith('--') else None
-    if tag is None:
-        published = [r for r in releases if not r['draft']]
-        save()
-        if not published:
-            sys.exit(1)
-        print(published[-1]['tag'])
-        sys.exit(0)
-    found = [r for r in releases if r['tag'] == tag]
+def fail(code, text):
     save()
-    if not found:
-        sys.exit(1)
-    print('true' if found[0]['draft'] else 'false')
-elif args[:2] == ['release', 'delete']:
-    state['releases'] = [r for r in releases if r['tag'] != args[2]]
+    print(json.dumps({'message': text}))
+    print(f'gh: {text} (HTTP {code})', file=sys.stderr)
+    sys.exit(1)
+path = next((a for a in args[1:] if a.startswith('repos/')), '')
+if args[0] == 'api' and state.get('broken') and state['broken'] in path:
+    fail(502, 'Bad Gateway')
+if args[0] == 'api' and '-X' not in args and path.endswith('/releases?per_page=100'):
+    save()
+    print(json.dumps([{'id': i, 'tag_name': r['tag'], 'draft': r['draft']} for i, r in enumerate(releases)][::-1]))
+elif args[0] == 'api' and '-X' not in args and path.endswith('/releases/latest'):
+    published = [r for r in releases if not r['draft']]
+    if not published:
+        fail(404, 'Not Found')
+    save()
+    print(json.dumps({'tag_name': published[-1]['tag']}))
+elif args[:3] == ['api', '-X', 'DELETE']:
+    index = int(path.rsplit('/', 1)[1])
+    releases[index]['deleted'] = True
+    state['releases'] = [r for r in releases if not r.get('deleted')]
     save()
 elif args[:2] == ['release', 'create']:
     assert '--latest' in args
     releases.append({'tag': args[2], 'draft': False})
     save()
 else:
+    save()
     sys.exit(2)
 """
 
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='the publish job runs on Linux')
-@pytest.mark.parametrize('releases, version, published', [
-    ([], '1.5.29', True),
-    ([{'tag': 'v1.5.29', 'draft': False}], '1.5.29', False),
-    ([{'tag': 'v1.5.29', 'draft': True}], '1.5.29', True),
-    ([{'tag': 'v1.5.31', 'draft': False}], '1.5.29', False),
-    ([{'tag': 'v1.5.9', 'draft': False}], '1.5.10', True),
+@pytest.mark.parametrize('releases, version, broken, outcome', [
+    ([], '1.5.29', None, 'published'),
+    ([{'tag': 'v1.5.29', 'draft': False}], '1.5.29', None, 'skipped'),
+    ([{'tag': 'v1.5.29', 'draft': True}], '1.5.29', None, 'published'),
+    ([{'tag': 'v1.5.31', 'draft': False}], '1.5.29', None, 'skipped'),
+    ([{'tag': 'v1.5.9', 'draft': False}], '1.5.10', None, 'published'),
+    # A GitHub error must stop the job, never be read as "there is no release".
+    ([{'tag': 'v1.5.31', 'draft': False}], '1.5.29', '/releases/latest', 'failed'),
+    ([{'tag': 'v1.5.29', 'draft': False}], '1.5.29', '/releases?', 'failed'),
 ])
-def test_publish_job_never_replaces_or_outranks_a_release(tmp_path, releases, version, published):
+def test_publish_job_never_replaces_or_outranks_a_release(tmp_path, releases, version, broken, outcome):
     import shutil
     import subprocess
     bash = shutil.which('bash')
-    if bash is None:
-        pytest.skip('bash is not available')
+    if bash is None or shutil.which('jq') is None:
+        pytest.skip('bash and jq are not available')
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
     gh = bin_dir / 'gh'
     gh.write_text(f'#!{sys.executable}\n' + FAKE_GH, encoding='utf-8')
     gh.chmod(0o755)
     state = tmp_path / 'state.json'
-    state.write_text(json.dumps({'releases': releases, 'calls': []}))
+    state.write_text(json.dumps({'releases': releases, 'calls': [], 'broken': broken}))
     (tmp_path / 'release').mkdir()
     (tmp_path / 'release' / f'CryptoPilot-Setup-{version}.exe').write_bytes(b'MZ')
     env = {**__import__('os').environ, 'PATH': f'{bin_dir}:/usr/bin:/bin', 'FAKE_GH_STATE': str(state),
            'VERSION': version, 'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_SHA': 'abc123', 'GH_TOKEN': 'x'}
     result = subprocess.run([bash, '-c', publish_script()], cwd=tmp_path, env=env, capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert (result.returncode != 0) == (outcome == 'failed'), result.stdout + result.stderr
     calls = json.loads(state.read_text())['calls']
     created = [call for call in calls if call[:2] == ['release', 'create']]
-    assert bool(created) == published, calls
+    assert bool(created) == (outcome == 'published'), calls
     if created:
         assert created[0][2] == f'v{version}' and '--target' in created[0]
     tags = [r['tag'] for r in json.loads(state.read_text())['releases']]

@@ -265,6 +265,115 @@ begin
   if not Result then Log('Could not rename ' + Source + ' to ' + Target + '.');
 end;
 
+function DeleteWithRetry(const FileName: String): Boolean;
+var
+  Attempt: Integer;
+begin
+  Result := (not FileExists(FileName)) or DeleteFile(FileName);
+  Attempt := 1;
+  while (not Result) and (Attempt < 20) do begin
+    Sleep(500);
+    Result := (not FileExists(FileName)) or DeleteFile(FileName);
+    Attempt := Attempt + 1;
+  end;
+  if not Result then Log('Could not delete ' + FileName + '.');
+end;
+
+procedure RequireSuccess(Success: Boolean; const Message: String);
+begin
+  if not Success then RaiseException(Message);
+end;
+
+procedure RemoveTree(const Folder: String);
+begin
+  { Only folders Setup made inside this installation; SafeTree refuses links and junctions. }
+  if DirExists(Folder) and SafeTree(Folder) then DelTree(Folder, True, True, True);
+end;
+
+procedure RollBackApp(const HadApp: Boolean);
+var
+  Root: String;
+begin
+  Root := ExpandConstant('{app}');
+  if HadApp and DirExists(BackupRoot + '\app') then begin
+    if DirExists(Root + '\app') then
+      RequireSuccess(RenameWithRetry(Root + '\app', GetStageRoot('') + '\app'),
+        'Could not preserve the interrupted source. Recovery will run at next startup.');
+    RequireSuccess(RenameWithRetry(BackupRoot + '\app', Root + '\app'),
+      'Could not restore the previous source. Recovery will run at next startup.');
+  end else if (not HadApp) and DirExists(Root + '\app') then
+    RequireSuccess(RenameWithRetry(Root + '\app', GetStageRoot('') + '\app'),
+      'Could not restore the staged source.');
+  if HadApp and FileExists(BackupRoot + '\installation.json') then
+    RequireSuccess(FileCopy(BackupRoot + '\installation.json', Root + '\installation.json', False),
+      'Could not restore the previous installation record.');
+  { The journal must go before the previous runtime comes back: a journal means the new
+    runtime is in place, and the next start rolls the swap forward. }
+  if HadApp then
+    RequireSuccess(DeleteWithRetry(Root + '\update-transaction.json'),
+      'Could not remove the recovery record. Recovery will run at next startup.');
+end;
+
+procedure SetPreviousRuntimeAside;
+var
+  Root: String;
+begin
+  { [Files] then writes a complete new runtime and maintenance helper. If the new
+    source cannot be activated, the previous runtime goes back next to the previous
+    source, so the two always match: a new runtime may require modules an old
+    source does not have, and would refuse to start it. }
+  Root := ExpandConstant('{app}');
+  if (not DirExists(Root + '\runtime')) and (not DirExists(Root + '\maintenance')) then exit;
+  RequireSuccess(ForceDirectories(BackupRoot), 'Could not create the backup folder.');
+  { Each folder counts as kept once moved, so DeinitializeSetup puts back whatever moved. }
+  if DirExists(Root + '\runtime') then begin
+    RequireSuccess(RenameWithRetry(Root + '\runtime', BackupRoot + '\runtime'),
+      'Could not set the current runtime aside. Close any program or window using the CryptoPilot folder, then try again.');
+    PreviousRuntimeKept := True;
+  end;
+  if DirExists(Root + '\maintenance') then begin
+    RequireSuccess(RenameWithRetry(Root + '\maintenance', BackupRoot + '\maintenance'),
+      'Could not set the current maintenance files aside. Close any program or window using the CryptoPilot folder, then try again.');
+    PreviousRuntimeKept := True;
+  end;
+  Log('The previous runtime waits in ' + BackupRoot + ' until the new version is active.');
+end;
+
+procedure RestoreFolder(const Saved, Name: String);
+var
+  Root, Rejected: String;
+begin
+  Root := ExpandConstant('{app}');
+  if not DirExists(Saved + '\' + Name) then exit;
+  Rejected := Saved + '\rejected-' + Name;
+  if DirExists(Root + '\' + Name) then
+    RequireSuccess(RenameWithRetry(Root + '\' + Name, Rejected), 'Could not remove the new ' + Name + '.');
+  if not RenameWithRetry(Saved + '\' + Name, Root + '\' + Name) then begin
+    if DirExists(Rejected) then RenameWithRetry(Rejected, Root + '\' + Name);
+    RaiseException('Could not restore the previous ' + Name + '.');
+  end;
+  RemoveTree(Rejected);
+end;
+
+procedure RestorePreviousRuntime;
+begin
+  if not PreviousRuntimeKept then exit;
+  RestoreFolder(BackupRoot, 'runtime');
+  RestoreFolder(BackupRoot, 'maintenance');
+  PreviousRuntimeKept := False;
+  Log('Restored the previous runtime and maintenance files.');
+end;
+
+procedure DiscardPreviousRuntime;
+begin
+  { The new version is active; the previous runtime is not kept, as before. Its source stays backed up. }
+  if not PreviousRuntimeKept then exit;
+  PreviousRuntimeKept := False;
+  RemoveTree(BackupRoot + '\runtime');
+  RemoveTree(BackupRoot + '\maintenance');
+  RemoveDir(BackupRoot);
+end;
+
 function SetupJournalToken(const Journal: String): String;
 var
   Text: AnsiString;
@@ -295,32 +404,51 @@ end;
 
 function RecoverInterruptedSetup(const Token: String): Boolean;
 var
-  Root, Backup, Stage: String;
+  Root, Backup, Stage, Kept: String;
+  RolledBack: Boolean;
 begin
   { An earlier Setup stopped while swapping the source, for example on a power cut.
-    Put a complete source and installation record back; this Setup then backs them
-    up and installs over them, so nothing has to start the app first. }
+    Every Setup writes this journal only after [Files] has installed its new runtime,
+    so finish the swap with the staged source that matches that runtime, as the
+    maintenance helper does at startup. The previous source stays in Backup. }
   Result := False;
+  RolledBack := False;
   Root := ExpandConstant('{app}');
   Backup := Root + '\backups\setup-' + Token;
   Stage := Root + '\.setup-' + Token;
   if (not SafeTree(Backup)) or (not SafeTree(Stage)) then exit;
-  if not DirExists(Root + '\app') then begin
-    if DirExists(Backup + '\app') then begin
-      if not RenameWithRetry(Backup + '\app', Root + '\app') then exit;
-    end else if DirExists(Stage + '\app') then begin
-      if not RenameWithRetry(Stage + '\app', Root + '\app') then exit;
+  if DirExists(Stage + '\app') then begin
+    if DirExists(Root + '\app') then begin
+      Kept := Backup + '\app';
+      if DirExists(Kept) then Kept := Backup + '\interrupted-app-' + StageToken;
+      if not ForceDirectories(Backup) then exit;
+      if not RenameWithRetry(Root + '\app', Kept) then exit;
     end;
-  end;
-  if not FileExists(Root + '\installation.json') then begin
+    if not RenameWithRetry(Stage + '\app', Root + '\app') then exit;
+  end else if (not DirExists(Root + '\app')) and DirExists(Backup + '\app') then begin
+    { No new source is left to finish with: put the previous version back whole. }
+    try
+      RestoreFolder(Backup, 'runtime');
+      RestoreFolder(Backup, 'maintenance');
+    except
+      Log(GetExceptionMessage);
+      exit;
+    end;
+    if not RenameWithRetry(Backup + '\app', Root + '\app') then exit;
     if FileExists(Backup + '\installation.json') then
-      FileCopy(Backup + '\installation.json', Root + '\installation.json', False)
-    else if FileExists(Stage + '\installation.json') then
-      FileCopy(Stage + '\installation.json', Root + '\installation.json', False);
+      if not FileCopy(Backup + '\installation.json', Root + '\installation.json', False) then exit;
+    RolledBack := True;
   end;
+  { A staged record belongs to the new source. Once Setup activated it, only the source was left in staging. }
+  if (not RolledBack) and FileExists(Stage + '\installation.json') then
+    if not MoveFileExW(Stage + '\installation.json', Root + '\installation.json', ReplaceExistingWriteThrough) then exit;
   if not (DirExists(Root + '\app') and FileExists(Root + '\installation.json')) then exit;
-  Result := DeleteFile(Root + '\update-transaction.json');
-  if Result then Log('Recovered the source swap that stopped in ' + Backup + '.');
+  if not DeleteWithRetry(Root + '\update-transaction.json') then exit;
+  { The interrupted Setup's previous runtime is not needed once its new source is active. }
+  RemoveTree(Backup + '\runtime');
+  RemoveTree(Backup + '\maintenance');
+  Log('Finished the source swap that stopped in ' + Backup + '.');
+  Result := True;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -347,8 +475,11 @@ begin
   end;
   if FileExists(ExpandConstant('{app}\update-transaction.json')) then begin
     Token := SetupJournalToken(ExpandConstant('{app}\update-transaction.json'));
-    if (Token = '') or (not RecoverInterruptedSetup(Token)) then begin
-      Result := 'A previous update needs recovery. Start CryptoPilot once to recover it, close it, then run Setup again.';
+    if Token = '' then
+      Result := 'A previous update needs recovery. Start CryptoPilot once to recover it, close it, then run Setup again.'
+    else if not RecoverInterruptedSetup(Token) then
+      Result := 'A previous update did not finish. Close any program or window that is using the CryptoPilot folder, then run Setup again.';
+    if Result <> '' then begin
       ReleaseInstallLock;
       exit;
     end;
@@ -359,93 +490,6 @@ begin
     StageToken := GetDateTimeString('yyyymmddhhnnss', '-', ':') + '-' + IntToStr(Suffix);
   end;
   BackupRoot := ExpandConstant('{app}\backups\setup-') + StageToken;
-end;
-
-procedure RequireSuccess(Success: Boolean; const Message: String);
-begin
-  if not Success then RaiseException(Message);
-end;
-
-procedure RollBackApp(const HadApp: Boolean);
-var
-  Root: String;
-begin
-  Root := ExpandConstant('{app}');
-  if HadApp and DirExists(BackupRoot + '\app') then begin
-    if DirExists(Root + '\app') then
-      RequireSuccess(RenameWithRetry(Root + '\app', GetStageRoot('') + '\app'),
-        'Could not preserve the interrupted source. Recovery will run at next startup.');
-    RequireSuccess(RenameWithRetry(BackupRoot + '\app', Root + '\app'),
-      'Could not restore the previous source. Recovery will run at next startup.');
-  end else if (not HadApp) and DirExists(Root + '\app') then
-    RequireSuccess(RenameWithRetry(Root + '\app', GetStageRoot('') + '\app'),
-      'Could not restore the staged source.');
-  if HadApp and FileExists(BackupRoot + '\installation.json') then
-    RequireSuccess(FileCopy(BackupRoot + '\installation.json', Root + '\installation.json', False),
-      'Could not restore the previous installation record.');
-  if HadApp then DeleteFile(Root + '\update-transaction.json');
-end;
-
-procedure SetPreviousRuntimeAside;
-var
-  Root: String;
-begin
-  { [Files] then writes a complete new runtime and maintenance helper. If the new
-    source cannot be activated, the previous runtime goes back next to the previous
-    source, so the two always match: a new runtime may require modules an old
-    source does not have, and would refuse to start it. }
-  Root := ExpandConstant('{app}');
-  if (not DirExists(Root + '\runtime')) and (not DirExists(Root + '\maintenance')) then exit;
-  RequireSuccess(ForceDirectories(BackupRoot), 'Could not create the backup folder.');
-  { Each folder counts as kept once moved, so DeinitializeSetup puts back whatever moved. }
-  if DirExists(Root + '\runtime') then begin
-    RequireSuccess(RenameWithRetry(Root + '\runtime', BackupRoot + '\runtime'),
-      'Could not set the current runtime aside. Close any program or window using the CryptoPilot folder, then try again.');
-    PreviousRuntimeKept := True;
-  end;
-  if DirExists(Root + '\maintenance') then begin
-    RequireSuccess(RenameWithRetry(Root + '\maintenance', BackupRoot + '\maintenance'),
-      'Could not set the current maintenance files aside. Close any program or window using the CryptoPilot folder, then try again.');
-    PreviousRuntimeKept := True;
-  end;
-  Log('The previous runtime waits in ' + BackupRoot + ' until the new version is active.');
-end;
-
-procedure RestoreFolder(const Name: String);
-var
-  Root, Rejected: String;
-begin
-  Root := ExpandConstant('{app}');
-  if not DirExists(BackupRoot + '\' + Name) then exit;
-  Rejected := BackupRoot + '\rejected-' + Name;
-  if DirExists(Root + '\' + Name) then
-    RequireSuccess(RenameWithRetry(Root + '\' + Name, Rejected), 'Could not remove the new ' + Name + '.');
-  if not RenameWithRetry(BackupRoot + '\' + Name, Root + '\' + Name) then begin
-    if DirExists(Rejected) then RenameWithRetry(Rejected, Root + '\' + Name);
-    RaiseException('Could not restore the previous ' + Name + '.');
-  end;
-  if DirExists(Rejected) and SafeTree(Rejected) then DelTree(Rejected, True, True, True);
-end;
-
-procedure RestorePreviousRuntime;
-begin
-  if not PreviousRuntimeKept then exit;
-  RestoreFolder('runtime');
-  RestoreFolder('maintenance');
-  PreviousRuntimeKept := False;
-  Log('Restored the previous runtime and maintenance files.');
-end;
-
-procedure DiscardPreviousRuntime;
-begin
-  { The new version is active; the previous runtime is not kept, as before. Its source stays backed up. }
-  if not PreviousRuntimeKept then exit;
-  PreviousRuntimeKept := False;
-  if DirExists(BackupRoot + '\runtime') and SafeTree(BackupRoot + '\runtime') then
-    DelTree(BackupRoot + '\runtime', True, True, True);
-  if DirExists(BackupRoot + '\maintenance') and SafeTree(BackupRoot + '\maintenance') then
-    DelTree(BackupRoot + '\maintenance', True, True, True);
-  RemoveDir(BackupRoot);
 end;
 
 procedure ActivateSource;
@@ -479,8 +523,6 @@ begin
     RequireSuccess(RenameWithRetry(GetStageRoot('') + '\app', Root + '\app'), 'Could not activate the new source.');
     RequireSuccess(MoveFileExW(GetStageRoot('') + '\installation.json', Root + '\installation.json',
       ReplaceExistingWriteThrough), 'Could not activate the installation record.');
-    if HadApp then
-      RequireSuccess(DeleteFile(Root + '\update-transaction.json'), 'Could not finish the update transaction.');
   except
     Failure := GetExceptionMessage;
     try
@@ -492,6 +534,9 @@ begin
     end;
     RaiseException(Failure);
   end;
+  { The new version is active. A record left behind is harmless: the next start or Setup finds nothing to move and removes it. }
+  if HadApp and (not DeleteWithRetry(Root + '\update-transaction.json')) then
+    Log('The recovery record remains; the next start removes it.');
   RemoveDir(GetStageRoot(''));
 end;
 

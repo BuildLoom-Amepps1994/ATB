@@ -40,9 +40,9 @@ def repo(tmp_path):
     git(root, 'init', '-q')
     git(root, 'config', 'user.email', 'test@example.invalid')
     git(root, 'config', 'user.name', 'test')
-    (root / 'app.py').write_text('print("hello")\n')
+    (root / 'app.py').write_bytes(b'print("hello")\n')          # bytes: write_text gives CRLF on Windows
     (root / 'docs').mkdir()
-    (root / 'docs' / 'guide.md').write_text('# Guide\n')
+    (root / 'docs' / 'guide.md').write_bytes(b'# Guide\n')
     (root / 'portfolio.sqlite3').write_bytes(b'not tracked')          # local data: never tracked, never archived
     git(root, 'add', 'app.py', 'docs/guide.md')
     git(root, 'commit', '-q', '-m', 'init')
@@ -71,7 +71,7 @@ def test_archive_holds_exactly_the_committed_files_and_is_deterministic(repo, tm
 
 
 def test_uncommitted_changes_are_refused(repo, tmp_path):
-    (repo / 'app.py').write_text('print("edited")\n')
+    (repo / 'app.py').write_bytes(b'print("edited")\n')
     with pytest.raises(archive.ArchiveRefused, match='Commit or discard'):
         archive.build(tmp_path / 'out', 'src', root=repo)
     assert not (tmp_path / 'out' / 'src.zip').exists()
@@ -79,7 +79,7 @@ def test_uncommitted_changes_are_refused(repo, tmp_path):
 
 def test_a_skip_worktree_edit_never_ships(repo, tmp_path):
     git(repo, 'update-index', '--skip-worktree', 'app.py')
-    (repo / 'app.py').write_text('print("local edit git status does not show")\n')
+    (repo / 'app.py').write_bytes(b'print("local edit git status does not show")\n')
     archive.build(tmp_path / 'out', 'src', root=repo)
     assert entry(tmp_path, 'out', 'app.py') == b'print("hello")\n'
 

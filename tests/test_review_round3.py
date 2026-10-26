@@ -698,3 +698,107 @@ def test_the_rollback_preparation_refuses_open_intents_and_a_wrong_phrase(data_f
         recovery.prepare_downgrade(data_folder, recovery.DOWNGRADE_PHRASE)
     assert (data_folder / 'portfolio.sqlite3').read_bytes() == before
     assert not (data_folder / 'backups').exists()
+
+
+# --- Final review, documentation lens: breakers, correlation, kill switch scope -------------
+
+from test_risk_gate import observe  # noqa: E402
+import risk  # noqa: E402
+
+
+def trip_slippage(engine):
+    client = arm_fake_live(engine)
+    engine.cfg['max_positions'] = 8
+    client.fill = {**client.fill, 'average': 101.0, 'cost': 101.0, 'filled': 1.0}   # 1 % worse every time
+    for symbol in ('BTC/USDT', 'ETH/USDT', 'SOL/USDT'):
+        assert engine._buy(symbol, 150, 100, .04)
+        observe(engine, symbol)
+    observe(engine, 'DOGE/USDT')
+    assert not engine._buy('DOGE/USDT', 150, 100, .04)
+    assert 'slippage' in engine.risk_block
+    return client
+
+
+def end_slippage_hold(engine):
+    """The hold has run its course (its end time moved into the past)."""
+    import json
+    key = engine.risk._key('slippage_breaker', engine.mode)
+    record = json.loads(storage.get_meta(key))
+    storage.set_meta(key, json.dumps({**record, 'until': time.time() - 1}))
+
+
+def test_the_slippage_breaker_is_reported_and_closes_on_its_own(engine):
+    client = trip_slippage(engine)
+    remaining = engine.risk.status()['breakers_open']
+    assert 0 < remaining['slippage'] <= risk.BREAKER_HOLD_S
+    end_slippage_hold(engine)
+    assert 'slippage' not in engine.risk.status()['breakers_open']
+    client.fill = {**client.fill, 'average': 100.0, 'cost': 100.0}
+    for symbol in ('BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT'):
+        observe(engine, symbol)
+    assert engine._buy('DOGE/USDT', 150, 100, .04)      # the fills that tripped it are spent
+
+
+def test_the_slippage_breaker_trips_again_on_new_adverse_fills(engine):
+    trip_slippage(engine)
+    end_slippage_hold(engine)
+    engine.cfg['max_orders_per_minute'] = 60                # six orders in a minute here
+    for symbol in ('DOGE/USDT', 'PEPE/USDT', 'SHIB/USDT'):
+        observe(engine, 'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'PEPE/USDT', symbol)
+        assert engine._buy(symbol, 150, 100, .04)
+    observe(engine, 'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'PEPE/USDT', 'SHIB/USDT', 'BONK/USDT')
+    assert not engine._buy('BONK/USDT', 150, 100, .04)
+    assert 'slippage' in engine.risk_block
+
+
+def test_the_rejection_spike_is_reported_and_ignores_orders_never_sent(engine):
+    client = arm_fake_live(engine)
+    for _ in range(3):                                     # refused locally, never sent
+        intent = storage.create_order_intent('mexc', 'BTC/USDT', 'BUY', cost=100, mode='live')
+        storage.update_order_intent(intent, 'rejected', note='kill switch engaged before submission')
+    assert 'reject_spike' not in engine.risk.status()['breakers_open']
+    client.order_error = ccxt.InvalidOrder('bad')
+    for _ in range(3):
+        assert not engine._buy('BTC/USDT', 100, 100, .04)
+    remaining = engine.risk.status()['breakers_open']['reject_spike']
+    assert 0 < remaining <= risk.REJECT_SPIKE_WINDOW_S
+
+
+def test_one_intent_id_finds_the_submit_and_the_submit_names_its_authorization(engine, monkeypatch):
+    events = []                                            # keep the bound correlation ids, as event() does
+    monkeypatch.setattr(observability, 'event', lambda kind, level='info', **fields:
+                        events.append((kind, {**observability.correlation(), **fields})))
+    arm_fake_live(engine)
+    assert engine._buy('BTC/USDT', 800, 100, .04, decision_id='dec_test')
+    intent = storage.rows("SELECT intent_id FROM order_journal WHERE mode='live'")[0]['intent_id']
+    by_intent = {kind: fields for kind, fields in events if fields.get('intent_id') == intent}
+    assert {'execution.submitted', 'execution.filled', 'ledger.accounted'} <= set(by_intent)
+    token = by_intent['execution.submitted']['token']
+    authorization = next(fields for kind, fields in events if kind == 'risk.authorize' and fields.get('token') == token)
+    assert authorization['decision_id'] == by_intent['execution.submitted']['decision_id'] == 'dec_test'
+
+
+def test_a_manual_order_carries_an_id_from_request_to_ledger(engine, monkeypatch):
+    events = capture_events(monkeypatch)
+    request_id = '0f1e2d3c-4b5a-4968-8776-655443322110'
+    result = engine.manual_trade('BTC/USDT', 'BUY', quote_amount=100, request_id=request_id)
+    assert result['status'] == 'filled'
+    row = storage.rows("SELECT decision_id FROM order_journal WHERE mode='paper'")[0]
+    assert row['decision_id'] == f'manual_{request_id}'
+    assert any(kind == 'ledger.accounted' and fields.get('decision_id') == f'manual_{request_id}' for kind, fields in events)
+
+
+def test_an_engaged_kill_switch_follows_the_operator_to_the_other_exchange(engine):
+    engine.risk.engage_kill_switch('incident', allow_exits=False)
+    engine.update_config({'exchange': 'kraken'})
+    switch = engine.risk.kill_switch()
+    assert engine.exchange_name == 'kraken' and switch['engaged'] and not switch['allow_exits']
+    assert 'MEXC' in switch['reason']
+
+
+def test_a_paper_reset_clears_a_paper_slippage_hold(engine):
+    key = engine.risk._key('slippage_breaker', 'paper')
+    storage.set_meta(key, '{"until": 9999999999, "after": "", "average": 1.0}')
+    assert 'slippage' in engine.risk.status()['breakers_open']
+    engine.reset_paper_portfolio()
+    assert not storage.get_meta(key) and 'slippage' not in engine.risk.status()['breakers_open']

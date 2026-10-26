@@ -414,11 +414,15 @@ class TradingEngine:
                 candidate_public = self._new_exchange(revised['exchange'])
                 candidate_data = MarketData(candidate_public, wait=self._retry_wait,
                                             concurrency=self._public_concurrency(candidate_public))
+            # The kill switch is kept per exchange; an engaged one must not be
+            # left behind when the operator moves to the other exchange.
+            carried_switch = self.risk.kill_switch() if changed_exchange else None
             storage.save_settings(revised)
             changed_keys = sorted(key for key in revised if revised.get(key) != self.cfg.get(key))
             self.cfg = revised
             if not revised.get('streaming_quotes'):
                 self._stop_feed()   # nothing may keep quoting from a stream the operator switched off
+            changed_from = self.exchange_name
             if changed_exchange:
                 self.exchange_name = revised['exchange']
                 self.public, self.data = candidate_public, candidate_data
@@ -437,6 +441,9 @@ class TradingEngine:
                 self.live_halted = self._durable_live_block()
                 self._restore_from_keyring()
             self.risk_block = None
+            if carried_switch and carried_switch['engaged'] and not self.risk.kill_switch()['engaged']:
+                self.risk.engage_kill_switch(f'Carried over from {changed_from.upper()}: {carried_switch.get("reason") or "kill switch"}',
+                                             allow_exits=carried_switch['allow_exits'])
             self.manual_order_context = str(uuid.uuid4())
             storage.audit('info', 'Trading configuration validated and saved.')
             observability.event('settings.saved', changed=changed_keys, exchange=self.exchange_name)
@@ -1127,6 +1134,11 @@ class TradingEngine:
                         return None, None
                     # The request leaves now; a crash after this point may have an order at the exchange.
                     storage.update_order_intent(intent, 'pending', submitted_at=storage._now())
+                    # Carries the intent and decision ids (bound above) and the
+                    # authorization token, which names the risk.authorize line.
+                    observability.event('execution.submitted', symbol=symbol, side=side, client_order_id=client_id,
+                                        token=authorization.token, quantity=quantity, cost=cost,
+                                        intended_price=intended_price)
                     sent = time.perf_counter()
                     try:
                         if side == 'BUY':
@@ -1968,12 +1980,13 @@ class TradingEngine:
                 filled = self._buy(symbol, amount, refreshed, fraction, reason='Explicit manual spot buy',
                                    merge_dust=position is not None, completion=completion,
                                    entry_candle=int(primary.iloc[-1]['timestamp']), kind='manual_entry',
-                                   spread=spread)
+                                   spread=spread, decision_id=f'manual_{request_id}')
             else:
                 if not self._orders_allowed():
                     raise error('Order preparation was stopped.')
                 completion = {'scope': scope, 'record': record, 'payload': payload, 'request_id': request_id}
-                filled = self._sell(position, price, 'Explicit manual close of tracked spot position', completion=completion)
+                filled = self._sell(position, price, 'Explicit manual close of tracked spot position', completion=completion,
+                                    decision_id=f'manual_{request_id}')
             if not filled:
                 if self.live_halted:
                     raise error('Order outcome requires manual reconciliation. Live trading is halted; do not retry this order.')

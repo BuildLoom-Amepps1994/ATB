@@ -297,16 +297,57 @@ class RiskGate:
                            (self.engine.exchange_name, mode, today + '%'))
         return float(row[0]['value'] or 0.0)
 
-    def _reject_spike(self, mode: str) -> bool:
+    def _reject_spike_remaining(self, mode: str) -> float:
+        """Seconds until the rejection-spike breaker closes on its own; 0 when it is closed.
+
+        Only requests that reached the counterparty count (``submitted_at`` is
+        set): an order the engine itself refused before sending (a Stop, the
+        kill switch) is not an exchange rejection.
+        """
         since = (datetime.now(timezone.utc) - timedelta(seconds=REJECT_SPIKE_WINDOW_S)).isoformat(timespec='milliseconds')
-        row = storage.rows("SELECT COUNT(*) AS count FROM order_journal WHERE exchange=? AND mode=? AND status='rejected' AND updated_at>=?",
-                           (self.engine.exchange_name, mode, since))
-        return int(row[0]['count']) >= REJECT_SPIKE_COUNT
+        rows = storage.rows("SELECT updated_at FROM order_journal WHERE exchange=? AND mode=? AND status='rejected' "
+                            'AND submitted_at IS NOT NULL AND updated_at>=? ORDER BY updated_at',
+                            (self.engine.exchange_name, mode, since))
+        if len(rows) < REJECT_SPIKE_COUNT:
+            return 0.0
+        # It closes when enough of the counted rejections have left the window.
+        oldest_needed = rows[len(rows) - REJECT_SPIKE_COUNT]['updated_at']
+        try:
+            closes = datetime.fromisoformat(oldest_needed).timestamp() + REJECT_SPIKE_WINDOW_S
+        except (TypeError, ValueError):
+            return float(REJECT_SPIKE_WINDOW_S)
+        return max(1.0, closes - time.time())
+
+    def _reject_spike(self, mode: str) -> bool:
+        return self._reject_spike_remaining(mode) > 0
+
+    def _slippage_record(self, mode: str) -> dict:
+        raw = storage.get_meta(self._key('slippage_breaker', mode))
+        try:
+            record = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            record = {}
+        return record if isinstance(record, dict) else {}
+
+    def _slippage_remaining(self, mode: str) -> float:
+        until = _finite(self._slippage_record(mode).get('until'))
+        return max(0.0, (until or 0.0) - time.time())
 
     def _slippage_breaker(self, mode: str) -> tuple[bool, float | None]:
-        rows = storage.rows('SELECT intended_price,filled_price,side FROM order_journal WHERE exchange=? AND mode=? '
+        """Pause entries for ``BREAKER_HOLD_S`` after the last fills ran far worse than assumed.
+
+        The fills that tripped it are then spent: once the hold ends, only
+        orders accounted after them can trip it again, so it closes on its own
+        even when no new order can move the average.
+        """
+        record = self._slippage_record(mode)
+        if self._slippage_remaining(mode) > 0:
+            return True, _finite(record.get('average'))
+        after = record.get('after') if isinstance(record.get('after'), str) else ''
+        rows = storage.rows('SELECT intended_price,filled_price,side,updated_at FROM order_journal WHERE exchange=? AND mode=? '
                             "AND status='accounted' AND intended_price IS NOT NULL AND filled_price IS NOT NULL "
-                            'ORDER BY updated_at DESC LIMIT ?', (self.engine.exchange_name, mode, SLIPPAGE_SAMPLE))
+                            'AND updated_at>? ORDER BY updated_at DESC LIMIT ?',
+                            (self.engine.exchange_name, mode, after, SLIPPAGE_SAMPLE))
         if len(rows) < SLIPPAGE_SAMPLE:
             return False, None
         adverse = []
@@ -316,9 +357,18 @@ class RiskGate:
                 return False, None
             move = (filled - intended) / intended * 100
             adverse.append(move if row['side'] == 'BUY' else -move)
-        average = sum(adverse) / len(adverse)
+        average = round(sum(adverse) / len(adverse), 4)
         assumed = float(self.engine.cfg.get('slippage_pct', 0.2))
-        return average > max(0.05, assumed) * SLIPPAGE_MULTIPLE, round(average, 4)
+        if average <= max(0.05, assumed) * SLIPPAGE_MULTIPLE:
+            return False, average
+        storage.set_meta(self._key('slippage_breaker', mode), json.dumps(
+            {'until': time.time() + BREAKER_HOLD_S, 'after': max(row['updated_at'] for row in rows), 'average': average}))
+        self.metrics.incr('risk.breaker_open')
+        storage.audit('error', f'Circuit breaker: average adverse slippage {average:.3f}% over the last {SLIPPAGE_SAMPLE} fills; '
+                               f'new entries pause for {BREAKER_HOLD_S // 60} minutes.')
+        observability.event('risk.breaker', level='error', breaker='slippage', average_adverse_slippage_pct=average,
+                            hold_seconds=BREAKER_HOLD_S)
+        return True, average
 
     def authorize(self, request: OrderRequest, *, positions: list[dict], cash: float | None,
                   equity: float | None, marks_fresh: bool, symbol_fresh: bool) -> Authorization:
@@ -449,6 +499,10 @@ class RiskGate:
             now = time.monotonic()
             breakers = {name: round(until - now, 1) for name, until in self._breaker_until.items() if until > now}
         mode = self.engine.mode
+        for name, remaining in (('reject_spike', self._reject_spike_remaining(mode)),
+                                ('slippage', self._slippage_remaining(mode))):
+            if remaining > 0:
+                breakers[name] = round(remaining, 1)
         return {'kill_switch': self.kill_switch(), 'drawdown_stop': self.drawdown_stop(mode),
                 'realized_stop': self.realized_stop(mode),
                 'peak_equity': _finite(storage.get_meta(self._key('peak_equity', mode))),

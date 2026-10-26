@@ -153,7 +153,7 @@ impact on live capital or on the integrity of the record.
 | 72 | Low | The kill switch is stored per exchange, so changing exchanges silently left an engaged switch behind. | **Fixed**: an engaged switch is carried over to the new exchange with its exit policy; the runbook says it is per exchange. |
 | 73 | Low | The upgrade path said the in-app updater would offer the hardening build to a 1.4.0 installation, but the build was also numbered 1.4.0. | **Resolved by pull request #7**: releases are numbered 1.5.<commits on main>, so every merged build is newer than 1.4.0. |
 | 74 | Med. | A loss booked by a manual exit never latched the realised-loss stop. Manual orders need a stopped bot, and the latch ran only at a valuation (monitor, scan, Start, entry authorization), so a later profitable close or the UTC rollover could hide the crossing and the bot resumed entries. | **Fixed**: every booked exit checks the day's realised P/L against the limit straight after the ledger commit, valued from the cash the sale left (no extra exchange read). |
-| 75 | Low | A re-quote failing with a network error (not a `ValueError`) ended the whole entry pass, and a Stop at the end of a scan, an entry error in live mode or a live halt dropped the remaining `enter` decisions with no `decision.withheld` line, so the soak check in the runbook could not pass. | **Fixed**: any re-quote failure withholds that candidate (`requote_unavailable`) and the pass goes on; the scan withholds its candidates when a Stop landed (`orders_not_allowed`); the live breaks withhold the rest (`entry_error`, `live_halted`); and anything else that ends the pass withholds the candidates not yet tried (`entry_pass_error`) before it is reported. |
+| 75 | Low | A re-quote failing with a network error (not a `ValueError`) ended the whole entry pass, and a Stop at the end of a scan, an entry error in live mode or a live halt dropped the remaining `enter` decisions with no `decision.withheld` line, so the soak check in the runbook could not pass. | **Fixed**: a re-quote with bad or missing data withholds that candidate (`requote_unavailable`) and the pass goes on (a connection failure ends the pass, finding 84); the scan withholds its candidates when a Stop landed (`orders_not_allowed`); the live breaks withhold the rest (`entry_error`, `live_halted`); and anything else that ends the pass withholds the candidates not yet tried (`entry_pass_error`) before it is reported. |
 | 76 | Low | A Stop (or a worker exit) landing between the stream's creation and its `start()` took it out of `self.feed` before its thread started; the start then ran anyway and nothing in the engine could reach the thread. | **Fixed**: Start keeps its own reference to the stream it started and stops that one when the generation check sees the Stop. |
 | 77 | Low | The durable slippage hold is an end time on the PC clock, so a clock corrected backwards while it was open stretched the 30-minute pause by the size of the step. | **Fixed**: an end time more than 30 minutes away is pulled back to 30 minutes from now and saved. The rejection-spike window still counts by journal timestamps, so a backward step keeps those rejections counted until the clock catches up; that fails closed and is listed in section H. |
 | 78 | Low | Changing exchange carried the kill switch only when the target's switch was released, so an exits-blocked switch did not tighten an entries-only switch already engaged on the target. | **Fixed**: it is carried when the target is released or when the target allows exits that the carried switch blocks; a stricter target is left as it is. |
@@ -162,6 +162,10 @@ impact on live capital or on the integrity of the record.
 | 81 | Low | An `enter` decision the risk gate refused (kill switch, caps, breakers) left no `decision.withheld` line and no journal row; only a `risk.blocked` event with the decision id. | **Fixed**: withheld as `risk_gate`, or `not_submitted` when nothing reached the journal for another reason. |
 | 82 | Low | The slippage breaker was judged only at the next entry attempt, so after three bad fills the state view showed no breaker and the 30-minute hold started whenever the next candidate appeared, possibly hours later. | **Fixed**: it is judged as each fill is booked, so the hold starts, and is listed, when the third bad fill lands. |
 | 83 | Low | The test review found fix paths no test pinned: a clear floor from an earlier day, the launcher's Ctrl+C wiring, intent ids on seven failure sites, the fee clamp, the worker-exit stream branch, the stream symbols a scan pushes, the fee estimate on a dust merge, eleven of twelve withheld reasons, the manual SELL id, a carried entries-only switch, the rejection-spike countdown, the rollback command line, the MEXC single-pair fallback and the dashboard's element ids. Each was shown by a mutant that passed the whole suite. | **Fixed**: one test per gap, each checked to fail on its mutant (section B). |
+| 84 | Low | The fix for finding 75 let the entry pass go on after a re-quote's connection failed. Each further candidate then waited out the same retries (up to about 55 s each) while no protective check ran, and the dashboard showed no error. | **Fixed**: a connection failure after the retries withholds the rest of the pass as `requote_unavailable` and ends it, and the scan reports the error as before; bad data for one pair still only skips that pair. |
+| 85 | Low | A database error in a report or check made after the ledger commit (the trade audit line, or the realised-loss and slippage checks added by findings 74 and 82, whose fallback audit could itself fail) was handled as a ledger failure, halting live trading for a fill that was booked correctly. | **Fixed**: once the commit succeeds the fill counts as done; a later failure is logged as `ledger.post_commit_error` and never reaches the ledger-failure path. |
+| 86 | Low | An entry whose order path raised before anything was journaled left no `decision.withheld` line in paper, and none for itself in live. | **Fixed**: it is withheld as `entry_error` unless its decision id reached the journal. |
+| 87 | Low | Finding 83 overstated its coverage: three withheld reasons (`held`, `protective_exit_pending`, `settings_review`) and the in-loop Stop, three intent-id sites (both ledger-commit failures and the paper sell's fill accounting), the live branch of the exit latch and the slippage check after a sell could each be removed without a test failing. The runbook's re-latch rule also left out that the loss must be past the current limit. | **Fixed**: a test for each, checked to fail on its mutant; the re-latch wording (runbook and the clear's audit line) is exact. |
 
 ---
 
@@ -196,7 +200,7 @@ impact on live capital or on the integrity of the record.
 | `recovery.py`, `trader.py`, `risk.py`, `RUNBOOK.md` | Findings 61–63: `--prepare-downgrade` for a rollback across the schema change, stream lifecycle on a fast Stop or with streaming off, kill switch re-read at submit. |
 | `tests/test_review_round3.py` | 7 more tests for findings 61–63, checked to fail with each fix removed, except the `allow_exits=True` case of the exit kill-switch test, a guard that passes without the fix. |
 | `risk.py`, `trader.py`, `storage.py`, `RUNBOOK.md`, `tests/test_review_round3.py` | Findings 66–69 and 72: breakers that close and report, the submit event and manual order ids, the kill switch across an exchange change; 7 tests, each checked to fail without its fix. |
-| `trader.py`, `risk.py`, `recovery.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new), `tests/test_dashboard.js` | Findings 74–83: realised-loss latch on every booked exit, withheld records whatever ends the entry pass or the gate refuses, the stream started by Start stopped by reference, the slippage hold capped after a clock step and judged at each fill, the stricter kill switch carried, a rollback not blocked by paper intents, the protective exit trigger, and the test review's gaps; 37 + 1 tests. Each fails on the mutation it targets (the reviewer's 16 mutants and 14 more), except the small-manual-loss test, a guard against latching too eagerly. |
+| `trader.py`, `risk.py`, `recovery.py`, `RUNBOOK.md`, `tests/test_review_round4.py` (new), `tests/test_dashboard.js` | Findings 74–87: realised-loss latch on every booked exit, withheld records whatever ends the entry pass or the gate refuses, the stream started by Start stopped by reference, the slippage hold capped after a clock step and judged at each fill, the stricter kill switch carried, a rollback not blocked by paper intents, the protective exit trigger, a booked fill that stays booked, a pass that ends on a connection failure, and the test reviews' gaps; 52 + 1 tests. Each fails on the mutation it targets (the reviewer's 16 mutants and 28 more), except the small-manual-loss test, a guard against latching too eagerly. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -393,7 +397,7 @@ measurements should be repeated on the Windows machine with Python 3.14
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **635 passed** |
+| `python -m pytest tests -q` | 434 passed | **650 passed** |
 | `node --test tests/test_dashboard.js` | 11 passed | 15 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
 | `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
@@ -464,12 +468,13 @@ New test files and what they prove:
   rejection spike reported and ignoring orders never sent; one intent id
   finding the submit, whose token finds the authorization; manual order ids;
   the kill switch carried to the other exchange.
-* `tests/test_review_round4.py` (37): a manual close that crosses the
+* `tests/test_review_round4.py` (52): a manual close that crosses the
   realised-loss limit latches before a later profitable close, and a small
-  one does not; a network error on one re-quote withholds only that
-  candidate; an error that ends the pass withholds only the candidates not
-  yet tried; a Stop at the end of a scan and a live halt leave a withheld line
-  for every remaining `enter`; a Stop between the stream's creation and its
+  one does not, also on the live path; a connection failure on a re-quote
+  withholds the rest and ends the pass, while bad data for one pair skips
+  only that pair; an error that ends the pass withholds only the candidates
+  not yet tried; a Stop at the end of a scan and a live halt leave a
+  withheld line for every remaining `enter`; a Stop between the stream's creation and its
   start leaves no stream thread running; a slippage hold seen after a
   six-hour backward clock step counts down from 30 minutes and closes; an
   exits-blocked switch tightens an entries-only one on the target, and an
@@ -477,7 +482,9 @@ New test files and what they prove:
   intent on another exchange does not block the rollback that drops it; a
   protective exit names its trigger; gate refusals are withheld; the slippage
   hold is listed as soon as the third bad fill is booked; and one test for
-  each coverage gap in finding 83. `tests/test_dashboard.js` also checks that
+  each coverage gap in findings 83 and 87; a report failing after the ledger
+  commit leaves the fill booked with no halt; an entry that raised before the
+  journal is withheld, one that reached it is not. `tests/test_dashboard.js` also checks that
   every element id the dashboard script looks up exists in the page.
 
 **Not runnable here.**

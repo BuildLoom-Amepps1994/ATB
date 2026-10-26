@@ -206,7 +206,7 @@ class RiskGate:
             db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',
                        (self._key('realized_stop_cleared', mode), cleared))
         storage.audit('warning', f'{mode.upper()} daily realised-loss stop cleared after explicit confirmation at '
-                                 f'{realized:.2f} USDT realised today; a further loss today latches it again.')
+                                 f'{realized:.2f} USDT realised today; it latches again if net realised P/L for today goes beyond the limit and below this level.')
         observability.event('risk.realized_stop_cleared', level='warning', mode=mode, realized=realized)
 
     def _cleared_floor(self, mode: str) -> float | None:

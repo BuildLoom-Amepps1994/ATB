@@ -1423,6 +1423,7 @@ class TradingEngine:
                 self._ledger_failure(f'BUY {symbol}: {type(exc).__name__}; fill/fee accounting requires review',
                                      intent_id=intent, mode='live')
                 return False
+        booked = False
         try:
             with storage.connection() as db:
                 if mode == 'paper':
@@ -1461,6 +1462,7 @@ class TradingEngine:
                 self._complete_manual_request(db, completion, qty + (float(existing['qty']) if existing else 0))
                 if intent:
                     storage.update_order_intent(intent, 'accounted', order_id=order_id, db=db)
+            booked = True
             # Refreshing an account is a read; a failure cannot erase a filled ledger entry.
             if mode == 'live':
                 with self.lock:
@@ -1471,6 +1473,8 @@ class TradingEngine:
             self._observe_fills(mode)
             return True
         except Exception as exc:
+            if booked:
+                return self._after_booking_failed(mode, 'BUY', symbol, exc, intent)
             self._ledger_failure(f'{mode.upper()} BUY {symbol}: {type(exc).__name__}; portfolio ledger requires review',
                                  intent_id=intent)
             return False
@@ -1564,6 +1568,7 @@ class TradingEngine:
         remaining = max(0.0, tracked - consumed)
         if remaining <= tracked * 1e-12:
             remaining = 0.0
+        booked = False
         try:
             with storage.connection() as db:
                 if mode == 'paper':
@@ -1588,6 +1593,7 @@ class TradingEngine:
                 self._complete_manual_request(db, completion, remaining)
                 if intent:
                     storage.update_order_intent(intent, 'accounted', order_id=order_id, db=db)
+            booked = True
             if mode == 'live':
                 with self.lock:
                     self.balance_updated_at = None
@@ -1608,9 +1614,22 @@ class TradingEngine:
             # Reentry cooldown and fill were committed together above.
             return True
         except Exception as exc:
+            if booked:
+                return self._after_booking_failed(mode, 'SELL', symbol, exc, intent)
             self._ledger_failure(f'{mode.upper()} SELL {symbol}: {type(exc).__name__}; portfolio ledger requires review',
                                  intent_id=intent)
             return False
+
+    def _after_booking_failed(self, mode: str, side: str, symbol: str, exc: Exception, intent: str | None) -> bool:
+        """A report or check after the ledger commit failed: the fill stays booked and counts as done."""
+        try:
+            observability.event('ledger.post_commit_error', level='warning', mode=mode, side=side, symbol=symbol,
+                                intent_id=intent, error=type(exc).__name__)
+            storage.audit('warning', f'{mode.upper()} {side} {symbol} is booked; a report after it failed '
+                                     f'({type(exc).__name__}).')
+        except Exception:
+            pass
+        return True
 
     def _observe_fills(self, mode: str) -> None:
         """Judge the slippage breaker as soon as a fill is booked.
@@ -2144,9 +2163,15 @@ class TradingEngine:
             # many coins can otherwise place an entry using an old quote.
             try:
                 price, volume, spread = self._observe_ticker(symbol, self.data.ticker(symbol), for_buy=True)
+            except ccxt.NetworkError:
+                # The transport failed after its retries. Every later re-quote
+                # would wait out the same retries while no protective check
+                # runs, so the pass ends and the scan reports the error.
+                self._withhold(candidates[index:], 'requote_unavailable')
+                cursor[0] = len(candidates)
+                raise
             except Exception:
-                # A network error after retries is as unquotable as bad data,
-                # and one unquotable candidate must not end the pass.
+                # Bad or missing data for one pair must not end the pass.
                 self._withhold([candidate], 'requote_unavailable')
                 continue
             if volume < self.cfg['min_quote_volume'] or spread is None or spread > self.cfg['max_spread_pct']:
@@ -2178,13 +2203,15 @@ class TradingEngine:
                 observability.event('execution.entry_error', level='error', symbol=symbol,
                                     error=type(exc).__name__, decision_id=decision_id)
                 self.risk.record_failure('entry_error')
+                if not self._journaled(decision_id):
+                    self._withhold([candidate], 'entry_error')
                 if self.mode == 'live':
                     self._withhold(candidates[index + 1:], 'entry_error')
                     break
                 continue
             if filled:
                 count += 1
-            elif not (decision_id and storage.rows('SELECT 1 FROM order_journal WHERE decision_id=? LIMIT 1', (decision_id,))):
+            elif not self._journaled(decision_id):
                 # Nothing reached the journal: the gate refused it (its
                 # risk.blocked event names the check) or it was never prepared.
                 with self.lock:
@@ -2196,6 +2223,16 @@ class TradingEngine:
                 self._withhold(candidates[index + 1:], 'live_halted')
                 break
         cursor[0] = len(candidates)
+
+    @staticmethod
+    def _journaled(decision_id) -> bool:
+        """Whether an order intent carries this decision id; a failed lookup counts as no."""
+        if not decision_id:
+            return False
+        try:
+            return bool(storage.rows('SELECT 1 FROM order_journal WHERE decision_id=? LIMIT 1', (decision_id,)))
+        except Exception:
+            return False
 
     def _same_candle_blocked(self, symbol: str, primary_tf: str, candle) -> bool:
         """The durable no-reentry rule _enter_candidates applies: entered or exited on this candle."""

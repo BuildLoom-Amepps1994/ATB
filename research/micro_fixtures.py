@@ -23,18 +23,20 @@ import time as _time
 from dataclasses import dataclass, field
 
 MINUTE = 60
+# The real clocks, read at import: a clock installed later must not chain onto an earlier fixture clock.
+_REAL_TIME, _REAL_MONOTONIC = _time.time, _time.monotonic
 
 
 class FixtureClock:
     """Wall clock = the real start time plus an offset the test advances."""
 
     def __init__(self, start: float | None = None):
-        real = _time.time()
+        real = _REAL_TIME()
         # Start a few seconds after a minute boundary so "the last completed bar" is unambiguous.
         base = start if start is not None else (math.floor(real / MINUTE) * MINUTE + 5.0)
         self._shift = self._shift0 = base - real
-        self._real = _time.time
-        self._mono = _time.monotonic
+        self._real = _REAL_TIME
+        self._mono = _REAL_MONOTONIC
 
     def time(self) -> float:
         return self._real() + self._shift
@@ -62,12 +64,15 @@ def install_clock(clock: FixtureClock, setattr_) -> None:
     plain ``setattr`` in a throwaway research process. Wall time, monotonic
     time and the ``datetime.now`` of the engine modules all move together, so
     a one-minute rate limit or a cooldown measures fixture minutes, not the
-    few real milliseconds a simulated minute takes.
+    few real milliseconds a simulated minute takes. A second install replaces
+    the first everywhere, including a module's earlier fixture ``datetime``.
     """
     import importlib
     from datetime import datetime as _datetime
 
     class FixtureDatetime(_datetime):
+        fixture_clock = clock
+
         @classmethod
         def now(cls, tz=None):
             return _datetime.fromtimestamp(clock.time(), tz)
@@ -80,7 +85,8 @@ def install_clock(clock: FixtureClock, setattr_) -> None:
     setattr_(_time, 'monotonic', clock.monotonic)
     for name in CLOCKED_MODULES:
         module = importlib.import_module(name)
-        if getattr(module, 'datetime', None) is _datetime:
+        current = getattr(module, 'datetime', None)
+        if current is _datetime or getattr(current, 'fixture_clock', None) is not None:
             setattr_(module, 'datetime', FixtureDatetime)
 
 
@@ -114,6 +120,7 @@ class SeriesMarket:
     volume: float = 50_000.0
     market: dict = field(default_factory=dict)
     rows: list | None = None          # recorded OHLCV rows (real data); closes are then their closes
+    venue: str = 'mexc'               # whose rules and book format the market follows
 
     @classmethod
     def from_rows(cls, symbol: str, rows: list, **kwargs) -> 'SeriesMarket':
@@ -144,14 +151,16 @@ class SeriesMarket:
                 spread_scale: float = 1.0) -> dict:
         """A CCXT-shaped book around ``mid``: ``levels`` ticks per side, ``level_quote`` notional each."""
         half = max(self.tick, mid * self.spread_bps * spread_scale / 20000.0)
-        best_bid = math.floor((mid - half) / self.tick) * self.tick
-        best_ask = math.ceil((mid + half) / self.tick) * self.tick
-        if best_ask <= best_bid:
-            best_ask = best_bid + self.tick
+        # Count whole ticks first (rounded, so float error cannot drop one), then price them.
+        bid_ticks = math.floor(round((mid - half) / self.tick, 6))
+        ask_ticks = max(math.ceil(round((mid + half) / self.tick, 6)), bid_ticks + 1)
+        if bid_ticks - self.levels < 0:
+            raise ValueError(f'{self.symbol}: a {self.tick} tick cannot model a book around {mid}')
+        places = max(10, 2 - math.floor(math.log10(self.tick)))
         bids, asks = [], []
         for level in range(self.levels):
-            bid = round(best_bid - level * self.tick, 10)
-            ask = round(best_ask + level * self.tick, 10)
+            bid = round((bid_ticks - level) * self.tick, places)
+            ask = round((ask_ticks + level) * self.tick, places)
             bids.append([bid, round(self.level_quote * depth_scale / bid, 6)])
             asks.append([ask, round(self.level_quote * depth_scale / ask, 6)])
         return {'symbol': self.symbol, 'bids': bids, 'asks': asks, 'timestamp': now_ms, 'datetime': None,

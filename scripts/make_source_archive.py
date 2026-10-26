@@ -3,25 +3,34 @@
 Run from the repository root:
     python scripts/make_source_archive.py [--out dist] [--label NAME]
 
-The archive holds exactly the files git tracks at HEAD (``git ls-files``), so
-local data (portfolio databases, settings, logs, saved keys, virtual
+The archive holds exactly the files of the HEAD commit, read from git's own
+objects (``git ls-tree`` and ``git cat-file``), never from the working tree.
+So local data (portfolio databases, settings, logs, saved keys, virtual
 environments, build output) can never be swept in by accident: none of those
-is tracked, and .gitignore keeps it that way. Before writing, every file is
-checked against a short list of names and contents that must never ship
-(databases, settings files, private keys, API-key shaped assignments). A hit
-stops the build and names the file; nothing is written.
+is committed, and .gitignore keeps it that way. Reading the objects also
+means a file marked skip-worktree or assume-unchanged ships as committed, and
+a Windows checkout with CRLF line endings ships the same bytes as any other.
+A committed symbolic link or submodule is refused, because its content lives
+outside the commit.
 
-A working tree with uncommitted changes to tracked files is refused, so the
-archive's content is the commit's content. After writing, the archive is read
-back and its membership and every entry's hash are compared with the
-manifest; a mismatch deletes it.
+Before writing, every file is checked against a list of names and contents
+that must never ship: databases and their journal files, settings and
+environment files, logs, private keys, credential-shaped assignments in code,
+JSON, YAML or .env form (also in UTF-16), and SQLite content under any name.
+A hit stops the build and names the file; nothing is written.
 
-The ZIP is deterministic: sorted entries, a fixed timestamp and fixed
-permissions, so the same commit always produces the same archive hash. The
-manifest lists each file's size and SHA-256 plus the archive's own hash, and
-is written beside the archive (``<label>.manifest.json``) and as a plain
-``SHA256SUMS`` file that ``sha256sum -c`` (or PowerShell ``Get-FileHash``)
-can check.
+A working tree with uncommitted changes to tracked files is refused, so what
+the operator sees is what ships. After writing, the archive is read back and
+its membership and every entry's hash are compared with the manifest; a
+mismatch deletes it.
+
+The ZIP is deterministic: sorted entries, a fixed timestamp, fixed
+permissions and no compression (deflate output can differ between zlib
+implementations and versions), so the same commit produces the same archive
+hash on any machine. The manifest lists each file's size and SHA-256
+plus the archive's own hash, and is written beside the archive
+(``<label>.manifest.json``) and as a plain ``SHA256SUMS`` file that
+``sha256sum -c`` (or PowerShell ``Get-FileHash``) can check.
 """
 from __future__ import annotations
 
@@ -36,20 +45,55 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXED_TIME = (2026, 1, 1, 0, 0, 0)
-FORBIDDEN_NAMES = re.compile(r'(\.sqlite3|\.db|\.pem|\.key|\.p12|\.pfx|\.env|settings\.json|settings\.last-good\.json|'
-                             r'instance\.lock|id_rsa|id_ed25519)$', re.IGNORECASE)
-# Assignments that look like a real credential: a key/secret name followed by a long opaque value.
-SECRET_CONTENT = re.compile(rb'(?i)(api[_-]?key|api[_-]?secret|secret[_-]?key|password)\s*[=:]\s*[\'"][A-Za-z0-9+/=_-]{24,}[\'"]')
-PRIVATE_KEY = re.compile(rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----')
+FORBIDDEN_NAMES = re.compile(r'''(
+      \.(sqlite3?|db)(-wal|-shm|-journal)?       # databases and their write-ahead and journal files
+    | \.(pem|key|p12|pfx|kdbx)
+    | (^|/)\.env(\.[^/]*)?                     # .env, .env.local, .env.production
+    | (^|/)settings(\.[^/]*)?\.json            # settings.json, settings.last-good.json, settings.backup.json
+    | \.log(\.\d+)?
+    | instance\.lock | id_rsa | id_ed25519 | id_ecdsa
+)$''', re.IGNORECASE | re.VERBOSE)
+SECRET_NAME = re.compile(rb'(?i)api[_-]?key|api[_-]?secret|secret|password|passphrase|private[_-]?key|access[_-]?token')
+# A name, quoted or not (code, a dict, JSON, YAML), then a long opaque quoted value. Whether the name
+# holds a secret word is checked afterwards, which keeps both patterns linear on long tokens.
+ASSIGNMENT_QUOTED = re.compile(rb'''["']?(?<![\w.-])([\w.-]+)["']?\s*[=:]\s*["'][A-Za-z0-9+/=_-]{24,}["']''')
+# The .env and INI form: NAME=value alone on its line, the value long, opaque and holding a digit.
+ASSIGNMENT_BARE = re.compile(rb'(?m)^[ \t]*(?:export[ \t]+)?([\w.-]+)[ \t]*[=:][ \t]*'
+                             rb'(?=[^\s#]*\d)[A-Za-z0-9+/=_-]{24,}[ \t]*\r?$')
+PRIVATE_KEY = re.compile(rb'-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----')
+SQLITE_MAGIC = b'SQLite format 3\x00'
+REGULAR_FILE_MODES = ('100644', '100755')
 
 
 class ArchiveRefused(RuntimeError):
     pass
 
 
-def tracked_files(root: Path = ROOT) -> list[str]:
-    output = subprocess.run(['git', 'ls-files', '-z'], cwd=root, check=True, capture_output=True).stdout
-    return sorted(name for name in output.decode('utf-8').split('\0') if name)
+def _git(root: Path, *args: str, stdin: bytes | None = None) -> bytes:
+    return subprocess.run(['git', *args], cwd=root, check=True, capture_output=True, input=stdin).stdout
+
+
+def committed_files(root: Path = ROOT) -> list[tuple[str, str, bytes | None]]:
+    """(path, mode, content) for every file of HEAD, sorted; content is None for a link or submodule."""
+    rows = []
+    for record in _git(root, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD').split(b'\0'):
+        if record:
+            meta, path = record.split(b'\t', 1)
+            mode, kind, oid = meta.decode('ascii').split()
+            rows.append((path.decode('utf-8'), mode, kind, oid))
+    rows.sort()
+    blobs = [row for row in rows if row[1] in REGULAR_FILE_MODES and row[2] == 'blob']
+    output = _git(root, 'cat-file', '--batch', stdin=b''.join(oid.encode('ascii') + b'\n' for *_, oid in blobs))
+    contents, position = {}, 0
+    for path, _mode, _kind, oid in blobs:
+        line_end = output.index(b'\n', position)
+        found, kind, size = output[position:line_end].decode('ascii').split()
+        if found != oid or kind != 'blob':
+            raise ArchiveRefused(f'git returned {found} {kind} for {path}')
+        start = line_end + 1
+        contents[path] = output[start:start + int(size)]
+        position = start + int(size) + 1
+    return [(path, mode, contents.get(path)) for path, mode, _kind, _oid in rows]
 
 
 def head_commit(root: Path = ROOT) -> str:
@@ -75,14 +119,23 @@ def verify(archive: Path, label: str, entries: list[tuple[str, bytes]]) -> None:
                 raise ArchiveRefused(f'Archive entry {name} does not match its source.')
 
 
-def screen(name: str, content: bytes) -> str | None:
+def screen(name: str, content: bytes | None, mode: str = '100644') -> str | None:
     """Why ``name`` must not ship, or None."""
+    if mode == '120000':
+        return 'a symbolic link (its target is outside the commit)'
+    if mode not in REGULAR_FILE_MODES or content is None:
+        return 'a submodule or other non-file entry'
     if FORBIDDEN_NAMES.search(name):
-        return 'a data, settings or key file name'
-    if PRIVATE_KEY.search(content):
-        return 'a private key block'
-    if SECRET_CONTENT.search(content):
-        return 'a credential-shaped assignment'
+        return 'a data, settings, log or key file name'
+    if content.startswith(SQLITE_MAGIC):
+        return 'an SQLite database'
+    # UTF-16 text (PowerShell's default output) hides a match behind NUL bytes; check without them too.
+    for text in (content, content.replace(b'\0', b'')) if b'\0' in content else (content,):
+        if PRIVATE_KEY.search(text):
+            return 'a private key block'
+        for pattern in (ASSIGNMENT_QUOTED, ASSIGNMENT_BARE):
+            if any(SECRET_NAME.search(found.group(1)) for found in pattern.finditer(text)):
+                return 'a credential-shaped assignment'
     return None
 
 
@@ -90,14 +143,9 @@ def build(out_dir: Path, label: str, root: Path = ROOT) -> dict:
     dirty = dirty_files(root)
     if dirty:
         raise ArchiveRefused('Archive not written. Commit or discard these changes first:\n  ' + '\n  '.join(dirty))
-    files = tracked_files(root)
     entries, refused = [], []
-    for name in files:
-        path = root / name
-        if not path.is_file():
-            continue     # deleted in the working tree but still tracked: archive what exists
-        content = path.read_bytes()
-        reason = screen(name, content)
+    for name, mode, content in committed_files(root):
+        reason = screen(name, content, mode)
         if reason:
             refused.append(f'{name}: {reason}')
             continue
@@ -106,10 +154,10 @@ def build(out_dir: Path, label: str, root: Path = ROOT) -> dict:
         raise ArchiveRefused('Archive not written. These files must not ship:\n  ' + '\n  '.join(refused))
     out_dir.mkdir(parents=True, exist_ok=True)
     archive = out_dir / f'{label}.zip'
-    with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
+    with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_STORED) as bundle:
         for name, content in entries:
             info = zipfile.ZipInfo(f'{label}/{name}', date_time=FIXED_TIME)
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = zipfile.ZIP_STORED
             info.external_attr = 0o644 << 16
             bundle.writestr(info, content)
     try:
@@ -123,6 +171,7 @@ def build(out_dir: Path, label: str, root: Path = ROOT) -> dict:
         'archive': archive.name, 'archive_sha256': digest, 'archive_bytes': archive.stat().st_size,
         'files': [{'path': name, 'bytes': len(content), 'sha256': hashlib.sha256(content).hexdigest()}
                   for name, content in entries],
+        'source': 'git objects of the commit, not the working tree',
         'excluded_by_design': 'untracked files: portfolio databases, settings, logs, saved keys, virtual '
                               'environments and build output',
     }

@@ -29,9 +29,9 @@ def _n(value, places: int = 4) -> str:
 
 
 def series_table(series: dict, budget: str = '25') -> list[str]:
-    rows = ['| Split | Bars | Cycles | Net | Fees | Gross before fees | Fees / gains before fees | Worst | Max drawdown '
-            '| Exposure % | Doubled net (cycles) | Severe net (cycles) |',
-            '|---|---|---|---|---|---|---|---|---|---|---|---|']
+    rows = ['| Split | Bars | Cycles | Net | Net with an open holding marked | Fees | Gross before fees '
+            '| Fees / gains before fees | Worst | Max drawdown | Exposure % | Doubled net (cycles) | Severe net (cycles) |',
+            '|---|---|---|---|---|---|---|---|---|---|---|---|---|']
     per_budget = series['by_budget'].get(budget, {})
     for split in SPLITS:
         result = per_budget.get(split)
@@ -40,7 +40,8 @@ def series_table(series: dict, budget: str = '25') -> list[str]:
         start, end = series['splits'][split]
         base = result['strategy']['baseline']
         doubled, severe = result['strategy']['doubled'], result['strategy']['severe']
-        rows.append(f"| {split} | {end - start} | {base['closed_cycles']} | {_n(base['net'])} | {_n(base['fees'])} "
+        rows.append(f"| {split} | {end - start} | {base['closed_cycles']} | {_n(base['net'])} "
+                    f"| {_n(base.get('net_marked'))} | {_n(base['fees'])} "
                     f"| {_n(base['gross_pnl_before_fees'])} | {_n(base['fees_share_of_gross_gains'], 3)} "
                     f"| {_n(base['worst'])} | {_n(base['max_drawdown'])} | {_n(base['exposure_pct_of_time'], 1)} "
                     f"| {_n(doubled['net'])} ({doubled['closed_cycles']}) | {_n(severe['net'])} ({severe['closed_cycles']}) |")
@@ -48,7 +49,7 @@ def series_table(series: dict, budget: str = '25') -> list[str]:
 
 
 def baseline_table(series: dict, budget: str = '25') -> list[str]:
-    rows = ['| Split | Strategy net | Cash | Buy and hold | Random entries mean (sd, n) | Strategy percentile '
+    rows = ['| Split | Strategy net, marked | Cash | Buy and hold | Random entries mean (sd, n), marked | Strategy percentile '
             '| Always enter net (cycles) | Unchanged ATB rapid |',
             '|---|---|---|---|---|---|---|---|']
     per_budget = series['by_budget'].get(budget, {})
@@ -64,7 +65,8 @@ def baseline_table(series: dict, budget: str = '25') -> list[str]:
         atb_text = (f"{_n(atb.get('return_pct'), 2)} % of 10,000, {atb.get('closed_trades')} trades"
                     if isinstance(atb, dict) and 'return_pct' in atb else str(atb))
         always = b['always_enter']
-        rows.append(f"| {split} | {_n(result['strategy']['baseline']['net'])} | 0 | {_n(b['buy_and_hold'])} "
+        strategy_net = result['strategy']['baseline'].get('net_marked', result['strategy']['baseline']['net'])
+        rows.append(f"| {split} | {_n(strategy_net)} | 0 | {_n(b['buy_and_hold'])} "
                     f"| {random_text} | {_n(rnd['strategy_percentile'], 1) if rnd['repetitions'] else 'n/a'} "
                     f"| {_n(always['net'])} ({always['closed_cycles']}) | {atb_text} |")
     return rows

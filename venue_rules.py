@@ -18,7 +18,9 @@ Sources and semantics (checked 2026-10-26; recheck when the venue changes):
   minimum is ``quoteAmountPrecisionMarket`` ("min order amount in market
   order") and the market maximum ``maxQuoteAmountMarket``; CCXT leaves both in
   ``info`` only, so they are read from there. ``status``: 1 online, 2 pause,
-  3 offline. ``tradeSideType``: 1 all, 2 buy only, 3 sell only, 4 close.
+  3 offline. ``tradeSideType``: 1 all, 2 buy only, 3 sell only, 4 close. A
+  value outside these allows sells only: a holding can still be closed, but
+  no entry opens on a side rule the code cannot read.
   ``makerCommission``/``takerCommission`` in ``exchangeInfo`` are the public
   schedule, not this account's rate (that needs the signed ``/api/v3/tradeFee``
   endpoint, which this code never calls).
@@ -129,9 +131,10 @@ class VenueRules:
         return self.max_cost_market if self.max_cost_market is not None else self.max_cost_limit
 
     def age_seconds(self, now: float) -> float | None:
-        if self.loaded_at is None:
+        """Seconds since the rules were loaded, or None when that cannot be known (a future or unreadable time)."""
+        if self.loaded_at is None or not math.isfinite(now) or not math.isfinite(self.loaded_at) or now < self.loaded_at:
             return None
-        return max(0.0, now - self.loaded_at)
+        return now - self.loaded_at
 
     def tradable(self, side: str, *, now: float | None = None, max_age_seconds: float | None = None) -> tuple[bool, str | None, str]:
         """``(ok, code, detail)`` for a market order on ``side`` ('BUY' or 'SELL')."""
@@ -140,7 +143,7 @@ class VenueRules:
         if self.active is not True:
             return False, MARKET_INACTIVE, f'{self.symbol} is not trading ({self.status})'
         allowed = {'all': ('BUY', 'SELL'), 'buy_only': ('BUY',), 'sell_only': ('SELL',),
-                   'close_only': ('SELL',), 'unknown': ('BUY', 'SELL')}[self.side_permission]
+                   'close_only': ('SELL',), 'unknown': ('SELL',)}[self.side_permission]   # unreadable: exit only
         if side not in allowed:
             return False, SIDE_NOT_ALLOWED, f'{self.symbol} accepts {self.side_permission.replace("_", " ")} orders'
         if self.market_orders is False:
@@ -149,7 +152,7 @@ class VenueRules:
             return False, COST_BUY_UNSUPPORTED, f'{self.symbol} does not accept market buys by quote amount'
         if max_age_seconds is not None and now is not None:
             age = self.age_seconds(now)
-            if age is None or age > max_age_seconds:
+            if age is None or not age <= max_age_seconds:         # NaN limits fail too
                 return False, METADATA_STALE, f'{self.symbol} market rules are older than {max_age_seconds:.0f} s'
         return True, None, ''
 

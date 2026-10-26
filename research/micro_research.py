@@ -21,14 +21,18 @@ Execution model (fixed before any result was seen; see ``PROTOCOL``):
 * While a cycle is open, each later bar is evaluated three times, in a
   pessimistic order: at the bar's low (where only loss, time and regime exits
   may act), then at its high (where profit exits may act), then at its close.
-  A bar that touched both a stop and a target is a stop.
+  A bar that touched both a stop and a target is a stop. A profit exit that
+  fires at the high is filled at the LOWEST price in the bar's range at which
+  it fires (a ticking engine sells at the first such price on the way up),
+  never at the high itself.
 * Market orders only, taker fees on both legs (the larger of the configured
   rate and the public schedule), billed in the quote asset. There is no maker
   simulation, so nothing fills because a price was touched.
 * One shared cash balance per series run; the wallet is never reset between
   cycles; a holding that cannot be sold at the end is valued at its last
   executable estimate and reported as open, never force-sold at a fictitious
-  price.
+  price. The verdict counts that open holding at its estimate (``net_marked``),
+  so a loss still open at the end of a split is not left out.
 
 Baselines: cash (no trade); passive buy-and-hold of the same budget over the
 same split with the same costs; random entries (same number of entries as the
@@ -38,8 +42,10 @@ the pure cost of churning); and the unchanged ATB rapid strategy
 (``strategy.backtest`` on the same 1m/5m bars, its own sizing).
 
 Stresses: baseline costs, doubled (fee x2, latency x2, spread x2, depth / 2)
-and severe (fee x3, latency 15 bps, spread x4, depth / 10). They are replays
-of the same bars, correlated with each other, not independent samples.
+and severe (fee x3, latency 15 bps, spread x4, depth / 10). The fee multiple
+applies to the fee actually modeled (the larger of the configured rate and the
+venue's public taker rate), in exact decimals. They are replays of the same
+bars, correlated with each other, not independent samples.
 
 Budgets: 10, 15 and 25 USDT run through the production sizing component. 50
 USDT is above the micro cap: the sizing component refuses it by design
@@ -53,20 +59,26 @@ deviations, and stays positive under the doubled stress. Synthetic fixtures
 can never demonstrate an edge; their verdict is always MECHANICS ONLY.
 
 DATA FORMAT for ``--data``: one ``<BASE>_<QUOTE>_1m.json`` per pair holding
-``{"provenance": {...}, "ohlcv": [[ms, o, h, l, c, v], ...]}`` from a public
-endpoint (``research/collect_public_ohlcv.py`` writes this), plus an optional
-``<BASE>_<QUOTE>_market.json`` with the CCXT market. Without recorded depth
-the harness models the book from the bar (spread and depth assumptions are
-written into every result).
+``{"provenance": {"venue": "mexc" | "kraken", ...}, "market": {...}, "ohlcv":
+[[ms, o, h, l, c, v], ...]}`` from a public endpoint
+(``research/collect_public_ohlcv.py`` writes this). The CCXT market may
+instead sit beside it as ``<BASE>_<QUOTE>_market.json``; a pair with neither,
+or with no supported venue, is refused, because the venue's rules and price
+tick decide what can be traded. Without recorded depth the harness models the
+book from the bar at the market's own tick; the book model, the decision
+parameters and the code identity are written into every result. A split too
+short to hold a full cycle is reported as not run, never indexed.
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import math
 import random
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -86,13 +98,20 @@ from research import micro_fixtures as fx   # noqa: E402
 from strategy import backtest as atb_backtest, frame_from_ohlcv   # noqa: E402
 
 PROTOCOL = {
-    'version': 'micro-research-v1',
+    'version': 'micro-research-v2',      # v1 filled profit exits at the bar's high
     'frozen_before_results': True,
     'splits': {'development': 0.6, 'validation': 0.2, 'holdout': 0.2},
     'embargo_bars': 120,
     'warmup_bars_1m': 120,
     'decision': 'every completed 1m bar; execution at the next bar open book',
-    'exit_path': 'low, then high, then close of each held bar (pessimistic)',
+    'exit_path': 'low (loss, time and regime exits), then high (profit exits), then close of each held bar',
+    'profit_exit_fill': 'the lowest price in the bar range at which the profit exit fires, never the high',
+    'stress_fee': 'the multiple applies to the modeled fee, max(configured, public taker), in decimals',
+    'open_at_end': 'counted at its executable estimate in net_marked, which the verdict reads',
+    'min_split_bars': 60,
+    'buy_and_hold_exit_stress_bps': 80,
+    'random_pick_multiplier': 4,
+    'book_model': 'modeled from each bar at the market tick: spread_bps, level_quote and levels per series',
     'orders': 'market only, taker fee both legs, quote-billed',
     'settings': {'micro_budget_usdt': 25, 'micro_max_cycles': 1, 'micro_target_net_bps': 20, 'micro_max_loss_bps': 120,
                  'micro_max_hold_minutes': 30, 'micro_cooldown_seconds': 60, 'micro_latency_bps': 3,
@@ -110,9 +129,31 @@ PROTOCOL = {
 
 
 def protocol_hash() -> str:
-    payload = json.dumps({'protocol': PROTOCOL, 'features': strat.FEATURE_VERSION, 'decision': strat.DECISION_VERSION},
-                         sort_keys=True).encode()
+    """The protocol, the two version labels and every decision parameter the run uses (micro.py constants too)."""
+    payload = json.dumps({'protocol': PROTOCOL, 'features': strat.FEATURE_VERSION, 'decision': strat.DECISION_VERSION,
+                          'params': dataclasses.asdict(params())}, sort_keys=True, default=str).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+CODE_FILES = ('micro.py', 'micro_strategy.py', 'micro_economics.py', 'micro_book.py', 'venue_rules.py', 'money.py',
+              'strategy.py', 'research/micro_research.py', 'research/micro_fixtures.py')
+
+
+def code_identity() -> dict:
+    """The code a result came from: a SHA-256 of the decision and research files, and the commit when git can say."""
+    digest = hashlib.sha256()
+    for name in CODE_FILES:
+        digest.update(name.encode() + b'\0' + (ROOT / name).read_bytes() + b'\0')
+    identity = {'files': list(CODE_FILES), 'files_sha256': digest.hexdigest(), 'commit': None, 'dirty': None}
+    try:
+        head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT, capture_output=True, text=True, timeout=10)
+        status = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no', '--', *CODE_FILES], cwd=ROOT,
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return identity
+    if head.returncode == 0 and status.returncode == 0 and head.stdout.strip():
+        identity['commit'], identity['dirty'] = head.stdout.strip(), bool(status.stdout.strip())
+    return identity
 
 
 @dataclass(frozen=True)
@@ -188,14 +229,26 @@ def feature_cache(series: fx.SeriesMarket, rows_1m, rows_5m) -> list:
 def book(series: fx.SeriesMarket, price: float, ms: int, scenario: Scenario, seq: int):
     raw = series.book_at(price, now_ms=ms, sequence=seq, depth_scale=scenario.depth_mult,
                          spread_scale=scenario.spread_mult)
-    return micro_book.from_ccxt_order_book(raw, exchange='mexc', symbol=series.symbol, received_wall=ms / 1000,
+    return micro_book.from_ccxt_order_book(raw, exchange=series.venue, symbol=series.symbol, received_wall=ms / 1000,
                                            received_mono=ms / 1000, source='fixture')
 
 
 def rules_for(series: fx.SeriesMarket, loaded_at: float) -> venue_rules.VenueRules:
+    """The series' venue rules, normalized for its own venue (both CCXT clients use TICK_SIZE precision)."""
     market = series.market or fx.mexc_market(series.symbol)
-    return venue_rules.normalize(market, exchange='mexc', symbol=series.symbol, loaded_at=loaded_at,
-                                 source='research fixture catalogue')
+    return venue_rules.normalize(market, exchange=series.venue, symbol=series.symbol, loaded_at=loaded_at,
+                                 source='research catalogue')
+
+
+def scenario_cost(rules: venue_rules.VenueRules, scenario: Scenario) -> econ.CostModel:
+    """The baseline cost model with the scenario's fee multiple applied to the fee actually modeled."""
+    cfg = PROTOCOL['settings']
+    base = econ.cost_model(configured_fee_pct=cfg['fee_pct'], configured_slippage_pct=cfg['slippage_pct'],
+                           latency_bps=scenario.latency_bps, rules=rules)
+    if scenario.fee_mult == 1:
+        return base
+    return replace(base, taker_fee=money.mul(base.taker_fee, money.parse(scenario.fee_mult)),
+                   fee_source=f'{base.fee_source} x{scenario.fee_mult} ({scenario.name} stress)')
 
 
 # -------------------------------------------------------------- simulation
@@ -231,8 +284,7 @@ def run(series: fx.SeriesMarket, cache: list, rows_1m: list, *, start: int, end:
     cfg = PROTOCOL['settings']
     loaded = rows_1m[start][0] / 1000
     rules = rules_for(series, loaded)
-    cost = econ.cost_model(configured_fee_pct=cfg['fee_pct'] * scenario.fee_mult, configured_slippage_pct=cfg['slippage_pct'],
-                           latency_bps=scenario.latency_bps, rules=rules)
+    cost = scenario_cost(rules, scenario)
     target_net = money.mul(budget, money.bps(money.parse(cfg['micro_target_net_bps'])))
     cycles: list[Cycle] = []
     open_cycle: Cycle | None = None
@@ -247,23 +299,36 @@ def run(series: fx.SeriesMarket, cache: list, rows_1m: list, *, start: int, end:
         features, reason = cache[i]
         if open_cycle is not None:
             # Pessimistic intra-bar order on the bar that just completed (bar i): low, high, close.
-            for label, price in (('low', rows_1m[i][3]), ('high', rows_1m[i][2]), ('close', rows_1m[i][4])):
+            prior = cache[i - 1][0] if i > 0 else None
+
+            def assess(price, peak):
                 snapshot = book(series, price, close_ms, scenario, seq)
                 estimate = econ.estimate_exit(owned_base=open_cycle.owned, basis_quote=open_cycle.basis, rules=rules,
                                               book=snapshot, cost=cost, target_net=open_cycle.target_net,
                                               uncertainty_bps=money.parse(max(p.uncertainty_floor_bps, scenario.latency_bps)))
                 regime = None
-                prior = cache[i - 1][0] if i > 0 else None
                 if prior is not None:
                     regime, _ = strat.classify_regime(prior, spread_bps=float(snapshot.spread_bps), depth_ok=True,
                                                       data_fresh=True, params=p)
                 verdict = strat.evaluate_exit(estimate=estimate.as_dict(), depth_model=estimate.depth_model,
                                               target_net=open_cycle.target_net, stop_net=open_cycle.stop_net,
-                                              peak_est_net=open_cycle.peak, opened_wall=open_cycle.entry_bar * 60.0,
+                                              peak_est_net=peak, opened_wall=open_cycle.entry_bar * 60.0,
                                               max_hold_s=p.max_hold_s, regime=regime, now=(i + 1) * 60.0)
+                return verdict, snapshot
+
+            for label, price in (('low', rows_1m[i][3]), ('high', rows_1m[i][2]), ('close', rows_1m[i][4])):
+                peak_before = open_cycle.peak
+                verdict, snapshot = assess(price, peak_before)
                 if verdict.new_peak is not None and (open_cycle.peak is None or verdict.new_peak > open_cycle.peak):
                     open_cycle.peak = verdict.new_peak
-                profit_trigger = verdict.trigger in ('take_profit', 'profit_protection')
+                profit_trigger = verdict.trigger in PROFIT_TRIGGERS
+                if label == 'high' and profit_trigger:
+                    # The engine sells at the first price on the way up where a profit exit fires; the high is only
+                    # an upper bound, so fill at the lowest such price in the bar's range.
+                    def fires(at, peak=peak_before):
+                        found = assess(at, peak)
+                        return found if found[0].trigger in PROFIT_TRIGGERS else None
+                    verdict, snapshot = first_profit_exit(fires, rows_1m[i][3], price)
                 if verdict.action == 'exit' and (label != 'low' or not profit_trigger):
                     _sell(open_cycle, snapshot, rules, cost, verdict.trigger, i)
                     cash = money.add(cash, open_cycle.net_out)
@@ -329,6 +394,39 @@ def run(series: fx.SeriesMarket, cache: list, rows_1m: list, *, start: int, end:
             'residual_at_end': None if open_cycle is not None else {'base': carry_base, 'basis': carry_basis}}
 
 
+PROFIT_TRIGGERS = ('take_profit', 'profit_protection')
+
+
+def first_profit_exit(fires, low: float, high: float, *, step_bps: float = 2.0, refine: int = 12):
+    """The (verdict, book) at the lowest price in [low, high] where ``fires(price)`` returns one.
+
+    The protection band can be a few basis points wide, so the range is walked
+    in steps of at most ``step_bps`` before the last step is halved ``refine``
+    times; the price found is never above where the exit first fires by more
+    than the last half-step. ``fires(high)`` must return a result.
+    """
+    found = fires(low)
+    if found is not None:
+        return found
+    steps = max(1, min(4000, math.ceil((high - low) / low * 1e4 / step_bps)))
+    below = low
+    for k in range(1, steps + 1):
+        price = high if k == steps else low + (high - low) * k / steps
+        found = fires(price)
+        if found is not None:
+            above = price
+            for _ in range(refine):
+                middle = (below + above) / 2
+                candidate = fires(middle)
+                if candidate is not None:
+                    above, found = middle, candidate
+                else:
+                    below = middle
+            return found
+        below = price
+    raise ValueError('first_profit_exit: no profit exit fires at the high')
+
+
 def _buy(symbol, sizing, snapshot, cost, bar, target_net, stop_net, candidate, *, carry_base=money.ZERO,
          carry_basis=money.ZERO) -> Cycle:
     walk = econ.walk_asks(snapshot, quote_amount=sizing.gross_quote, latency_bps=cost.latency_bps)
@@ -378,8 +476,13 @@ def summarize(result: dict, budget: Decimal, bars: int) -> dict:
     gross_pnl = sum(gross_each)
     gross_wins = sum(g for g in gross_each if g > 0)
     losses = [n for n in nets if n < 0]
+    # An open holding counts at its executable estimate; one that cannot be valued counts as lost.
+    open_mark = 0.0 if open_cycle is None else (
+        float(open_cycle.open_value) - float(open_cycle.basis) if open_cycle.open_value is not None
+        else -float(open_cycle.basis))
     return {
-        'closed_cycles': len(cycles), 'net': round(sum(nets), 6), 'gross_pnl_before_fees': round(gross_pnl, 6),
+        'closed_cycles': len(cycles), 'net': round(sum(nets), 6), 'net_marked': round(sum(nets) + open_mark, 6),
+        'open_mark': round(open_mark, 6), 'gross_pnl_before_fees': round(gross_pnl, 6),
         'fees': round(fees, 6), 'net_pct_of_budget': round(sum(nets) / float(budget) * 100, 4) if nets else 0.0,
         'average_net': round(statistics.mean(nets), 6) if nets else None,
         'sd_net': round(statistics.stdev(nets), 6) if len(nets) > 1 else None,
@@ -404,23 +507,25 @@ def summarize(result: dict, budget: Decimal, bars: int) -> dict:
 
 
 def split_bounds(n: int) -> dict:
+    """Each split's [start, end), or None when it is shorter than ``min_split_bars`` after its embargo."""
     warm = PROTOCOL['warmup_bars_1m']
-    usable = n - warm
+    usable = max(0, n - warm)
     dev_end = warm + int(usable * PROTOCOL['splits']['development'])
     val_end = dev_end + int(usable * PROTOCOL['splits']['validation'])
     embargo = PROTOCOL['embargo_bars']
-    return {'development': (warm, dev_end), 'validation': (dev_end + embargo, val_end),
-            'holdout': (val_end + embargo, n)}
+    bounds = {'development': (warm, dev_end), 'validation': (dev_end + embargo, val_end),
+              'holdout': (val_end + embargo, n)}
+    return {name: (start, end) if end - start >= PROTOCOL['min_split_bars'] else None
+            for name, (start, end) in bounds.items()}
 
 
 def buy_and_hold(series, rows_1m, start, end, scenario, budget) -> float:
-    cfg = PROTOCOL['settings']
     rules = rules_for(series, rows_1m[start][0] / 1000)
-    cost = econ.cost_model(configured_fee_pct=cfg['fee_pct'] * scenario.fee_mult, configured_slippage_pct=cfg['slippage_pct'],
-                           latency_bps=scenario.latency_bps, rules=rules)
+    cost = scenario_cost(rules, scenario)
     first = book(series, rows_1m[start][1], int(rows_1m[start][0]), scenario, 1)
     sizing = econ.size_entry(rules=rules, book=first, cost=cost, budget_cap=budget, cash_available=budget,
-                             allocation_remaining=budget, target_net=money.ZERO, exit_stress_bps=Decimal('80'),
+                             allocation_remaining=budget, target_net=money.ZERO,
+                             exit_stress_bps=money.parse(PROTOCOL['buy_and_hold_exit_stress_bps']),
                              now_wall=rows_1m[start][0] / 1000)
     if not sizing.eligible:
         return float('nan')
@@ -455,11 +560,18 @@ def evaluate_series(series: fx.SeriesMarket, *, synthetic: bool, budgets=None) -
     feature_seconds = time.perf_counter() - started
     bounds = split_bounds(len(rows_1m))
     budgets = budgets or [Decimal(str(b)) for b in PROTOCOL['budgets_sized']]
-    report = {'symbol': series.symbol, 'bars': len(rows_1m), 'splits': {k: list(v) for k, v in bounds.items()},
+    report = {'symbol': series.symbol, 'venue': series.venue, 'bars': len(rows_1m),
+              'splits': {k: list(v) if v else f'not run: fewer than {PROTOCOL["min_split_bars"]} bars after the embargo'
+                         for k, v in bounds.items()},
+              'book_model': {'spread_bps': series.spread_bps, 'level_quote': series.level_quote, 'levels': series.levels,
+                             'tick': series.tick, 'from': 'each bar (no recorded depth)'},
               'feature_seconds': round(feature_seconds, 2), 'by_budget': {}}
     for budget in budgets:
         per_budget = {}
-        for split, (start, end) in bounds.items():
+        for split, span in bounds.items():
+            if span is None:
+                continue
+            start, end = span
             bars = end - start
             per_scenario, results = {}, {}
             for name, scenario in SCENARIOS.items():
@@ -474,10 +586,10 @@ def evaluate_series(series: fx.SeriesMarket, *, synthetic: bool, budgets=None) -
                 rng = random.Random(f'{series.symbol}|{split}|{budget}')
                 candidates = list(range(start, end - 2))
                 for _ in range(PROTOCOL['random_repetitions']):
-                    picks = set(rng.sample(candidates, min(len(candidates), entries * 4)))
+                    picks = set(rng.sample(candidates, min(len(candidates), entries * PROTOCOL['random_pick_multiplier'])))
                     random_nets.append(summarize(run(series, cache, rows_1m, start=start, end=end, scenario=base,
                                                      budget=budget, policy='random', entry_bars=picks,
-                                                     max_entries=entries), budget, bars)['net'])
+                                                     max_entries=entries), budget, bars)['net_marked'])
             always = summarize(run(series, cache, rows_1m, start=start, end=end, scenario=base, budget=budget,
                                    policy='always'), budget, bars)
             per_budget[split] = {
@@ -485,11 +597,11 @@ def evaluate_series(series: fx.SeriesMarket, *, synthetic: bool, budgets=None) -
                 'baselines': {
                     'cash': 0.0,
                     'buy_and_hold': round(buy_and_hold(series, rows_1m, start, end, base, budget), 6),
-                    'random_entries': {'repetitions': len(random_nets),
+                    'random_entries': {'repetitions': len(random_nets), 'measure': 'net_marked',
                                        'mean': round(statistics.mean(random_nets), 6) if random_nets else None,
                                        'sd': round(statistics.stdev(random_nets), 6) if len(random_nets) > 1 else None,
                                        'strategy_percentile': (round(sum(1 for n in random_nets
-                                                                       if n < per_scenario['baseline']['net'])
+                                                                       if n < per_scenario['baseline']['net_marked'])
                                                                    / len(random_nets) * 100, 1) if random_nets else None)},
                     'always_enter': always,
                     'atb_rapid_unchanged': atb_rapid(rows_1m, rows_5m, start, end) if budget == budgets[-1] else 'see 25 USDT row',
@@ -506,9 +618,9 @@ def verdict(report: dict, *, synthetic: bool) -> str:
     holdout = report['by_budget'].get('25', {}).get('holdout')
     if not holdout:
         return 'NO DEMONSTRATED EDGE (no holdout)'
-    net = holdout['strategy']['baseline']['net']
+    net = holdout['strategy']['baseline']['net_marked']           # closed cycles plus a holding still open
     rnd = holdout['baselines']['random_entries']
-    doubled = holdout['strategy']['doubled']['net']
+    doubled = holdout['strategy']['doubled']['net_marked']
     if (holdout['strategy']['baseline']['closed_cycles'] and net > 0 and rnd['mean'] is not None and rnd['sd']
             and net > rnd['mean'] + 2 * rnd['sd'] and doubled > 0):
         return 'EDGE DEMONSTRATED ON THIS HOLDOUT (prospective paper evidence still required)'
@@ -559,8 +671,24 @@ def load_real(directory: Path) -> list:
         digest = hashlib.sha256(json.dumps(rows).encode()).hexdigest()
         provenance = dict(payload.get('provenance') or {})
         provenance['rows_sha256_verified'] = digest == provenance.get('rows_sha256')
-        symbol = str((payload.get('market') or {}).get('symbol') or path.stem.replace('_1m', '').replace('_', '/'))
-        series = fx.SeriesMarket.from_rows(symbol, rows, market=payload.get('market') or {})
+        market = payload.get('market')
+        sidecar = path.with_name(path.name[:-len('_1m.json')] + '_market.json')
+        if not market and sidecar.exists():
+            market = json.loads(sidecar.read_text(encoding='utf-8'))
+        if not isinstance(market, dict) or not market:
+            raise SystemExit(f'{path.name}: no market metadata (a "market" entry or {sidecar.name}); '
+                             'the venue rules and price tick decide what can trade')
+        venue = str(provenance.get('venue') or '').lower()
+        if venue not in ('mexc', 'kraken'):
+            raise SystemExit(f'{path.name}: the provenance names no supported venue (mexc or kraken)')
+        try:
+            tick = float((market.get('precision') or {})['price'])
+        except (KeyError, TypeError, ValueError):
+            tick = float('nan')
+        if not math.isfinite(tick) or tick <= 0:
+            raise SystemExit(f'{path.name}: the market has no usable price tick')
+        symbol = str(market.get('symbol') or path.stem.replace('_1m', '').replace('_', '/'))
+        series = fx.SeriesMarket.from_rows(symbol, rows, market=market, tick=tick, venue=venue)
         suite.append((series, f'real public data ({provenance.get("venue")}), book modeled from bars', provenance))
     if not suite:
         raise SystemExit(f'No *_1m.json files in {directory}')
@@ -575,7 +703,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     started = time.perf_counter()
     output = {'protocol': PROTOCOL, 'protocol_sha256': protocol_hash(), 'feature_version': strat.FEATURE_VERSION,
-              'decision_version': strat.DECISION_VERSION, 'series': [], 'cost_algebra': algebra_table()}
+              'decision_version': strat.DECISION_VERSION, 'params': dataclasses.asdict(params()),
+              'code': code_identity(), 'series': [], 'cost_algebra': algebra_table()}
     if args.data:
         suite = load_real(Path(args.data))
         output['real_data'] = [item[2] for item in suite]
@@ -588,8 +717,9 @@ def main(argv=None) -> int:
         report = evaluate_series(series, synthetic=synthetic)
         report['fixture'] = label
         output['series'].append(report)
+        holdout = report['by_budget']['25'].get('holdout')
         print(f"{series.symbol:10s} {label[:48]:48s} cycles(25, holdout, baseline)="
-              f"{report['by_budget']['25']['holdout']['strategy']['baseline']['closed_cycles']}", flush=True)
+              f"{holdout['strategy']['baseline']['closed_cycles'] if holdout else 'not run'}", flush=True)
     output['runtime_seconds'] = round(time.perf_counter() - started, 1)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

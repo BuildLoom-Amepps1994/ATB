@@ -9,7 +9,8 @@ Run it by hand; nothing schedules it and it installs nothing:
 
 Isolation comes first. Before any application module is imported the script
 refuses a data folder that already holds files or overlaps the normal
-CryptoPilot profile, sets ``CRYPTOPILOT_DATA_DIR`` to the new folder, selects
+CryptoPilot profile (or a profile the calling shell names in
+``CRYPTOPILOT_DATA_DIR``), sets ``CRYPTOPILOT_DATA_DIR`` to the new folder, selects
 the null keyring backend, turns update checks off and replaces the credential
 loader with one that returns nothing. So no saved key, setting, portfolio or
 log of a normal installation can be read, and no account call can be made:
@@ -30,6 +31,8 @@ recorded as such; the engine is stopped gracefully either way.
 ``research/micro_fixtures.py`` on the real clock (a mechanics market that
 completes cycles, plus flat markets). It exercises the real loop, threads and
 timing, never a real market; its results say nothing about profitability.
+It needs no network, so it also refuses every remote connection and proxy
+(``scripts/offline_net.py``).
 """
 from __future__ import annotations
 
@@ -49,9 +52,15 @@ ROOT = Path(__file__).resolve().parents[1]
 APP_MODULES = ('storage', 'trader', 'credentials', 'micro', 'app')
 
 
-def normal_profile() -> Path:
+def normal_profiles() -> list[tuple[Path, str]]:
+    """The default profile, and the one an inherited CRYPTOPILOT_DATA_DIR points the app at."""
     base = os.environ.get('LOCALAPPDATA') or str(Path.home() / '.cryptopilot')
-    return (Path(base) / 'CryptoPilot').expanduser().resolve()
+    profiles = [((Path(base) / 'CryptoPilot').expanduser().resolve(), 'the normal CryptoPilot profile')]
+    inherited = os.environ.get('CRYPTOPILOT_DATA_DIR')
+    if inherited:
+        profiles.append((Path(inherited).expanduser().resolve(),
+                         'the CryptoPilot profile that CRYPTOPILOT_DATA_DIR names'))
+    return profiles
 
 
 def isolate(data_dir: Path) -> Path:
@@ -60,9 +69,9 @@ def isolate(data_dir: Path) -> Path:
     if loaded:
         raise SystemExit(f'refusing: application modules were imported before isolation: {loaded}')
     data_dir = data_dir.expanduser().resolve()
-    normal = normal_profile()
-    if data_dir == normal or normal.is_relative_to(data_dir) or data_dir.is_relative_to(normal):
-        raise SystemExit(f'refusing {data_dir}: it overlaps the normal CryptoPilot profile {normal}')
+    for profile, what in normal_profiles():
+        if data_dir == profile or profile.is_relative_to(data_dir) or data_dir.is_relative_to(profile):
+            raise SystemExit(f'refusing {data_dir}: it overlaps {what} {profile}')
     if data_dir.exists() and (not data_dir.is_dir() or any(data_dir.iterdir())):
         raise SystemExit(f'refusing {data_dir}: a soak needs a NEW, empty folder')
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -74,20 +83,23 @@ def isolate(data_dir: Path) -> Path:
 
 
 def source_identity() -> dict:
-    files = sorted([*ROOT.glob('*.py'), *(ROOT / 'static').glob('*'), *(ROOT / 'research').glob('*.py')])
+    """The application, research and harness files, and the commit when git can say (else None)."""
+    files = sorted([*ROOT.glob('*.py'), *(ROOT / 'static').glob('*'), *(ROOT / 'research').glob('*.py'),
+                    *(ROOT / 'scripts').glob('*.py')])
     digest = hashlib.sha256()
     for path in files:
         if path.is_file():
             digest.update(path.relative_to(ROOT).as_posix().encode() + b'\0' + path.read_bytes() + b'\0')
-    identity = {'files': len(files), 'files_sha256': digest.hexdigest()}
+    identity = {'files': len(files), 'files_sha256': digest.hexdigest(), 'commit': None, 'dirty': None}
     try:
-        identity['commit'] = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT, capture_output=True, text=True,
-                                            timeout=10).stdout.strip() or None
-        dirty = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=ROOT,
-                               capture_output=True, text=True, timeout=10).stdout.strip()
-        identity['dirty'] = bool(dirty)
+        head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT, capture_output=True, text=True, timeout=10)
+        status = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=ROOT,
+                                capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        identity['commit'] = None
+        return identity                          # no git: the commit and its state are unknown
+    if head.returncode == 0 and status.returncode == 0 and head.stdout.strip():
+        identity['commit'] = head.stdout.strip()
+        identity['dirty'] = bool(status.stdout.strip())
     return identity
 
 
@@ -168,13 +180,19 @@ def main(argv=None) -> int:
     parser.add_argument('--pairs', default='BTC/USDT,ETH/USDT', help='comma-separated USDT pairs')
     parser.add_argument('--exchange', default='mexc', choices=('mexc', 'kraken'))
     parser.add_argument('--streaming', action='store_true', help='turn streaming quotes on (default off)')
-    parser.add_argument('--sample-seconds', type=float, default=60.0)
+    parser.add_argument('--sample-seconds', type=float, default=60.0, help='1 to 3600 (default 60)')
     parser.add_argument('--fixture', action='store_true', help='synthetic markets on the real clock (offline)')
     args = parser.parse_args(argv)
     requested_s = (args.hours * 3600.0) if args.hours is not None else (args.minutes * 60.0)
     if not 0 < requested_s <= 7 * 24 * 3600:
         raise SystemExit('the duration must be positive and at most seven days')
+    if not 1.0 <= args.sample_seconds <= 3600.0:            # also refuses NaN
+        raise SystemExit('--sample-seconds must be between 1 and 3600')
     data_dir = isolate(Path(args.data_dir))
+    if args.fixture:
+        import offline_net                                   # beside this script
+        offline_net.clear_proxies(os.environ)
+        offline_net.install()
     # The source that runs is the source read now; a checkout that changes during the run is recorded as such.
     source_at_start = source_identity()
     sys.path.insert(0, str(ROOT))
@@ -253,6 +271,7 @@ def main(argv=None) -> int:
         'source_changed_during_run': source_identity() != source_at_start,
         'profile': str(data_dir), 'mode': engine.mode, 'exchange': engine.exchange_name, 'pairs': pairs,
         'market_data': 'synthetic fixture on the real clock' if args.fixture else 'public endpoints, no account',
+        'remote_network_refused': bool(args.fixture),
         'streaming_quotes': bool(engine.cfg.get('streaming_quotes')),
         'samples': count, 'faults': faults,
         'results': final.get('results'), 'open_cycles': final.get('cycles'), 'latch': final.get('latch'),

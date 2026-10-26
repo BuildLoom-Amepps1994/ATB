@@ -97,18 +97,30 @@ def _check_step(step: Decimal) -> Decimal:
     return step
 
 
+# The quotient of a step rounding is taken at 200 digits, so a 34-digit value with a step that is not a
+# power of ten, or a parsed value longer than 34 digits, cannot round across a step boundary first.
+_QUOTIENT = Context(prec=200, rounding=ROUND_HALF_EVEN, Emax=999, Emin=-999,
+                    traps=[InvalidOperation, DivisionByZero, Overflow])
+
+
 def q_down(value: Decimal, step: Decimal) -> Decimal:
     """Largest multiple of ``step`` that is not above ``value``."""
     step = _check_step(step)
-    units = CONTEXT.divide(value, step).to_integral_value(rounding=ROUND_FLOOR)
-    return CONTEXT.multiply(units, step)
+    units = _QUOTIENT.divide(value, step).to_integral_value(rounding=ROUND_FLOOR)
+    result = CONTEXT.multiply(units, step)
+    while result > value:          # the product rounded up at 34 digits: never return more than was given
+        result = CONTEXT.subtract(result, step)
+    return result
 
 
 def q_up(value: Decimal, step: Decimal) -> Decimal:
     """Smallest multiple of ``step`` that is not below ``value``."""
     step = _check_step(step)
-    units = CONTEXT.divide(value, step).to_integral_value(rounding=ROUND_CEILING)
-    return CONTEXT.multiply(units, step)
+    units = _QUOTIENT.divide(value, step).to_integral_value(rounding=ROUND_CEILING)
+    result = CONTEXT.multiply(units, step)
+    while result < value:          # the product rounded down at 34 digits: never return less than was asked
+        result = CONTEXT.add(result, step)
+    return result
 
 
 def add(*values: Decimal) -> Decimal:

@@ -11,16 +11,20 @@ at import) or ``credentials`` (which asks keyring for a backend) can load.
   ``CRYPTOPILOT_DATA_DIR`` still cannot fall back to ``%LOCALAPPDATA%\\CryptoPilot``.
 * keyring uses its null backend, which stores nothing and returns nothing, so
   no test can read or write the operating-system credential manager.
-* Outbound connections are refused unless they go to a loopback address or a
-  local socket. The suite needs no internet; a test that tried to reach an
-  exchange, a DNS server or GitHub fails instead of silently doing so.
+* Outbound connections, datagrams and name lookups are refused unless they go
+  to a loopback address or a local socket (``scripts/offline_net.py``). The
+  suite needs no internet; a test that tried to reach an exchange, a DNS
+  server or GitHub fails instead of silently doing so.
+* Proxy variables are removed and ``NO_PROXY`` is ``*``: a proxy on loopback
+  would otherwise pass the guard and forward a request to any host.
+* Python child processes get the same guard: ``tests/offline_child`` goes
+  first on ``PYTHONPATH``, and its ``sitecustomize`` installs it at start-up.
 """
 from __future__ import annotations
 
-import ipaddress
+import importlib.util
 import os
 import shutil
-import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -40,66 +44,20 @@ os.environ['CRYPTOPILOT_NO_UPDATE_CHECK'] = '1'
 os.environ['CRYPTOPILOT_NO_BROWSER'] = '1'
 
 
-class RemoteNetworkRefused(ConnectionRefusedError):
-    """Raised when a test tries to open a connection that is not local."""
-
-
-_LOCAL_NAMES = {'localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback'}
-
-
-def _local_host(host) -> bool:
-    if host is None:
-        return True        # getaddrinfo(None, port) means a local wildcard
-    if isinstance(host, bytes):
-        host = host.decode('ascii', 'replace')
-    host = str(host).strip('[]').split('%')[0]
-    if host == '' or host.lower() in _LOCAL_NAMES:
-        return True
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return address.is_loopback or address.is_unspecified
-
-
-def _allowed(address) -> bool:
-    if isinstance(address, (str, bytes)):
-        return True        # AF_UNIX path
-    if isinstance(address, tuple) and address:
-        return _local_host(address[0])
-    return False
-
-
-_real_connect = socket.socket.connect
-_real_connect_ex = socket.socket.connect_ex
-_real_getaddrinfo = socket.getaddrinfo
-
-
-def _guarded_connect(self, address):
-    if not _allowed(address):
-        raise RemoteNetworkRefused(f'Offline test campaign refused a connection to {address!r}')
-    return _real_connect(self, address)
-
-
-def _guarded_connect_ex(self, address):
-    if not _allowed(address):
-        raise RemoteNetworkRefused(f'Offline test campaign refused a connection to {address!r}')
-    return _real_connect_ex(self, address)
-
-
-def _guarded_getaddrinfo(host, *args, **kwargs):
-    if not _local_host(host):
-        raise RemoteNetworkRefused(f'Offline test campaign refused a name lookup for {host!r}')
-    return _real_getaddrinfo(host, *args, **kwargs)
-
-
-socket.socket.connect = _guarded_connect
-socket.socket.connect_ex = _guarded_connect_ex
-socket.getaddrinfo = _guarded_getaddrinfo
+_GUARD = Path(__file__).resolve().parents[1] / 'scripts' / 'offline_net.py'
+_spec = importlib.util.spec_from_file_location('offline_net', _GUARD)
+offline_net = importlib.util.module_from_spec(_spec)
+sys.modules['offline_net'] = offline_net
+_spec.loader.exec_module(offline_net)
+RemoteNetworkRefused = offline_net.RemoteNetworkRefused
+offline_net.clear_proxies(os.environ)
+offline_net.install()
+os.environ['PYTHONPATH'] = os.pathsep.join(
+    [str(Path(__file__).resolve().parent / 'offline_child'), *filter(None, [os.environ.get('PYTHONPATH')])])
 
 
 def pytest_report_header(config):
-    return [f'cryptopilot isolation: data dir {DATA_DIR}; keyring null backend; remote networking refused']
+    return [f'cryptopilot isolation: data dir {DATA_DIR}; keyring null backend; remote networking and proxies refused, in child processes too']
 
 
 def pytest_unconfigure(config):

@@ -110,6 +110,17 @@ def test_untradable_markets_name_the_rule(info, side, code):
     assert not ok and reason == code and 'ETH/USDT' in detail
 
 
+def test_an_unreadable_side_rule_allows_an_exit_but_no_entry():
+    rules = venue_rules.normalize(mexc_market(tradeSideType='5'), exchange='mexc', symbol='ETH/USDT', loaded_at=1.0)
+    assert rules.side_permission == 'unknown'
+    assert any('tradeSideType' in issue for issue in rules.issues)
+    ok, reason, _ = rules.tradable('BUY')
+    assert not ok and reason == venue_rules.SIDE_NOT_ALLOWED
+    assert rules.tradable('SELL') == (True, None, '')
+    missing = venue_rules.normalize(mexc_market(), exchange='mexc', symbol='ETH/USDT', loaded_at=1.0)
+    assert missing.side_permission == 'all' and missing.tradable('BUY')[0]       # no field: MEXC's default
+
+
 def test_unknown_or_malformed_metadata_is_unknown_not_zero():
     market = mexc_market()
     market['limits']['amount']['min'] = 'garbage'
@@ -133,3 +144,24 @@ def test_decimal_places_precision_mode_becomes_a_step():
     rules = venue_rules.normalize(market, exchange='kraken', symbol='ETH/USDT', loaded_at=1.0,
                                   precision_mode=venue_rules.DECIMAL_PLACES)
     assert rules.amount_step == D('0.0001') and rules.price_tick == D('0.01')
+
+
+@pytest.mark.parametrize('value, step, down, up', [
+    ('5.499999999999999999999999999999999', '0.5', '5.0', '5.5'),
+    ('5.500000000000000000000000000000001', '0.5', '5.5', '6.0'),
+    ('2.99999999999999999999999999999999999999', '1', '2', '3'),
+    ('0.010000000000000000000000000000000001', '0.01', '0.01', '0.02'),
+])
+def test_step_rounding_never_crosses_its_input(value, step, down, up):
+    value, step = money.parse(value), money.parse(step)
+    assert money.q_down(value, step) == D(down) and money.q_down(value, step) <= value
+    assert money.q_up(value, step) == D(up) and money.q_up(value, step) >= value
+
+
+def test_rules_with_an_unknowable_age_are_stale():
+    rules = venue_rules.normalize(mexc_market(), exchange='mexc', symbol='ETH/USDT', loaded_at=10_000.0)
+    assert rules.tradable('BUY', now=10_030.0, max_age_seconds=60) == (True, None, '')
+    for now, limit in ((100.0, 60), (float('nan'), 60), (10_030.0, float('nan'))):     # future stamp, bad clock, bad limit
+        ok, reason, _ = rules.tradable('BUY', now=now, max_age_seconds=limit)
+        assert not ok and reason == venue_rules.METADATA_STALE, (now, limit)
+    assert rules.age_seconds(100.0) is None and rules.age_seconds(10_030.0) == 30.0

@@ -64,7 +64,7 @@ def test_recovery_report_excludes_secrets_and_preserves_database(recovery_data):
     original_db = storage.DB_PATH.read_bytes()
     original_config = storage.CONFIG_PATH.read_bytes()
     result = recovery.report(recovery_data)
-    assert result['schema_version'] == 3
+    assert result['schema_version'] == 4
     assert result['unresolved_order_count'] == 1
     assert result['unresolved_orders'][0]['intent_id'] == intent
     assert result['unresolved_orders'][0]['status'] == 'uncertain'
@@ -117,7 +117,7 @@ def test_cli_output_is_new_file_outside_data_folder(recovery_data, tmp_path, cap
     target = recovery_data.parent / (recovery_data.name + '-report.json')
     try:
         assert recovery.main(['--output', str(target)]) == 0
-        assert json.loads(target.read_text())['schema_version'] == 3
+        assert json.loads(target.read_text())['schema_version'] == 4
         capsys.readouterr()
         original = target.read_bytes()
         assert recovery.main(['--output', str(target)]) == 1

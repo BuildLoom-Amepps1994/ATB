@@ -1,0 +1,1704 @@
+"""Autonomous PAPER micro-trading cycles: buy about 25 USDT, take a small net gain or a bounded loss, repeat.
+
+The manager runs on the engine's worker thread when the selected strategy
+horizon is ``micro``. Each tick it
+
+1. refuses to do anything unless the engine is in PAPER mode (``micro_policy``),
+2. manages every open cycle first: a fresh validated order book (or, failing
+   that, a fresh top-of-book quote for safety exits only), an after-cost exit
+   estimate, the exit policy, and a market sell through the engine's single
+   risk gate and submit path,
+3. refreshes slower completed-bar context (1m features, 5m regime) after each
+   bar closes, re-checking open cycles between downloads,
+4. evaluates new entries only for the pairs the operator selected, through one
+   sizing component (``micro_economics``) and the strategy rules
+   (``micro_strategy``), reserving cash atomically before an order intent
+   exists.
+
+A cycle is a durable row in ``micro_cycles`` with an explicit state machine
+(``TRANSITIONS``). Order intents carry ``decision_id = cycle_id``, so the
+order journal and the cycle always correlate. A fill, the journal's
+``accounted`` transition, the ledger rows, the cycle state and the reservation
+release commit in one SQLite transaction; a crash can leave an order without
+its booking (resolved later from the paper venue's durable record, with a
+read-only explanation and an operator confirmation) but never a booking
+without its cycle state.
+
+Nothing here can submit to a real venue: the only client is the in-process
+``micro_venue.MicroPaperVenue`` and every boundary asks ``micro_policy``.
+"""
+from __future__ import annotations
+
+import json
+import math
+import threading
+import time
+import uuid
+from collections import Counter, deque
+from datetime import datetime, timezone
+from decimal import Decimal
+
+import micro_book
+import micro_economics as econ
+import micro_policy
+import micro_strategy as strat
+import micro_venue
+import money
+import observability
+import storage
+import venue_rules
+
+STATES = ('ENTRY_RESERVED', 'ENTRY_SUBMITTED', 'ENTRY_UNKNOWN', 'HOLDING', 'EXIT_SUBMITTED', 'EXIT_UNKNOWN',
+          'REVIEW', 'CLOSED', 'ABANDONED')
+TERMINAL = ('CLOSED', 'ABANDONED')
+ENTRY_STATES = ('ENTRY_RESERVED', 'ENTRY_SUBMITTED', 'ENTRY_UNKNOWN')
+OWNING_STATES = ('HOLDING', 'EXIT_SUBMITTED', 'EXIT_UNKNOWN')
+BLOCKING_STATES = ('ENTRY_UNKNOWN', 'EXIT_UNKNOWN', 'REVIEW')
+TRANSITIONS = {
+    'ENTRY_RESERVED': {'ENTRY_SUBMITTED', 'ABANDONED', 'REVIEW'},
+    'ENTRY_SUBMITTED': {'HOLDING', 'ABANDONED', 'ENTRY_UNKNOWN', 'REVIEW'},
+    'ENTRY_UNKNOWN': {'HOLDING', 'ABANDONED', 'REVIEW'},
+    'HOLDING': {'EXIT_SUBMITTED', 'CLOSED', 'REVIEW'},
+    'EXIT_SUBMITTED': {'HOLDING', 'CLOSED', 'EXIT_UNKNOWN', 'REVIEW'},
+    'EXIT_UNKNOWN': {'HOLDING', 'CLOSED', 'REVIEW'},
+    'REVIEW': {'HOLDING', 'CLOSED', 'ABANDONED'},
+    'CLOSED': set(), 'ABANDONED': set(),
+}
+REVIEW_PHRASE = 'I HAVE REVIEWED THIS CYCLE'
+RESUME_PHRASE = 'RESUME TRADING'
+
+# Fixed research defaults of the strategy (documented in docs/ATB_MICRO_ECONOMICS.md).
+UNCERTAINTY_FLOOR_BPS = 5.0
+MAX_VOL_BPS = 60.0
+MIN_EFFICIENCY_TREND = 0.35
+MAX_EFFICIENCY_RANGE = 0.25
+EDGE_RATIO = 0.6
+MAX_SPREAD_BPS = 20.0
+BOOK_LEVELS = 20
+ENTRY_BOOK_SECONDS = 3.0          # a flat pair's book is refreshed this often while a setup is plausible
+IDLE_BOOK_SECONDS = 30.0          # otherwise only this often (eligibility display)
+EXIT_RETRY_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
+CATALOGUE_MAX_AGE_S = 2 * 3600.0
+ENTRIES_PER_TICK = 1
+RECONCILE_WINDOW_S = 6 * 3600.0  # venue records this recent are compared with the journal before an entry
+LATE_FILL_CHECK_S = 30.0         # how often a partially filled holding re-reads its venue orders
+CONTEXT_RETRY_S = 5.0            # a candle frame that lacks the last closed bar is read again after this
+
+SCHEMA = (
+    '''CREATE TABLE IF NOT EXISTS micro_cycles (
+        cycle_id TEXT PRIMARY KEY, exchange TEXT NOT NULL, mode TEXT NOT NULL, symbol TEXT NOT NULL,
+        state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
+        strategy TEXT, decision_id TEXT, opportunity_key TEXT NOT NULL, budget_cap TEXT NOT NULL,
+        reserved_quote TEXT NOT NULL DEFAULT '0', sizing TEXT,
+        entry_intent_id TEXT, entry_order_id TEXT, entry_filled_base TEXT, entry_gross TEXT, entry_fee_quote TEXT,
+        entry_fee_base TEXT, entry_fee_other TEXT, entry_fee_status TEXT, entry_debit TEXT, entry_partial INTEGER,
+        entry_price TEXT, opened_at TEXT, opened_wall REAL,
+        carried_base TEXT NOT NULL DEFAULT '0', carried_basis TEXT NOT NULL DEFAULT '0',
+        owned_base TEXT NOT NULL DEFAULT '0', basis_quote TEXT NOT NULL DEFAULT '0',
+        target_net TEXT, stop_net TEXT, max_hold_s REAL, peak_est_net TEXT,
+        exit_count INTEGER NOT NULL DEFAULT 0, closed_base TEXT NOT NULL DEFAULT '0',
+        exit_gross TEXT NOT NULL DEFAULT '0', exit_fees TEXT NOT NULL DEFAULT '0',
+        exit_proceeds_net TEXT NOT NULL DEFAULT '0', realized_net TEXT NOT NULL DEFAULT '0',
+        realized_status TEXT, last_exit_trigger TEXT, closed_at TEXT, closed_wall REAL,
+        residual_base TEXT NOT NULL DEFAULT '0', residual_basis TEXT NOT NULL DEFAULT '0',
+        last_reason TEXT, review_reason TEXT)''',
+    # One open cycle per pair, and one cycle per opportunity, even across restarts.
+    '''CREATE UNIQUE INDEX IF NOT EXISTS micro_one_open_cycle ON micro_cycles(exchange, mode, symbol)
+        WHERE state NOT IN ('CLOSED', 'ABANDONED')''',
+    'CREATE UNIQUE INDEX IF NOT EXISTS micro_one_cycle_per_opportunity ON micro_cycles(exchange, mode, opportunity_key)',
+    'CREATE INDEX IF NOT EXISTS micro_cycles_recent ON micro_cycles(exchange, mode, closed_wall)',
+    '''CREATE TABLE IF NOT EXISTS micro_cycle_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id TEXT NOT NULL, at TEXT NOT NULL,
+        from_state TEXT, to_state TEXT NOT NULL, reason TEXT NOT NULL, data TEXT)''',
+    'CREATE INDEX IF NOT EXISTS micro_cycle_events_cycle ON micro_cycle_events(cycle_id, id)',
+)
+
+
+def ensure_schema(db) -> None:
+    for statement in SCHEMA:
+        db.execute(statement)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+
+
+def _dec(value, default: Decimal | None = None) -> Decimal | None:
+    if value is None or value == '':
+        return default
+    try:
+        return money.parse(value, field='stored amount', allow_negative=True)
+    except money.MoneyError:
+        return default
+
+
+class CycleError(RuntimeError):
+    """An illegal cycle transition or a cycle that changed underneath an update."""
+
+
+# ---------------------------------------------------------------------- store
+def transition(db, cycle: dict, to_state: str, reason: str, *, data: dict | None = None, **fields) -> dict:
+    """Move ``cycle`` to ``to_state`` inside the caller's transaction (optimistic version check)."""
+    current = db.execute('SELECT state, version FROM micro_cycles WHERE cycle_id=?', (cycle['cycle_id'],)).fetchone()
+    if current is None:
+        raise CycleError('cycle does not exist')
+    if current['version'] != cycle['version'] or current['state'] != cycle['state']:
+        raise CycleError(f'cycle changed underneath this update ({current["state"]} v{current["version"]})')
+    if to_state != current['state'] and to_state not in TRANSITIONS[current['state']]:
+        raise CycleError(f'illegal cycle transition {current["state"]} -> {to_state}')
+    stamp = _now_iso()
+    values = {**fields, 'state': to_state, 'updated_at': stamp, 'version': cycle['version'] + 1,
+              'last_reason': str(reason)[:300]}
+    assignments = ','.join(f'{name}=?' for name in values)
+    db.execute(f'UPDATE micro_cycles SET {assignments} WHERE cycle_id=?', (*values.values(), cycle['cycle_id']))
+    db.execute('INSERT INTO micro_cycle_events(cycle_id, at, from_state, to_state, reason, data) VALUES (?,?,?,?,?,?)',
+               (cycle['cycle_id'], stamp, current['state'], to_state, str(reason)[:300],
+                json.dumps(data, default=str, allow_nan=False) if data else None))
+    updated = dict(cycle)
+    updated.update(values)
+    return updated
+
+
+def load_cycle(cycle_id: str) -> dict | None:
+    found = storage.rows('SELECT * FROM micro_cycles WHERE cycle_id=?', (cycle_id,))
+    return found[0] if found else None
+
+
+def open_cycles(exchange: str, mode: str) -> list[dict]:
+    return storage.rows("SELECT * FROM micro_cycles WHERE exchange=? AND mode=? AND state NOT IN ('CLOSED','ABANDONED') "
+                        'ORDER BY created_at', (exchange, mode))
+
+
+def cycle_events(cycle_id: str) -> list[dict]:
+    return storage.rows('SELECT * FROM micro_cycle_events WHERE cycle_id=? ORDER BY id', (cycle_id,))
+
+
+# -------------------------------------------------------------------- manager
+class MicroManager:
+    def __init__(self, engine):
+        self.engine = engine
+        self.lock = threading.RLock()
+        self.metrics = observability.METRICS
+        self._venue = None
+        self._venue_exchange = None
+        self.books = micro_book.BookTracker(max_age_s=30.0)
+        self.context: dict[str, dict] = {}          # symbol -> features, regime and bar time
+        self.rules_cache: dict[str, venue_rules.VenueRules] = {}
+        self.rules_loaded_at: float | None = None
+        self.pairs: dict[str, dict] = {}             # dashboard rows per pair
+        self.counters: Counter = Counter()           # dominant waiting reason codes
+        self.waiting_since: dict[str, float] = {}
+        self.last_codes: dict[str, str] = {}
+        self.exit_backoff: dict[str, tuple[int, float]] = {}
+        self.decisions: deque = deque(maxlen=300)
+        self.recovery: list[dict] = []
+        self.last_tick = self.last_error = None
+        self.tick_count = 0
+        self._next_book: dict[str, float] = {}
+        self._flatten = threading.Event()
+        self._late_checked: dict[str, float] = {}
+        self._conflicts: dict[str, tuple[float, list]] = {}
+
+    # ------------------------------------------------------------ plumbing
+    @property
+    def venue(self) -> micro_venue.MicroPaperVenue:
+        """The durable paper venue of the engine's current exchange (rebuilt when the exchange changes)."""
+        engine = self.engine
+        if self._venue is None or self._venue_exchange != engine.exchange_name:
+            self._venue = micro_venue.MicroPaperVenue(engine.exchange_name, rules=self.rules,
+                                                      balances=engine._paper_balances)
+            self._venue_exchange = engine.exchange_name
+            self.books = micro_book.BookTracker(max_age_s=30.0)
+            self.context.clear()
+            self.rules_cache.clear()
+            self.pairs.clear()
+        return self._venue
+
+    def active(self) -> bool:
+        return micro_policy.is_micro(horizon=self.engine.cfg.get('time_horizon'))
+
+    def _key(self, name: str) -> str:
+        return storage.scope_key(f'micro.paper.{name}', self.engine.exchange_name)
+
+    def params(self) -> strat.MicroParams:
+        cfg = self.engine.cfg
+        return strat.MicroParams(
+            target_net_bps=float(cfg['micro_target_net_bps']), max_loss_bps=float(cfg['micro_max_loss_bps']),
+            max_hold_s=float(cfg['micro_max_hold_minutes']) * 60.0, uncertainty_floor_bps=UNCERTAINTY_FLOOR_BPS,
+            max_spread_bps=min(float(cfg['max_spread_pct']) * 100.0, MAX_SPREAD_BPS), max_vol_bps=MAX_VOL_BPS,
+            min_efficiency_trend=MIN_EFFICIENCY_TREND, max_efficiency_range=MAX_EFFICIENCY_RANGE, edge_ratio=EDGE_RATIO)
+
+    def budget_cap(self) -> Decimal:
+        configured = money.parse(self.engine.cfg['micro_budget_usdt'], field='micro budget')
+        return min(configured, econ.MICRO_MAX_ALL_IN_USDT)
+
+    def allocation(self) -> Decimal:
+        """The finite capital the micro strategy may commit at once: cycles x cap (never the paper balance)."""
+        return money.mul(self.budget_cap(), Decimal(int(self.engine.cfg['micro_max_cycles'])))
+
+    def target_net(self) -> Decimal:
+        return money.mul(self.budget_cap(), money.bps(money.parse(self.engine.cfg['micro_target_net_bps'])))
+
+    def selected(self) -> list[str]:
+        """Only the operator's watchlist is tradable; discovery never adds pairs here."""
+        return list(dict.fromkeys(self.engine.cfg['watchlist']))
+
+    def open_symbols(self) -> set[str]:
+        """Pairs with an unfinished cycle (holding, in flight or waiting for review)."""
+        rows = storage.rows("SELECT symbol FROM micro_cycles WHERE exchange=? AND mode='paper' "
+                            "AND state NOT IN ('CLOSED','ABANDONED')", (self.engine.exchange_name,))
+        return {row['symbol'] for row in rows}
+
+    def owned_symbols(self) -> set[str]:
+        """Pairs whose ledger position belongs to the micro cycles: open cycles, and a closed
+        cycle's retained remainder that is still in the ledger (the next cycle carries it).
+        The legacy monitor and the manual ticket leave these alone. Fails closed: when the
+        cycle table cannot be read, every paper position counts as micro-owned."""
+        exchange = self.engine.exchange_name
+        try:
+            owned = self.open_symbols()
+            rows = storage.rows("SELECT DISTINCT c.symbol FROM micro_cycles c JOIN positions p ON p.exchange=c.exchange "
+                                "AND p.mode=c.mode AND p.symbol=c.symbol WHERE c.exchange=? AND c.mode='paper' "
+                                "AND c.state='CLOSED' AND c.residual_base IS NOT NULL AND c.residual_base NOT IN ('0', '')",
+                                (exchange,))
+        except Exception:
+            return {row['symbol'] for row in storage.rows("SELECT symbol FROM positions WHERE exchange=? AND mode='paper'",
+                                                          (exchange,))}
+        return owned | {row['symbol'] for row in rows}
+
+    def rules(self, symbol: str) -> venue_rules.VenueRules:
+        cached = self.rules_cache.get(symbol)
+        if cached is not None:
+            return cached
+        engine = self.engine
+        market = engine._catalogue().get(symbol)
+        precision_mode = getattr(engine.public, 'precisionMode', venue_rules.TICK_SIZE)
+        rules = venue_rules.normalize(market, exchange=engine.exchange_name, symbol=symbol,
+                                      loaded_at=self.rules_loaded_at, precision_mode=precision_mode)
+        self.rules_cache[symbol] = rules
+        return rules
+
+    def cost(self, rules: venue_rules.VenueRules) -> econ.CostModel:
+        cfg = self.engine.cfg
+        return econ.cost_model(configured_fee_pct=cfg['fee_pct'], configured_slippage_pct=cfg['slippage_pct'],
+                               latency_bps=cfg['micro_latency_bps'], rules=rules)
+
+    def _cash(self) -> Decimal:
+        return money.parse(float(self.engine._cash('paper')), field='paper cash')
+
+    # ------------------------------------------------------------ latches
+    def latch(self) -> dict | None:
+        raw = storage.get_meta(self._key('stop'))
+        if not raw:
+            return None
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            return {'reason': 'unreadable micro stop record', 'at': None}
+        return record if isinstance(record, dict) and record.get('engaged') else None
+
+    def _engage_latch(self, reason: str, **values) -> None:
+        if self.latch():
+            return
+        record = {'engaged': True, 'reason': reason, 'at': _now_iso(), **values}
+        storage.set_meta(self._key('stop'), json.dumps(record, default=str))
+        storage.audit('error', f'MICRO STOP latched: {reason}. New micro entries are blocked until cleared with {RESUME_PHRASE}; '
+                               'open cycles keep their exits.')
+        observability.event('micro.stop_latched', level='error', reason=reason, **values)
+        self.metrics.incr('micro.stop_latched')
+
+    def clear_latch(self, confirmation: str) -> None:
+        if confirmation != RESUME_PHRASE:
+            raise storage.ConfigValidationError(f'Type {RESUME_PHRASE} to clear the micro stop.')
+        storage.set_meta(self._key('stop'), json.dumps({'engaged': False, 'cleared_at': _now_iso(),
+                                                         'cleared_wall': time.time()}))
+        storage.audit('warning', 'Micro stop cleared after explicit confirmation. Losses before this moment no longer '
+                                 'count toward the consecutive-loss stop; the daily loss stop counts from this level.')
+        observability.event('micro.stop_cleared', level='warning')
+
+    def _cleared_record(self) -> dict:
+        try:
+            record = json.loads(storage.get_meta(self._key('stop')) or '{}')
+        except ValueError:
+            return {}
+        return record if isinstance(record, dict) and not record.get('engaged') else {}
+
+    def _closed_since(self, since_wall: float) -> list[dict]:
+        return storage.rows("SELECT * FROM micro_cycles WHERE exchange=? AND mode='paper' AND state='CLOSED' "
+                            'AND closed_wall>=? ORDER BY closed_wall', (self.engine.exchange_name, since_wall))
+
+    def _check_loss_limits(self) -> None:
+        """Latch on consecutive losing cycles or the day's realized micro loss. Never self-clears."""
+        cfg = self.engine.cfg
+        cleared = self._cleared_record()
+        cleared_wall = float(cleared.get('cleared_wall') or 0.0)
+        recent = storage.rows("SELECT realized_net, closed_wall FROM micro_cycles WHERE exchange=? AND mode='paper' "
+                              "AND state='CLOSED' AND closed_wall>? ORDER BY closed_wall DESC LIMIT 50",
+                              (self.engine.exchange_name, cleared_wall))
+        streak = 0
+        for row in recent:
+            if (_dec(row['realized_net'], money.ZERO) or money.ZERO) < 0:
+                streak += 1
+            else:
+                break
+        if streak >= int(cfg['micro_max_consecutive_losses']):
+            self._engage_latch(f'{streak} consecutive losing micro cycles', streak=streak)
+            return
+        today_utc = datetime.fromtimestamp(time.time(), timezone.utc)   # the same clock as closed_wall
+        day_start = today_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        since = max(day_start, cleared_wall)
+        today = money.add(*[(_dec(row['realized_net'], money.ZERO) or money.ZERO) for row in self._closed_since(since)])
+        limit = money.parse(cfg['micro_daily_loss_limit_usdt'])
+        if today <= -limit:
+            self._engage_latch(f'realized micro loss today {money.display(today)} USDT reached the '
+                               f'{money.display(limit)} USDT limit', realized_today=money.text(today))
+
+    # ----------------------------------------------------------- recovery
+    def recover_on_startup(self) -> list[dict]:
+        """Read-only explanation of every unfinished cycle; only provably empty reservations are released.
+
+        Runs while the engine is STOPPED in PAPER mode. Nothing is submitted.
+        A reservation with no order intent, or an intent that never left
+        (no ``submitted_at``), sent nothing and is released. Everything else
+        keeps blocking new micro entries until the operator applies a
+        recovery that books what the paper venue's own record shows.
+        """
+        explanations = []
+        try:
+            cycles = open_cycles(self.engine.exchange_name, 'paper')
+        except Exception as exc:
+            self.recovery = [{'error': f'micro cycle table unreadable: {type(exc).__name__}'}]
+            return self.recovery
+        for cycle in cycles:
+            try:
+                explanations.append(self._recover_cycle(cycle))
+            except Exception as exc:
+                explanations.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
+                                     'explanation': f'recovery check failed: {type(exc).__name__}; review required'})
+        for orphan in self._orphans():
+            explanations.append(orphan)
+        self.recovery = [item for item in explanations if item]
+        if self.recovery:
+            observability.event('micro.recovery', level='warning', items=self.recovery)
+        return self.recovery
+
+    def _intent(self, cycle_id: str, side: str) -> dict | None:
+        found = storage.rows('SELECT * FROM order_journal WHERE decision_id=? AND side=? ORDER BY created_at DESC LIMIT 1',
+                             (cycle_id, side))
+        return found[0] if found else None
+
+    def _venue_record(self, intent: dict | None) -> dict | None:
+        if not intent or not intent.get('client_order_id'):
+            return None
+        try:
+            return self.venue.fetch_order(None, intent['symbol'], {'clientOrderId': intent['client_order_id']})
+        except Exception:
+            return None
+
+    def _recover_cycle(self, cycle: dict) -> dict | None:
+        state, symbol = cycle['state'], cycle['symbol']
+        base = {'cycle_id': cycle['cycle_id'], 'symbol': symbol, 'state': state}
+        if state in ('ENTRY_RESERVED', 'ENTRY_SUBMITTED', 'ENTRY_UNKNOWN'):
+            intent = self._intent(cycle['cycle_id'], 'BUY')
+            if intent is None or (intent['status'] == 'pending' and not intent.get('submitted_at')) \
+                    or intent['status'] == 'rejected':
+                with storage.connection() as db:
+                    if intent is not None and intent['status'] == 'pending':
+                        storage.update_order_intent(intent['intent_id'], 'rejected', note='never sent; released at startup', db=db)
+                    transition(db, cycle, 'ABANDONED', 'released at startup: no order left this computer',
+                               reserved_quote='0')
+                return {**base, 'state': 'ABANDONED', 'explanation': 'The reservation was released: no order intent '
+                        'had been sent, so nothing can have filled.'}
+            record = self._venue_record(intent)
+            explanation = self._describe_record('entry', intent, record)
+            if state != 'ENTRY_UNKNOWN':
+                with storage.connection() as db:
+                    transition(db, cycle, 'ENTRY_UNKNOWN', 'restart during the entry order', review_reason=explanation)
+            return {**base, 'state': 'ENTRY_UNKNOWN', 'explanation': explanation, 'action': 'apply_recovery'}
+        if state in ('EXIT_SUBMITTED', 'EXIT_UNKNOWN'):
+            intent = self._intent(cycle['cycle_id'], 'SELL')
+            if intent is None or (intent['status'] == 'pending' and not intent.get('submitted_at')) \
+                    or intent['status'] == 'rejected':
+                with storage.connection() as db:
+                    if intent is not None and intent['status'] == 'pending':
+                        storage.update_order_intent(intent['intent_id'], 'rejected', note='never sent; released at startup', db=db)
+                    transition(db, cycle, 'HOLDING', 'exit order never left; the holding is unchanged')
+                return {**base, 'state': 'HOLDING', 'explanation': 'The exit order was never sent; the holding is '
+                        'unchanged and will be managed when the bot starts.'}
+            record = self._venue_record(intent)
+            explanation = self._describe_record('exit', intent, record)
+            if state != 'EXIT_UNKNOWN':
+                with storage.connection() as db:
+                    transition(db, cycle, 'EXIT_UNKNOWN', 'restart during the exit order', review_reason=explanation)
+            return {**base, 'state': 'EXIT_UNKNOWN', 'explanation': explanation, 'action': 'apply_recovery'}
+        if state == 'HOLDING':
+            problem = self._ownership_problem(cycle)
+            if problem:
+                with storage.connection() as db:
+                    transition(db, cycle, 'REVIEW', problem, review_reason=problem)
+                return {**base, 'state': 'REVIEW', 'explanation': problem, 'action': 'apply_recovery'}
+            return None
+        if state == 'REVIEW':
+            return {**base, 'explanation': cycle.get('review_reason') or 'review required', 'action': 'apply_recovery'}
+        return None
+
+    @staticmethod
+    def _describe_record(leg: str, intent: dict, record: dict | None) -> str:
+        if record is None:
+            return (f'The {leg} intent {intent["intent_id"][:8]} was sent but the paper venue has no record of it, so '
+                    'no fill happened. Applying recovery releases it.')
+        exact = (record.get('info') or {}).get('exact') or {}
+        return (f'The paper venue reports the {leg} order {record.get("id")} as {record.get("status")} with '
+                f'{exact.get("filled", record.get("filled"))} filled for {exact.get("cost", record.get("cost"))} '
+                f'(fee {exact.get("fee_cost")} {exact.get("fee_currency")}). Applying recovery books exactly that.')
+
+    def _ownership_problem(self, cycle: dict) -> str | None:
+        position = storage.rows('SELECT qty, cost FROM positions WHERE exchange=? AND mode=? AND symbol=?',
+                                (cycle['exchange'], cycle['mode'], cycle['symbol']))
+        owned = _dec(cycle['owned_base'], money.ZERO)
+        if not position:
+            return f'The ledger has no {cycle["symbol"]} position although the cycle owns {money.text(owned)}.'
+        held = float(position[0]['qty'])
+        if not math.isclose(held, float(owned), rel_tol=1e-9, abs_tol=1e-12):
+            return (f'The ledger holds {held!r} {cycle["symbol"].split("/")[0]} but the cycle owns {money.text(owned)}; '
+                    'something outside the cycle changed this position.')
+        return None
+
+    def _orphans(self, symbol: str | None = None, *, since_ms: int | None = None) -> list[dict]:
+        """Venue orders that no journal intent explains, or that filled more than the ledger booked."""
+        found = []
+        try:
+            records = self.venue.records(symbol)
+        except Exception as exc:
+            return [{'symbol': symbol, 'explanation': f'paper venue records unreadable: {type(exc).__name__}',
+                     'action': 'review'}]
+        if since_ms is not None:
+            records = [record for record in records if int(record.get('timestamp_ms') or 0) >= since_ms]
+        for record in records:
+            client_id = record.get('clientOrderId') or record.get('client_order_id')
+            journal = storage.rows('SELECT intent_id, status, filled_quantity, decision_id FROM order_journal '
+                                   'WHERE exchange=? AND mode=? AND client_order_id=?',
+                                   (self.engine.exchange_name, 'paper', client_id))
+            if not journal:
+                found.append({'symbol': record.get('symbol'), 'order_id': record.get('order_id') or record.get('id'),
+                              'explanation': 'The paper venue holds an order no journal intent explains (orphan).',
+                              'action': 'review'})
+                continue
+            row = journal[0]
+            exact = (record.get('info') or {}).get('exact') or {}
+            venue_filled = _dec(exact.get('filled'), None)
+            if venue_filled is None:
+                venue_filled = _dec(record.get('filled'), money.ZERO)
+            if row['status'] == 'accounted' and row['filled_quantity'] is not None and venue_filled is not None:
+                booked = money.parse(float(row['filled_quantity']), field='booked fill')
+                if venue_filled > booked * (1 + Decimal('1e-12')):
+                    found.append({'symbol': record.get('symbol'), 'order_id': record.get('order_id') or record.get('id'),
+                                  'cycle_id': row['decision_id'],
+                                  'explanation': f'The paper venue now reports {money.text(venue_filled)} filled for an '
+                                                 f'order booked at {money.text(booked)} (a late fill after the cancel).',
+                                  'action': 'review'})
+        return found
+
+    def _late_fills(self, cycle: dict) -> list[tuple[dict, dict, Decimal]]:
+        """(intent, venue view, extra base) for each accounted order of ``cycle`` the venue later filled further."""
+        found = []
+        for intent in storage.rows("SELECT * FROM order_journal WHERE decision_id=? AND status='accounted' "
+                                   'ORDER BY created_at', (cycle['cycle_id'],)):
+            view = self._venue_record(intent)
+            if view is None or intent.get('filled_quantity') is None:
+                continue
+            try:
+                venue_filled = self._fill(view)['filled']
+            except Exception:
+                continue
+            booked = money.parse(float(intent['filled_quantity']), field='booked fill')
+            if venue_filled > booked:
+                found.append((intent, view, money.sub(venue_filled, booked)))
+        return found
+
+    def _check_late_fills(self, cycle: dict) -> dict:
+        """A partially filled holding re-reads its venue orders now and then; a later fill sends it to review."""
+        if not (int(cycle.get('entry_partial') or 0) or int(cycle.get('exit_count') or 0)):
+            return cycle
+        now = time.monotonic()
+        if now - self._late_checked.get(cycle['cycle_id'], -1e9) < LATE_FILL_CHECK_S:
+            return cycle
+        self._late_checked[cycle['cycle_id']] = now
+        late = self._late_fills(cycle)
+        if not late:
+            return cycle
+        detail = '; '.join(f'{intent["side"]} order {view.get("id")} now shows {money.text(extra)} more filled'
+                           for intent, view, extra in late)
+        reason = (f'The paper venue reports a late fill ({detail}) after the order was booked. Stop the bot and '
+                  'apply the recovery to book it exactly.')
+        with storage.connection() as db:
+            cycle = transition(db, cycle, 'REVIEW', 'late fill after booking', review_reason=reason)
+        storage.audit('error', f'Micro {cycle["symbol"]}: {reason}')
+        observability.event('micro.late_fill_detected', level='error', cycle_id=cycle['cycle_id'], detail=detail)
+        return cycle
+
+    def _book_late_fills(self, cycle: dict, late: list) -> None:
+        """Book only the extra quantity each order filled after it was booked, in one transaction."""
+        engine = self.engine
+        symbol = cycle['symbol']
+        with storage.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            fresh = dict(db.execute('SELECT * FROM micro_cycles WHERE cycle_id=?', (cycle['cycle_id'],)).fetchone())
+            owned = _dec(fresh['owned_base'], money.ZERO)
+            basis = _dec(fresh['basis_quote'], money.ZERO)
+            key = engine._key('paper_cash')
+            cash = money.parse(float(db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()['value']),
+                               field='paper cash')
+            realized_total = _dec(fresh['realized_net'], money.ZERO)
+            for intent, view, _extra in late:
+                total = self._fill(view)
+                booked = db.execute('SELECT COALESCE(SUM(quantity),0) AS q, COALESCE(SUM(gross),0) AS g, '
+                                    'COALESCE(SUM(fee),0) AS f FROM trades WHERE exchange=? AND mode=? AND order_id=?',
+                                    (engine.exchange_name, 'paper', view.get('id'))).fetchone()
+                quote_fee, base_fee, other = self._split_fee(symbol, total)
+                extra_gross = money.sub(total['gross'], money.parse(float(booked['g']), field='booked gross'))
+                extra_fee = money.sub(quote_fee or money.ZERO, money.parse(float(booked['f']), field='booked fee'))
+                if intent['side'] == 'BUY':
+                    extra_base = money.sub(money.sub(total['filled'], base_fee or money.ZERO),
+                                           money.parse(float(booked['q']), field='booked quantity'))
+                    if extra_base <= 0 or extra_gross < 0 or extra_fee < 0:
+                        raise CycleError('the late entry fill does not add a positive quantity')
+                    debit = money.add(extra_gross, extra_fee)
+                    if debit > cash:
+                        raise CycleError('paper cash below the late fill debit')
+                    cash, owned, basis = money.sub(cash, debit), money.add(owned, extra_base), money.add(basis, debit)
+                    db.execute('INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,reason,'
+                               'order_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                               (_now_iso(), engine.exchange_name, 'paper', symbol, 'BUY', float(total['average']),
+                                float(extra_base), float(extra_gross), float(extra_fee),
+                                'Micro cycle entry (late fill)', view.get('id')))
+                else:
+                    extra_sold = money.sub(total['filled'], money.parse(float(booked['q']), field='booked quantity'))
+                    if extra_sold <= 0 or extra_gross < 0 or extra_fee < 0:
+                        raise CycleError('the late exit fill does not add a positive quantity')
+                    realized = econ.realize_exit(owned_base=owned, basis_quote=basis, sold_base=extra_sold,
+                                                 gross_quote=extra_gross, quote_fee=extra_fee, base_fee=None,
+                                                 other_fees={}, other_fee_value=None, fee_status=total['fee_status'])
+                    cash = money.add(cash, realized.net_proceeds)
+                    owned, basis = realized.residual_base, realized.residual_basis
+                    realized_total = money.add(realized_total, realized.realized_net)
+                    db.execute('INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,realized,'
+                               'reason,order_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                               (_now_iso(), engine.exchange_name, 'paper', symbol, 'SELL', float(total['average']),
+                                float(extra_sold), float(extra_gross), float(extra_fee), float(realized.realized_net),
+                                'Micro exit (late fill)', view.get('id')))
+                storage.update_order_intent(intent['intent_id'], 'accounted', db=db,
+                                            filled_quantity=float(total['filled']), filled_price=float(total['average']),
+                                            note='late fill booked by operator recovery')
+            db.execute('UPDATE meta SET value=? WHERE key=?', (repr(float(cash)), key))
+            if owned > 0:
+                updated = db.execute('UPDATE positions SET qty=?, cost=? WHERE exchange=? AND mode=? AND symbol=?',
+                                     (float(owned), float(basis), engine.exchange_name, 'paper', symbol)).rowcount
+                if not updated:
+                    db.execute('INSERT INTO positions(exchange,mode,symbol,qty,entry_price,cost,highest,stop,target,'
+                               'opened_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                               (engine.exchange_name, 'paper', symbol, float(owned), float(money.div(basis, owned)),
+                                float(basis), float(money.div(basis, owned)), 0.0, 0.0, _now_iso()))
+            else:
+                db.execute('DELETE FROM positions WHERE exchange=? AND mode=? AND symbol=?',
+                           (engine.exchange_name, 'paper', symbol))
+            transition(db, fresh, 'HOLDING' if owned > 0 else 'CLOSED', 'operator recovery: late fill booked',
+                       owned_base=money.text(owned), basis_quote=money.text(basis),
+                       realized_net=money.text(realized_total), review_reason=None,
+                       **({} if owned > 0 else {'closed_at': _now_iso(), 'closed_wall': time.time()}))
+
+    def _symbol_conflicts(self, symbol: str, now: float, *, force: bool = False) -> list[dict]:
+        """Recent venue orders on ``symbol`` the journal does not explain (re-read at most every 10 s)."""
+        checked = self._conflicts.get(symbol)
+        mono = time.monotonic()
+        if not force and checked is not None and mono - checked[0] < 10.0:
+            return checked[1]
+        found = self._orphans(symbol, since_ms=int((now - RECONCILE_WINDOW_S) * 1000))
+        self._conflicts[symbol] = (mono, found)
+        if found:
+            known = {(item.get('order_id'), item.get('explanation')) for item in self.recovery}
+            self.recovery.extend(item for item in found if (item.get('order_id'), item.get('explanation')) not in known)
+        return found
+
+    def _final_answer(self, symbol: str, intent: dict | None, order: dict) -> dict:
+        """A canceled or partial answer is read once more: a late fill can race the cancel acknowledgement."""
+        if order.get('status') == 'closed' or not intent or not intent.get('client_order_id'):
+            return order
+        try:
+            fresh = self.venue.fetch_order(None, symbol, {'clientOrderId': intent['client_order_id']})
+            before, after = self._fill(order)['filled'], self._fill(fresh)['filled']
+        except Exception:
+            return order
+        if after <= before:
+            return order
+        observability.event('micro.late_fill_reconciled', level='warning', symbol=symbol, intent_id=intent['intent_id'],
+                            first_answer=money.text(before), final=money.text(after))
+        self.metrics.incr('micro.late_fill_reconciled')
+        return fresh
+
+    def review_block(self) -> list[dict]:
+        """Unfinished outcomes that block every new micro entry."""
+        blockers = []
+        for cycle in open_cycles(self.engine.exchange_name, 'paper'):
+            if cycle['state'] in BLOCKING_STATES:
+                blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
+                                 'explanation': cycle.get('review_reason') or cycle.get('last_reason') or 'review required'})
+        return blockers
+
+    def apply_recovery(self, cycle_id: str, confirmation: str) -> dict:
+        """Operator-confirmed: book exactly what the paper venue's record shows. Bot must be stopped."""
+        engine = self.engine
+        if confirmation != REVIEW_PHRASE:
+            raise storage.ConfigValidationError(f'Type {REVIEW_PHRASE} to apply this recovery.')
+        with engine.lock:
+            if engine._busy():
+                raise storage.ConfigValidationError('Stop the bot and wait for active operations before applying a recovery.')
+            if engine.mode != 'paper':
+                raise storage.ConfigValidationError(micro_policy.PAPER_ONLY)
+            engine.control_busy = True
+        try:
+            cycle = load_cycle(cycle_id)
+            if cycle is None or cycle['exchange'] != engine.exchange_name or cycle['mode'] != 'paper':
+                raise storage.ConfigValidationError('Unknown micro cycle for this exchange.')
+            if cycle['state'] not in BLOCKING_STATES:
+                raise storage.ConfigValidationError('This cycle does not need a recovery.')
+            if cycle['state'] == 'ENTRY_UNKNOWN':
+                result = self._apply_entry_recovery(cycle)
+            elif cycle['state'] == 'EXIT_UNKNOWN':
+                result = self._apply_exit_recovery(cycle)
+            else:
+                result = self._apply_review(cycle)
+            storage.audit('warning', f'Micro cycle {cycle_id[:12]} recovered by the operator: {result["outcome"]}.')
+            observability.event('micro.recovery_applied', level='warning', cycle_id=cycle_id, outcome=result['outcome'])
+            self.recovery = [item for item in self.recovery if item.get('cycle_id') != cycle_id]
+            return result
+        finally:
+            with engine.lock:
+                engine.control_busy = False
+
+    def _settle_intent_for_recovery(self, intent: dict, db, *, accounted: bool, order_id=None, record=None) -> None:
+        if intent['status'] in ('accounted', 'rejected', 'reconciled'):
+            return
+        if intent['status'] != 'uncertain':
+            storage.update_order_intent(intent['intent_id'], 'uncertain', note='restart before booking', db=db)
+        if accounted:
+            summary = record or {}
+            storage.update_order_intent(intent['intent_id'], 'accounted', order_id=order_id, db=db,
+                                        filled_price=summary.get('average'), filled_quantity=summary.get('filled'),
+                                        note='booked from the paper venue record by operator recovery')
+        else:
+            storage.update_order_intent(intent['intent_id'], 'reconciled', db=db,
+                                        note='paper venue holds no such order; released by operator recovery')
+
+    def _apply_entry_recovery(self, cycle: dict) -> dict:
+        intent = self._intent(cycle['cycle_id'], 'BUY')
+        record = self._venue_record(intent)
+        filled = None
+        if record is not None:
+            exact = (record.get('info') or {}).get('exact') or {}
+            filled = _dec(exact.get('filled'), None) if exact else _dec(record.get('filled'), None)
+        if record is None or not filled:
+            with storage.connection() as db:
+                if intent is not None:
+                    self._settle_intent_for_recovery(intent, db, accounted=False)
+                transition(db, cycle, 'ABANDONED', 'operator recovery: the venue shows no fill', reserved_quote='0')
+            return {'cycle_id': cycle['cycle_id'], 'outcome': 'released (no fill)'}
+        booked = self._book_entry(cycle, intent, record, recovery=True)
+        if not booked:
+            raise storage.ConfigValidationError('The venue record could not be booked; see local activity.')
+        return {'cycle_id': cycle['cycle_id'], 'outcome': 'entry fill booked from the venue record'}
+
+    def _apply_exit_recovery(self, cycle: dict) -> dict:
+        intent = self._intent(cycle['cycle_id'], 'SELL')
+        record = self._venue_record(intent)
+        filled = None
+        if record is not None:
+            exact = (record.get('info') or {}).get('exact') or {}
+            filled = _dec(exact.get('filled'), None) if exact else _dec(record.get('filled'), None)
+        if record is None or not filled:
+            with storage.connection() as db:
+                if intent is not None:
+                    self._settle_intent_for_recovery(intent, db, accounted=False)
+                transition(db, cycle, 'HOLDING', 'operator recovery: the exit did not fill')
+            return {'cycle_id': cycle['cycle_id'], 'outcome': 'holding unchanged (exit did not fill)'}
+        booked = self._book_exit(cycle, intent, record, trigger=cycle.get('last_exit_trigger') or 'recovery',
+                                 reason='exit booked by operator recovery', recovery=True)
+        if not booked:
+            raise storage.ConfigValidationError('The venue record could not be booked; see local activity.')
+        return {'cycle_id': cycle['cycle_id'], 'outcome': 'exit fill booked from the venue record'}
+
+    def _apply_review(self, cycle: dict) -> dict:
+        late = self._late_fills(cycle)
+        if late:
+            self._book_late_fills(cycle, late)
+            return {'cycle_id': cycle['cycle_id'], 'outcome': 'late fill booked from the venue record'}
+        position = storage.rows('SELECT qty, cost FROM positions WHERE exchange=? AND mode=? AND symbol=?',
+                                (cycle['exchange'], cycle['mode'], cycle['symbol']))
+        with storage.connection() as db:
+            if position:
+                qty = money.parse(float(position[0]['qty']), field='ledger quantity')
+                cost = money.parse(float(position[0]['cost']), field='ledger cost')
+                transition(db, cycle, 'HOLDING', 'operator review: the cycle adopts the ledger position',
+                           owned_base=money.text(qty), basis_quote=money.text(cost), review_reason=None)
+                return {'cycle_id': cycle['cycle_id'], 'outcome': 'cycle adopted the ledger position'}
+            transition(db, cycle, 'CLOSED', 'operator review: the ledger holds nothing for this cycle',
+                       closed_at=_now_iso(), closed_wall=time.time(), realized_status='unconfirmed', review_reason=None)
+        return {'cycle_id': cycle['cycle_id'], 'outcome': 'cycle closed (no ledger position); realized result unconfirmed'}
+
+    # -------------------------------------------------------------- data
+    def _refresh_catalogue(self) -> None:
+        engine = self.engine
+        before = engine.markets_loaded_at
+        engine._fetch_markets()
+        if engine.markets_loaded_at != before or self.rules_loaded_at is None:
+            # The catalogue was (re)loaded: rules derived from it are rebuilt.
+            self.rules_loaded_at = time.time()
+            self.rules_cache.clear()
+
+    def _poll_interval(self, count: int) -> float:
+        rate = getattr(self.engine.public, 'rateLimit', None)
+        spacing = 0.25
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool) and math.isfinite(rate) and rate > 0:
+            spacing = max(spacing, 3.0 * float(rate) / 1000.0)
+        return max(1.0, spacing * max(1, count))
+
+    def _fetch_book(self, symbol: str) -> micro_book.BookSnapshot:
+        engine = self.engine
+        started = time.monotonic()
+        raw = engine.data.order_book(symbol, limit=BOOK_LEVELS)
+        received_mono = time.monotonic()
+        received_wall = raw.get('_received_at') if isinstance(raw, dict) else None
+        if not isinstance(received_wall, (int, float)) or isinstance(received_wall, bool):
+            received_wall = time.time()
+        snapshot = micro_book.from_ccxt_order_book(raw, exchange=engine.exchange_name, symbol=symbol,
+                                                   received_wall=float(received_wall), received_mono=received_mono,
+                                                   clock_offset_s=engine._clock_offset(), max_levels=BOOK_LEVELS)
+        snapshot = self.books.accept(snapshot)
+        self.metrics.observe('micro.book_fetch_ms', (received_mono - started) * 1000)
+        self._mark(symbol, snapshot)
+        return snapshot
+
+    def _mark(self, symbol: str, snapshot) -> None:
+        """Feed the engine's marks, which the risk gate's freshness checks read."""
+        ticker = {'bid': float(snapshot.best_bid), 'ask': float(snapshot.best_ask),
+                  'timestamp': snapshot.venue_timestamp_ms, '_received_at': snapshot.received_wall}
+        try:
+            self.engine._observe_ticker(symbol, ticker)
+        except ValueError:
+            pass
+
+    def _book(self, symbol: str, *, interval: float, max_age: float) -> micro_book.BookSnapshot | None:
+        now_mono = time.monotonic()
+        current = self.books.latest(symbol, now_mono=now_mono, max_age_s=max_age)
+        if current is not None and current.age_seconds(now_mono) < interval:
+            return current
+        if now_mono < self._next_book.get(symbol, 0.0) and current is not None:
+            return current
+        self._next_book[symbol] = now_mono + interval
+        try:
+            return self._fetch_book(symbol)
+        except micro_book.BookError as exc:
+            self._note_error(symbol, f'order book refused: {exc.code}')
+        except Exception as exc:
+            self._note_error(symbol, f'order book unavailable: {type(exc).__name__}')
+        return self.books.latest(symbol, now_mono=time.monotonic(), max_age_s=max_age)
+
+    def _ticker_snapshot(self, symbol: str):
+        """Top of book from the stream or a REST quote; depth unknown, for safety exits only."""
+        engine = self.engine
+        try:
+            ticker = engine._quote(symbol, None)
+            if not isinstance(ticker, dict):
+                quotes = engine.data.quotes([symbol])
+                ticker = quotes.get(symbol) if isinstance(quotes, dict) else None
+            if not isinstance(ticker, dict):
+                return None
+            received = ticker.get('_received_at')
+            received = float(received) if isinstance(received, (int, float)) and not isinstance(received, bool) else time.time()
+            snapshot = micro_book.from_ticker(ticker, exchange=engine.exchange_name, symbol=symbol,
+                                              received_wall=received, received_mono=time.monotonic(),
+                                              clock_offset_s=engine._clock_offset(),
+                                              source='stream_ticker' if ticker.get('_source') else 'ticker')
+        except Exception:
+            return None
+        age = time.time() - snapshot.received_wall
+        if age > float(engine.cfg['micro_book_max_age_seconds']) or age < -5:
+            return None
+        self._mark(symbol, snapshot)
+        return snapshot
+
+    def _bar_due(self) -> int:
+        """Open time (exchange seconds) of the last completed 1m bar."""
+        now = time.time() - self.engine._clock_offset()
+        return int(now // 60) * 60 - 60
+
+    def _context_due(self, symbol: str, bar_due: int) -> bool:
+        cached = self.context.get(symbol)
+        if not cached or cached.get('bar_due') != bar_due:
+            return True
+        return not cached.get('current') and time.monotonic() >= cached.get('retry_mono', 0.0)
+
+    def _prefetch_context(self, symbols: list[str]) -> None:
+        """Start the due candle downloads together (exchanges whose rate limit allows overlap).
+
+        ``MarketData.prefetch`` keeps the shared request pacing and the quote
+        slot that order-book and exit reads use, so this only overlaps round
+        trips; it never sends requests faster than the venue limit allows.
+        """
+        bar_due = self._bar_due()
+        due = [symbol for symbol in symbols if self._context_due(symbol, bar_due)]
+        if not due:
+            return
+        try:
+            self.engine.data.prefetch([(symbol, '1m', 120) for symbol in due] + [(symbol, '5m', 60) for symbol in due])
+        except Exception:
+            pass      # each symbol's own read reports the failure
+
+    def _refresh_context(self, symbol: str) -> dict | None:
+        """Completed-bar features after each 1m close; cached until the next bar completes.
+
+        A frame that does not yet contain the bar that just closed (a cached
+        copy from the previous minute, or a venue that publishes the bar a
+        moment late) is kept but marked not current: it is read again after
+        ``CONTEXT_RETRY_S`` and, until then, an entry decision treats the
+        data as not fresh rather than acting on the previous bar.
+        """
+        engine = self.engine
+        bar_due = self._bar_due()
+        cached = self.context.get(symbol)
+        if cached and not self._context_due(symbol, bar_due):
+            return cached
+        started = time.monotonic()
+        try:
+            frame_1m = engine.data.candles(symbol, '1m', limit=120)
+            frame_5m = engine.data.candles(symbol, '5m', limit=60)
+            features, reason = strat.compute_features(symbol, frame_1m, frame_5m)
+        except Exception as exc:
+            features, reason = None, f'ERROR: candles unavailable ({type(exc).__name__})'
+        self.metrics.observe('micro.context_ms', (time.monotonic() - started) * 1000)
+        if features is not None:
+            current = int(features.bar_ts_ms // 1000) >= bar_due
+        else:
+            current = str(reason or '').startswith('WARMUP')
+        entry = {'bar_due': bar_due, 'features': features, 'reason': reason, 'computed_wall': time.time(),
+                 'current': current, 'retry_mono': time.monotonic() + CONTEXT_RETRY_S}
+        if features is not None and not current:
+            entry['reason'] = 'STALE: the last completed 1m bar is not in the candle data yet'
+        self.context[symbol] = entry
+        return entry
+
+    def _note_error(self, symbol: str, message: str) -> None:
+        row = self.pairs.setdefault(symbol, {'symbol': symbol})
+        row['error'] = message
+        self.last_error = f'{symbol}: {message}'
+
+    # -------------------------------------------------------------- tick
+    def request_flatten(self) -> None:
+        self._flatten.set()
+
+    def tick(self) -> float:
+        """One pass of exits, context and entries. Returns seconds until the next pass."""
+        engine = self.engine
+        started = time.monotonic()
+        refusal = micro_policy.live_refusal(engine.mode, horizon=engine.cfg.get('time_horizon'))
+        if refusal:
+            with engine.lock:
+                engine.risk_block = refusal
+            engine.stop_event.set()
+            storage.audit('error', refusal)
+            return 1.0
+        if not engine._orders_allowed():
+            return 1.0
+        self.venue   # bind the venue to the current exchange before anything else
+        params = self.params()
+        try:
+            self._refresh_catalogue()
+        except Exception as exc:
+            self.last_error = f'market catalogue unavailable: {type(exc).__name__}'
+            return 5.0
+        held = [c for c in open_cycles(engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
+        if self._flatten.is_set():
+            self._flatten.clear()
+            for cycle in held:
+                self._manage_exit(cycle, params, operator=True)
+            held = [c for c in open_cycles(engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
+        self._manage_exits(params)
+        selected = self.selected()
+        self._prefetch_context(selected)
+        for symbol in selected:
+            if not engine._orders_allowed():
+                break
+            self._refresh_context(symbol)
+            self._manage_exits(params, only_due=True)
+        if engine._orders_allowed():
+            self._entries(params, selected)
+        self.tick_count += 1
+        self.last_tick = _now_iso()
+        elapsed = (time.monotonic() - started) * 1000
+        self.metrics.observe('micro.tick_ms', elapsed)
+        current = engine.feed
+        streaming = current is not None and getattr(current, 'healthy', lambda: False)()
+        return 1.0 if streaming or held else 2.0
+
+    # ------------------------------------------------------------- exits
+    def _manage_exits(self, params, *, only_due: bool = False) -> None:
+        engine = self.engine
+        cycles = [c for c in open_cycles(engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
+        interval = self._poll_interval(len(cycles))
+        for cycle in cycles:
+            if not engine._orders_allowed():
+                return
+            if only_due and time.monotonic() < self._next_book.get(cycle['symbol'], 0.0):
+                continue
+            self._manage_exit(cycle, params, interval=interval)
+
+    def _manage_exit(self, cycle: dict, params, *, operator: bool = False, interval: float = 1.0) -> None:
+        engine = self.engine
+        symbol = cycle['symbol']
+        cycle = self._check_late_fills(cycle)
+        if cycle['state'] != 'HOLDING':
+            return
+        started = time.monotonic()
+        max_age = float(engine.cfg['micro_book_max_age_seconds'])
+        rules = self.rules(symbol)
+        cost = self.cost(rules)
+        book = self._book(symbol, interval=interval, max_age=max_age)
+        if book is None:
+            book = self._ticker_snapshot(symbol)
+        owned = _dec(cycle['owned_base'], money.ZERO)
+        basis = _dec(cycle['basis_quote'], money.ZERO)
+        target_net = _dec(cycle['target_net'], self.target_net())
+        stop_net = _dec(cycle['stop_net'], money.mul(self.budget_cap(), money.bps(Decimal(str(params.max_loss_bps)))))
+        estimate = None
+        depth_model = 'unavailable'
+        if book is not None and owned > 0:
+            try:
+                estimate_obj = econ.estimate_exit(owned_base=owned, basis_quote=basis, rules=rules, book=book, cost=cost,
+                                                  target_net=target_net,
+                                                  uncertainty_bps=money.parse(max(params.uncertainty_floor_bps,
+                                                                                  float(cost.latency_bps))))
+                estimate = estimate_obj.as_dict()
+                depth_model = estimate_obj.depth_model
+            except Exception as exc:
+                self._note_error(symbol, f'exit estimate failed: {type(exc).__name__}')
+        context = self.context.get(symbol) or {}
+        features = context.get('features')
+        regime = None
+        if features is not None and book is not None:
+            regime, _ = strat.classify_regime(features, spread_bps=float(book.spread_bps), depth_ok=True,
+                                              data_fresh=True, params=params)
+        peak = _dec(cycle.get('peak_est_net'))
+        verdict = strat.evaluate_exit(estimate=estimate, depth_model=depth_model, target_net=target_net,
+                                      stop_net=stop_net, peak_est_net=peak, opened_wall=float(cycle['opened_wall'] or 0),
+                                      max_hold_s=float(cycle['max_hold_s'] or params.max_hold_s), regime=regime,
+                                      now=time.time())
+        self.metrics.observe('micro.exit_decision_ms', (time.monotonic() - started) * 1000)
+        with self.lock:
+            row = self.pairs.setdefault(symbol, {'symbol': symbol})
+            row['exit'] = {'estimate': estimate, 'verdict': verdict.as_dict(), 'depth_model': depth_model,
+                           'at': _now_iso()}
+        if verdict.new_peak is not None and (peak is None or verdict.new_peak > peak):
+            gap = money.mul(self.budget_cap(), Decimal('0.0001'))
+            if peak is None or verdict.new_peak - peak >= gap:
+                try:
+                    with storage.connection() as db:
+                        cycle = transition(db, cycle, 'HOLDING', 'new estimated net peak',
+                                           peak_est_net=money.text(verdict.new_peak))
+                except CycleError:
+                    return
+        trigger, reason = verdict.trigger, verdict.reason
+        if operator:
+            trigger, reason = 'operator', 'Operator asked to exit all micro positions'
+        elif verdict.action != 'exit':
+            return
+        if book is None:
+            self._note_error(symbol, 'exit wanted but no fresh executable quote is available')
+            return
+        backoff = self.exit_backoff.get(cycle['cycle_id'])
+        if backoff and time.monotonic() < backoff[1] and not operator:
+            return
+        self._sell(cycle, book, rules, cost, trigger=trigger, reason=reason)
+
+    def _sell(self, cycle: dict, book, rules, cost, *, trigger: str, reason: str) -> bool:
+        engine = self.engine
+        symbol = cycle['symbol']
+        owned = _dec(cycle['owned_base'], money.ZERO)
+        step = rules.amount_step
+        sellable = money.q_down(owned, step) if step is not None else owned
+        minimum_ok = (sellable > 0 and (rules.min_amount is None or sellable >= rules.min_amount)
+                      and (rules.market_min_cost() is None
+                           or money.mul(sellable, book.best_bid) >= rules.market_min_cost()))
+        if not minimum_ok:
+            # Only an unsellable remainder is left: the cycle closes and keeps it as residual.
+            with storage.connection() as db:
+                transition(db, cycle, 'CLOSED', 'only an unsellable remainder is left; retained as residual',
+                           closed_at=_now_iso(), closed_wall=time.time(), residual_base=money.text(owned),
+                           residual_basis=cycle['basis_quote'],
+                           realized_status=cycle.get('realized_status') or 'confirmed')
+            self._after_close(cycle)
+            return False
+        positions = engine._active_positions('paper')
+        price = book.best_bid
+        authorization = engine._authorize(symbol, 'SELL', 'micro_exit', float(money.mul(sellable, price)), float(price),
+                                          positions=positions, cash=None, quantity=float(sellable),
+                                          reason=f'{trigger}: {reason}', decision_id=cycle['cycle_id'])
+        if not authorization.allowed:
+            self._backoff(cycle)
+            self._note_error(symbol, 'exit refused by the risk gate: ' + authorization.reason)
+            return False
+        try:
+            with storage.connection() as db:
+                cycle = transition(db, cycle, 'EXIT_SUBMITTED', f'{trigger}: {reason}', last_exit_trigger=trigger)
+        except CycleError:
+            return False
+        submitted = time.monotonic()
+        intent, order = engine._submit(self.venue, symbol, 'SELL', quantity=float(sellable), authorization=authorization,
+                                       intended_price=float(price), decision_id=cycle['cycle_id'],
+                                       venue_params={'book': book, 'adverse_bps': cost.latency_bps,
+                                                     'taker_fee': cost.taker_fee})
+        self.metrics.observe('micro.exit_submit_ms', (time.monotonic() - submitted) * 1000)
+        if order is None:
+            self._unsent_or_unknown(cycle, 'SELL')
+            return False
+        intent_row = storage.order_intent(intent)
+        booked = self._book_exit(cycle, intent_row, self._final_answer(symbol, intent_row, order), trigger=trigger,
+                                 reason=reason)
+        if booked:
+            self.exit_backoff.pop(cycle['cycle_id'], None)
+        return booked
+
+    def _backoff(self, cycle: dict) -> None:
+        count, _ = self.exit_backoff.get(cycle['cycle_id'], (0, 0.0))
+        delay = EXIT_RETRY_SECONDS[min(count, len(EXIT_RETRY_SECONDS) - 1)]
+        self.exit_backoff[cycle['cycle_id']] = (count + 1, time.monotonic() + delay)
+
+    def _unsent_or_unknown(self, cycle: dict, side: str) -> None:
+        """After _submit returned nothing: a refusal/rejection or an uncertain outcome."""
+        intent = self._intent(cycle['cycle_id'], side)
+        fresh = load_cycle(cycle['cycle_id']) or cycle
+        with storage.connection() as db:
+            if intent is None or intent['status'] == 'rejected':
+                if side == 'BUY':
+                    transition(db, fresh, 'ABANDONED', 'entry not filled: ' + (intent or {}).get('note', 'not sent'),
+                               reserved_quote='0')
+                else:
+                    transition(db, fresh, 'HOLDING', 'exit not filled: ' + (intent or {}).get('note', 'not sent'))
+                    self._backoff(cycle)
+            else:
+                to_state = 'ENTRY_UNKNOWN' if side == 'BUY' else 'EXIT_UNKNOWN'
+                transition(db, fresh, to_state, f'{side} outcome uncertain ({intent["status"]}); review required',
+                           review_reason=f'The {side.lower()} order outcome is uncertain. Stop the bot and review the '
+                                         'recovery explanation.')
+        if intent is not None and intent['status'] != 'rejected':
+            observability.event('micro.outcome_unknown', level='error', cycle_id=cycle['cycle_id'], side=side,
+                                intent_id=intent['intent_id'])
+
+    # ---------------------------------------------------------- booking
+    @staticmethod
+    def _fill(order: dict) -> dict:
+        """Exact fill figures: the venue's exact strings when present, else the CCXT floats (repr)."""
+        exact = (order.get('info') or {}).get('exact') if isinstance(order.get('info'), dict) else None
+        if isinstance(exact, dict) and exact.get('filled') is not None:
+            filled = money.parse(exact['filled'], field='filled')
+            gross = money.parse(exact['cost'], field='cost')
+            fee_cost = _dec(exact.get('fee_cost'))
+            fee_currency = exact.get('fee_currency')
+            status = 'simulated'
+        else:
+            filled = money.parse(order.get('filled'), field='filled')
+            gross = money.parse(order.get('cost'), field='cost')
+            fee = order.get('fee') if isinstance(order.get('fee'), dict) else {}
+            fee_cost = _dec(fee.get('cost'))
+            fee_currency = fee.get('currency')
+            status = 'observed'
+        if filled <= 0 or gross <= 0:
+            raise money.MoneyError('the fill has no positive quantity and cost')
+        return {'filled': filled, 'gross': gross, 'fee_cost': fee_cost, 'fee_currency': fee_currency,
+                'fee_status': status if fee_cost is not None and fee_currency else 'unknown',
+                'average': money.div(gross, filled)}
+
+    def _split_fee(self, symbol: str, fill: dict) -> tuple[Decimal | None, Decimal | None, dict]:
+        base, quote = symbol.split('/')
+        fee, currency = fill['fee_cost'], fill['fee_currency']
+        if fee is None or not currency:
+            return None, None, {}
+        if currency == quote:
+            return fee, money.ZERO, {}
+        if currency == base:
+            return money.ZERO, fee, {}
+        return money.ZERO, money.ZERO, {str(currency): fee}
+
+    def _book_entry(self, cycle: dict, intent: dict | None, order: dict, *, recovery: bool = False) -> bool:
+        engine = self.engine
+        symbol = cycle['symbol']
+        started = time.monotonic()
+        try:
+            fill = self._fill(order)
+            quote_fee, base_fee, other = self._split_fee(symbol, fill)
+            reserved = _dec(cycle['reserved_quote'], money.ZERO)
+            acquisition = econ.account_entry(filled_base=fill['filled'], gross_quote=fill['gross'], quote_fee=quote_fee,
+                                             base_fee=base_fee, other_fees=other, other_fee_value=None,
+                                             fee_status=fill['fee_status'], reserved=reserved)
+        except Exception as exc:
+            engine._ledger_failure(f'MICRO BUY {symbol}: {type(exc).__name__}; fill accounting requires review',
+                                   intent_id=(intent or {}).get('intent_id'))
+            return False
+        order_id = order.get('id')
+        sizing = json.loads(cycle.get('sizing') or '{}')
+        try:
+            with storage.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                key = engine._key('paper_cash')
+                cash = float(db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()['value'])
+                debit = float(acquisition.debit)
+                if debit > cash + 1e-9:
+                    raise ValueError('paper cash below the booked debit')
+                db.execute('UPDATE meta SET value=? WHERE key=?', (repr(cash - debit), key))
+                existing = db.execute('SELECT qty, cost FROM positions WHERE exchange=? AND mode=? AND symbol=?',
+                                      (engine.exchange_name, 'paper', symbol)).fetchone()
+                carried_base = _dec(cycle['carried_base'], money.ZERO)
+                carried_basis = _dec(cycle['carried_basis'], money.ZERO)
+                if existing is not None:
+                    if not math.isclose(float(existing['qty']), float(carried_base), rel_tol=1e-9, abs_tol=1e-12):
+                        raise ValueError('the carried remainder changed before booking')
+                elif carried_base > 0:
+                    raise ValueError('the carried remainder disappeared before booking')
+                owned = money.add(acquisition.owned_base, carried_base)
+                basis = money.add(acquisition.basis, carried_basis)
+                price = float(fill['average'])
+                stop_bid = sizing.get('stop_bid')
+                target_bid = sizing.get('target_bid')
+                stop_value = float(stop_bid) if stop_bid else price * (1 - float(engine.cfg['micro_max_loss_bps']) / 10000)
+                target_value = float(target_bid) if target_bid else price * 1.01
+                if existing is None:
+                    db.execute('INSERT INTO positions(exchange,mode,symbol,qty,entry_price,cost,highest,stop,target,opened_at) '
+                               'VALUES (?,?,?,?,?,?,?,?,?,?)',
+                               (engine.exchange_name, 'paper', symbol, float(owned), price, float(basis), price,
+                                stop_value, target_value, _now_iso()))
+                else:
+                    db.execute('UPDATE positions SET qty=?,entry_price=?,cost=?,highest=?,stop=?,target=?,opened_at=? '
+                               'WHERE exchange=? AND mode=? AND symbol=?',
+                               (float(owned), price, float(basis), price, stop_value, target_value, _now_iso(),
+                                engine.exchange_name, 'paper', symbol))
+                db.execute('INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,reason,order_id) '
+                           'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                           (_now_iso(), engine.exchange_name, 'paper', symbol, 'BUY', price,
+                            float(acquisition.owned_base), float(fill['gross']),
+                            float(money.add(quote_fee or money.ZERO, money.mul(base_fee or money.ZERO, fill['average']))),
+                            'Micro cycle entry' + (' (recovered)' if recovery else ''), order_id))
+                if intent is not None and not recovery:
+                    storage.update_order_intent(intent['intent_id'], 'accounted', order_id=order_id, db=db,
+                                                filled_quantity=float(fill['filled']), filled_price=price)
+                elif intent is not None:
+                    self._settle_intent_for_recovery(intent, db, accounted=True, order_id=order_id,
+                                                     record={'average': price, 'filled': float(fill['filled'])})
+                fresh = dict(db.execute('SELECT * FROM micro_cycles WHERE cycle_id=?', (cycle['cycle_id'],)).fetchone())
+                partial = bool(order.get('status') != 'closed')
+                transition(db, fresh, 'HOLDING', 'entry filled' + (' (partially)' if partial else ''),
+                           data={'debit': money.text(acquisition.debit), 'owned': money.text(acquisition.owned_base),
+                                 'fee_status': acquisition.fee_status, 'notes': list(acquisition.notes)},
+                           reserved_quote='0', entry_intent_id=(intent or {}).get('intent_id'), entry_order_id=order_id,
+                           entry_filled_base=money.text(fill['filled']), entry_gross=money.text(fill['gross']),
+                           entry_fee_quote=money.text(quote_fee), entry_fee_base=money.text(base_fee),
+                           entry_fee_other=json.dumps({k: money.text(v) for k, v in other.items()}) if other else None,
+                           entry_fee_status=acquisition.fee_status, entry_debit=money.text(acquisition.debit),
+                           entry_partial=int(partial), entry_price=money.text(fill['average']), opened_at=_now_iso(),
+                           opened_wall=time.time(), owned_base=money.text(owned), basis_quote=money.text(basis),
+                           review_reason=None)
+        except Exception as exc:
+            engine._ledger_failure(f'MICRO BUY {symbol}: {type(exc).__name__}; portfolio ledger requires review',
+                                   intent_id=(intent or {}).get('intent_id'))
+            return False
+        self.metrics.observe('micro.fill_to_commit_ms', (time.monotonic() - started) * 1000)
+        try:
+            storage.audit('trade', f'PAPER MICRO BUY {symbol}: {money.display(acquisition.owned_base, 8)} owned for '
+                                   f'{money.display(acquisition.debit)} USDT all-in (cap {money.display(self.budget_cap(), 2)}).')
+            observability.event('micro.entry_booked', cycle_id=cycle['cycle_id'], symbol=symbol,
+                                debit=money.text(acquisition.debit), owned=money.text(acquisition.owned_base),
+                                fee_status=acquisition.fee_status, order_id=order_id)
+        except Exception:
+            pass
+        engine._observe_fills('paper')
+        return True
+
+    def _book_exit(self, cycle: dict, intent: dict | None, order: dict, *, trigger: str, reason: str,
+                   recovery: bool = False) -> bool:
+        engine = self.engine
+        symbol = cycle['symbol']
+        started = time.monotonic()
+        try:
+            fill = self._fill(order)
+            quote_fee, base_fee, other = self._split_fee(symbol, fill)
+            owned = _dec(cycle['owned_base'], money.ZERO)
+            basis = _dec(cycle['basis_quote'], money.ZERO)
+            realized = econ.realize_exit(owned_base=owned, basis_quote=basis, sold_base=fill['filled'],
+                                         gross_quote=fill['gross'], quote_fee=quote_fee, base_fee=base_fee,
+                                         other_fees=other, other_fee_value=None, fee_status=fill['fee_status'])
+        except Exception as exc:
+            engine._ledger_failure(f'MICRO SELL {symbol}: {type(exc).__name__}; fill accounting requires review',
+                                   intent_id=(intent or {}).get('intent_id'))
+            return False
+        order_id = order.get('id')
+        rules = self.rules(symbol)
+        residual = realized.residual_base
+        step = rules.amount_step
+        sellable_rest = money.q_down(residual, step) if step is not None else residual
+        rest_sellable = bool(sellable_rest > 0 and (rules.min_amount is None or sellable_rest >= rules.min_amount))
+        try:
+            with storage.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                key = engine._key('paper_cash')
+                cash = float(db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()['value'])
+                db.execute('UPDATE meta SET value=? WHERE key=?', (repr(cash + float(realized.net_proceeds)), key))
+                if residual == 0:
+                    db.execute('DELETE FROM positions WHERE exchange=? AND mode=? AND symbol=?',
+                               (engine.exchange_name, 'paper', symbol))
+                else:
+                    db.execute('UPDATE positions SET qty=?, cost=? WHERE exchange=? AND mode=? AND symbol=?',
+                               (float(residual), float(realized.residual_basis), engine.exchange_name, 'paper', symbol))
+                db.execute('INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,realized,reason,order_id) '
+                           'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                           (_now_iso(), engine.exchange_name, 'paper', symbol, 'SELL', float(fill['average']),
+                            float(fill['filled']), float(fill['gross']),
+                            float(money.add(quote_fee or money.ZERO, money.mul(base_fee or money.ZERO, fill['average']))),
+                            float(realized.realized_net), f'Micro {trigger}: {reason}'[:200], order_id))
+                if intent is not None and not recovery:
+                    storage.update_order_intent(intent['intent_id'], 'accounted', order_id=order_id, db=db,
+                                                filled_quantity=float(fill['filled']),
+                                                filled_price=float(fill['average']))
+                elif intent is not None:
+                    self._settle_intent_for_recovery(intent, db, accounted=True, order_id=order_id,
+                                                     record={'average': float(fill['average']), 'filled': float(fill['filled'])})
+                fresh = dict(db.execute('SELECT * FROM micro_cycles WHERE cycle_id=?', (cycle['cycle_id'],)).fetchone())
+                status = realized.status if (fresh.get('realized_status') in (None, 'confirmed')) else fresh['realized_status']
+                fields = dict(owned_base=money.text(residual), basis_quote=money.text(realized.residual_basis),
+                              exit_count=int(fresh['exit_count']) + 1,
+                              closed_base=money.text(money.add(_dec(fresh['closed_base'], money.ZERO), realized.closed_base)),
+                              exit_gross=money.text(money.add(_dec(fresh['exit_gross'], money.ZERO), fill['gross'])),
+                              exit_fees=money.text(money.add(_dec(fresh['exit_fees'], money.ZERO), quote_fee or money.ZERO)),
+                              exit_proceeds_net=money.text(money.add(_dec(fresh['exit_proceeds_net'], money.ZERO),
+                                                                     realized.net_proceeds)),
+                              realized_net=money.text(money.add(_dec(fresh['realized_net'], money.ZERO),
+                                                                realized.realized_net)),
+                              realized_status=status, last_exit_trigger=trigger, review_reason=None)
+                data = {'realized': realized.as_dict(), 'trigger': trigger}
+                if rest_sellable:
+                    transition(db, fresh, 'HOLDING', f'partial exit ({trigger}); the rest stays managed', data=data, **fields)
+                else:
+                    transition(db, fresh, 'CLOSED', f'exit filled ({trigger})', data=data, closed_at=_now_iso(),
+                               closed_wall=time.time(), residual_base=money.text(residual),
+                               residual_basis=money.text(realized.residual_basis), **fields)
+        except Exception as exc:
+            engine._ledger_failure(f'MICRO SELL {symbol}: {type(exc).__name__}; portfolio ledger requires review',
+                                   intent_id=(intent or {}).get('intent_id'))
+            return False
+        self.metrics.observe('micro.fill_to_commit_ms', (time.monotonic() - started) * 1000)
+        try:
+            storage.audit('trade', f'PAPER MICRO SELL {symbol} ({trigger}): realized net {money.display(realized.realized_net, signed=True)} '
+                                   f'USDT ({realized.status}); residual {money.display(residual, 8)}.')
+            observability.event('micro.exit_booked', cycle_id=cycle['cycle_id'], symbol=symbol, trigger=trigger,
+                                realized_net=money.text(realized.realized_net), status=realized.status,
+                                residual=money.text(residual), order_id=order_id)
+        except Exception:
+            pass
+        try:
+            cash_after = engine._cash('paper')
+            engine.risk.observe_realized('paper', engine._equity('paper', cash_after, engine._active_positions('paper')))
+        except Exception:
+            pass
+        engine._observe_fills('paper')
+        if not rest_sellable:
+            self._after_close(cycle)
+        return True
+
+    def _after_close(self, cycle: dict) -> None:
+        try:
+            self._check_loss_limits()
+        except Exception as exc:
+            storage.audit('warning', f'Micro loss-limit check failed ({type(exc).__name__}); it runs again after the next exit.')
+
+    # ------------------------------------------------------------ entries
+    def _last_close(self, symbol: str) -> dict | None:
+        rows = storage.rows("SELECT closed_wall, realized_net FROM micro_cycles WHERE exchange=? AND mode='paper' "
+                            "AND symbol=? AND state='CLOSED' ORDER BY closed_wall DESC LIMIT 10",
+                            (self.engine.exchange_name, symbol))
+        if not rows:
+            return None
+        streak = 0
+        for row in rows:
+            if (_dec(row['realized_net'], money.ZERO) or money.ZERO) < 0:
+                streak += 1
+            else:
+                break
+        return {'closed_wall': float(rows[0]['closed_wall'] or 0.0), 'loss_streak': streak}
+
+    def _cooldown_remaining(self, symbol: str, now: float) -> tuple[float, dict | None]:
+        last = self._last_close(symbol)
+        if last is None:
+            return 0.0, None
+        base = float(self.engine.cfg['micro_cooldown_seconds'])
+        wait = base * (2 ** min(last['loss_streak'], 4))
+        return max(0.0, last['closed_wall'] + wait - now), last
+
+    def _committed(self) -> tuple[Decimal, Decimal]:
+        """(reserved by unfinished entries, basis of open cycles)."""
+        reserved, basis = money.ZERO, money.ZERO
+        for cycle in open_cycles(self.engine.exchange_name, 'paper'):
+            reserved = money.add(reserved, _dec(cycle['reserved_quote'], money.ZERO))
+            if cycle['state'] in OWNING_STATES or cycle['state'] == 'REVIEW':
+                basis = money.add(basis, _dec(cycle['basis_quote'], money.ZERO))
+        return reserved, basis
+
+    def _entries(self, params, selected: list[str]) -> None:
+        engine = self.engine
+        now = time.time()
+        opened = open_cycles(engine.exchange_name, 'paper')
+        open_symbols = {c['symbol'] for c in opened}
+        blockers = [c for c in opened if c['state'] in BLOCKING_STATES]
+        latch = self.latch()
+        capacity = len(opened) < int(engine.cfg['micro_max_cycles'])
+        entered = 0
+        max_age = float(engine.cfg['micro_book_max_age_seconds'])
+        for symbol in selected:
+            if not engine._orders_allowed():
+                return
+            if symbol in open_symbols:
+                self._set_waiting(symbol, None, 'Cycle open', [])
+                continue
+            context = self.context.get(symbol) or {}
+            features = context.get('features')
+            cooldown, last = self._cooldown_remaining(symbol, now)
+            fresh_after_exit = True
+            if last is not None and features is not None:
+                fresh_after_exit = (features.bar_ts_ms / 1000.0 + 60.0) > last['closed_wall']
+            pre_regime = None
+            if features is not None:
+                pre_regime, _ = strat.classify_regime(features, spread_bps=0.0, depth_ok=True, data_fresh=True,
+                                                      params=params)
+            plausible = pre_regime in ('trending_up', 'ranging') and capacity and not blockers and not latch \
+                and cooldown <= 0 and fresh_after_exit
+            book = self._book(symbol, interval=ENTRY_BOOK_SECONDS if plausible else IDLE_BOOK_SECONDS, max_age=max_age)
+            rules = self.rules(symbol)
+            cost = self.cost(rules)
+            sizing = None
+            if book is not None:
+                reserved, basis = self._committed()
+                try:
+                    cash = self._cash()
+                    sizing = econ.size_entry(rules=rules, book=book, cost=cost, budget_cap=self.budget_cap(),
+                                             cash_available=max(money.ZERO, money.sub(cash, reserved)),
+                                             allocation_remaining=max(money.ZERO, money.sub(self.allocation(),
+                                                                                            money.add(reserved, basis))),
+                                             target_net=self.target_net(),
+                                             exit_stress_bps=money.parse(params.max_loss_bps),
+                                             now_wall=now, max_rules_age_s=CATALOGUE_MAX_AGE_S)
+                except Exception as exc:
+                    self._note_error(symbol, f'sizing failed: {type(exc).__name__}')
+            fresh_book = book if book is not None and book.age_seconds(time.monotonic()) <= max_age else None
+            # Features of an older bar than the one that just closed are not fresh data for an entry.
+            features_current = features is None or bool(context.get('current'))
+            regime, regime_reasons = strat.classify_regime(
+                features, spread_bps=float(fresh_book.spread_bps) if fresh_book else 1e9,
+                depth_ok=bool(fresh_book and fresh_book.depth_known),
+                data_fresh=fresh_book is not None and features_current, params=params)
+            book_summary = {}
+            if book is not None:
+                book_summary = {'best_bid': money.text(book.best_bid), 'best_ask': money.text(book.best_ask),
+                                'spread_bps': float(book.spread_bps), 'generation': book.generation,
+                                'sequence': book.venue_sequence, 'age_s': round(book.age_seconds(time.monotonic()), 3),
+                                'source': book.source}
+            conflicts = self._symbol_conflicts(symbol, now)
+            gates = {'selected': True, 'capacity': capacity, 'cooldown_remaining_s': round(cooldown, 1),
+                     'fresh_after_exit': fresh_after_exit, 'review_block': bool(blockers) or bool(conflicts),
+                     'risk_block': engine.risk_block if engine.risk.kill_switch()['engaged'] else None,
+                     'latched': latch.get('reason') if latch else None}
+            sizing_dict = sizing.as_dict() if sizing is not None else {'eligible': False, 'code': 'DEPTH_UNKNOWN',
+                                                                        'detail': 'No fresh order book'}
+            started = time.monotonic()
+            verdict = strat.evaluate_entry(symbol=symbol, features=features, regime=regime,
+                                           regime_reasons=regime_reasons, sizing=sizing_dict, book_summary=book_summary,
+                                           params=params, gates=gates, now=now,
+                                           feature_reason=context.get('reason') if features is None else None)
+            self.metrics.observe('micro.entry_decision_ms', (time.monotonic() - started) * 1000)
+            if book is not None and verdict.action == 'enter':
+                self.metrics.observe('micro.book_to_decision_ms',
+                                     max(0.0, (time.monotonic() - book.received_mono) * 1000))
+            self._record_decision(symbol, verdict, sizing_dict, book_summary, regime, context)
+            if conflicts:
+                # The venue shows an order or a fill the ledger does not: never add exposure on top of it.
+                self._set_waiting(symbol, 'REVIEW', 'Venue record conflict: ' + conflicts[0]['explanation'],
+                                  [item['explanation'] for item in conflicts])
+            if verdict.action != 'enter' or entered >= ENTRIES_PER_TICK:
+                continue
+            if self._symbol_conflicts(symbol, now, force=True):
+                continue
+            if self._enter(symbol, verdict, sizing, book, rules, cost, features, params):
+                entered += 1
+                opened = open_cycles(engine.exchange_name, 'paper')
+                open_symbols = {c['symbol'] for c in opened}
+                capacity = len(opened) < int(engine.cfg['micro_max_cycles'])
+
+    def _record_decision(self, symbol, verdict, sizing_dict, book_summary, regime, context) -> None:
+        with self.lock:
+            row = self.pairs.setdefault(symbol, {'symbol': symbol})
+            row.update({'decision': verdict.as_dict(), 'sizing': sizing_dict, 'book': book_summary, 'regime': regime,
+                        'features': context.get('features').as_dict() if context.get('features') is not None else None,
+                        'context_reason': context.get('reason'), 'updated_at': _now_iso()})
+            if verdict.code != 'ERROR':
+                row.pop('error', None)
+        self._set_waiting(symbol, verdict.code, verdict.status, list(verdict.reasons))
+        self.decisions.append(verdict.as_dict())
+        if self.last_codes.get(symbol) != (verdict.action, verdict.code):
+            self.last_codes[symbol] = (verdict.action, verdict.code)
+            observability.event('micro.decision', decision_id=verdict.decision_id, symbol=symbol, action=verdict.action,
+                                code=verdict.code, status=verdict.status, reasons=list(verdict.reasons),
+                                candidate=verdict.candidate, regime=regime)
+        self.metrics.incr(f'micro.decision.{verdict.action}')
+
+    def _set_waiting(self, symbol: str, code: str | None, status: str, reasons: list) -> None:
+        with self.lock:
+            row = self.pairs.setdefault(symbol, {'symbol': symbol})
+            previous = row.get('waiting', {}).get('code')
+            if code and code != previous:
+                self.waiting_since[symbol] = time.time()
+            if code:
+                self.counters[code] += 1
+            row['waiting'] = {'code': code, 'status': status, 'reasons': reasons,
+                              'since': self.waiting_since.get(symbol) if code else None}
+
+    def _enter(self, symbol, verdict, sizing, book, rules, cost, features, params) -> bool:
+        engine = self.engine
+        proposal = verdict.proposal or {}
+        if sizing is None or not sizing.eligible or sizing.max_debit is None:
+            return False
+        cycle_id = 'cyc_' + uuid.uuid4().hex[:24]
+        stop_bps = proposal.get('stop_net_bps') or strat.stop_net_bps(features, params)
+        if stop_bps is None:
+            return False
+        stop_net = money.mul(self.budget_cap(), money.bps(money.parse(float(stop_bps))))
+        target_net = self.target_net()
+        sizing_record = sizing.as_dict()
+        owned_guess = sizing.sellable_base or sizing.expected_base
+        if owned_guess and owned_guess > 0:
+            # Approximate trigger prices for the legacy position row and the dashboard only.
+            sizing_record['stop_bid'] = money.text(money.div(money.sub(sizing.max_debit, stop_net), owned_guess))
+        started = time.monotonic()
+        try:
+            with storage.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                cash = money.parse(float(db.execute('SELECT value FROM meta WHERE key=?',
+                                                    (engine._key('paper_cash'),)).fetchone()['value']), field='paper cash')
+                rows = db.execute("SELECT state, reserved_quote, basis_quote FROM micro_cycles WHERE exchange=? AND mode='paper' "
+                                  "AND state NOT IN ('CLOSED','ABANDONED')", (engine.exchange_name,)).fetchall()
+                reserved = money.add(*[_dec(r['reserved_quote'], money.ZERO) for r in rows])
+                basis = money.add(*[_dec(r['basis_quote'], money.ZERO) for r in rows])
+                if len(rows) >= int(engine.cfg['micro_max_cycles']):
+                    raise CycleError('micro cycle capacity reached')
+                if money.sub(cash, reserved) < sizing.max_debit:
+                    raise CycleError('paper cash is already reserved by other entries')
+                if money.add(reserved, basis, sizing.max_debit) > self.allocation():
+                    raise CycleError('the micro allocation is fully committed')
+                position = db.execute('SELECT qty, cost FROM positions WHERE exchange=? AND mode=? AND symbol=?',
+                                      (engine.exchange_name, 'paper', symbol)).fetchone()
+                carried_base = carried_basis = money.ZERO
+                if position is not None:
+                    market = engine._catalogue().get(symbol)
+                    if not engine._is_dust(dict(position), market, float(book.best_bid)):
+                        raise CycleError(f'{symbol} is already held outside the micro cycles')
+                    carried_base = money.parse(float(position['qty']), field='carried quantity')
+                    carried_basis = money.parse(float(position['cost']), field='carried cost')
+                stamp = _now_iso()
+                db.execute('INSERT INTO micro_cycles(cycle_id, exchange, mode, symbol, state, created_at, updated_at, '
+                           'strategy, decision_id, opportunity_key, budget_cap, reserved_quote, sizing, carried_base, '
+                           'carried_basis, target_net, stop_net, max_hold_s, last_reason) '
+                           'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                           (cycle_id, engine.exchange_name, 'paper', symbol, 'ENTRY_RESERVED', stamp, stamp,
+                            verdict.candidate, verdict.decision_id, proposal['opportunity_key'],
+                            money.text(self.budget_cap()), money.text(sizing.max_debit),
+                            json.dumps(sizing_record, default=str), money.text(carried_base), money.text(carried_basis),
+                            money.text(target_net), money.text(stop_net), float(params.max_hold_s), verdict.status[:300]))
+                db.execute('INSERT INTO micro_cycle_events(cycle_id, at, from_state, to_state, reason, data) VALUES (?,?,?,?,?,?)',
+                           (cycle_id, stamp, None, 'ENTRY_RESERVED', 'cash reserved for a new cycle',
+                            json.dumps({'reserved': money.text(sizing.max_debit), 'decision_id': verdict.decision_id,
+                                        'opportunity_key': proposal['opportunity_key']})))
+        except CycleError as exc:
+            self._set_waiting(symbol, 'CAPACITY' if 'capacity' in str(exc) or 'allocation' in str(exc) else 'RISK',
+                              str(exc), [str(exc)])
+            return False
+        except Exception as exc:
+            # A duplicate opportunity key lands here too: that opportunity was already used.
+            self._set_waiting(symbol, 'RISK', f'Entry not reserved: {type(exc).__name__}', [type(exc).__name__])
+            return False
+        self.metrics.observe('micro.reservation_ms', (time.monotonic() - started) * 1000)
+        cycle = load_cycle(cycle_id)
+        positions = engine._active_positions('paper')
+        authorization = engine._authorize(symbol, 'BUY', 'micro_entry', float(sizing.max_debit), float(book.best_ask),
+                                          positions=positions, cash=engine._cash('paper'),
+                                          stop_fraction=min(0.5, float(stop_bps) / 10000.0),
+                                          spread=float(book.spread_bps) / 100.0, reason=verdict.status,
+                                          decision_id=cycle_id, sizing=sizing.as_dict())
+        if not authorization.allowed:
+            with storage.connection() as db:
+                transition(db, cycle, 'ABANDONED', 'risk gate refused: ' + authorization.reason, reserved_quote='0')
+            self._set_waiting(symbol, 'RISK', 'Risk gate: ' + authorization.reason, list(authorization.failed))
+            return False
+        with storage.connection() as db:
+            cycle = transition(db, cycle, 'ENTRY_SUBMITTED', 'order intent being sent')
+        intent, order = engine._submit(self.venue, symbol, 'BUY', cost=float(sizing.gross_quote),
+                                       authorization=authorization, intended_price=float(book.best_ask),
+                                       decision_id=cycle_id,
+                                       venue_params={'book': book, 'adverse_bps': cost.latency_bps,
+                                                     'taker_fee': cost.taker_fee})
+        if order is None:
+            self._unsent_or_unknown(cycle, 'BUY')
+            return False
+        intent_row = storage.order_intent(intent)
+        return self._book_entry(cycle, intent_row, self._final_answer(symbol, intent_row, order))
+
+    # ------------------------------------------------------- operator exit
+    def flatten(self) -> dict:
+        """Exit every open micro holding now (a risk-reducing operator action)."""
+        engine = self.engine
+        with engine.lock:
+            running = engine.running and engine.thread is not None and engine.thread.is_alive()
+        if running:
+            self.request_flatten()
+            return {'queued': True}
+        with engine.lock:
+            if engine._busy():
+                raise storage.ConfigValidationError('Wait for the active operation to finish.')
+            if engine.mode != 'paper':
+                raise storage.ConfigValidationError(micro_policy.PAPER_ONLY)
+            if not engine.scan_lock.acquire(blocking=False):
+                raise storage.ConfigValidationError('Wait for the active market operation to finish.')
+            engine.control_busy = engine._manual_order_active = True
+            engine.stop_event.clear()
+        results = []
+        try:
+            self._refresh_catalogue()
+            params = self.params()
+            for cycle in open_cycles(engine.exchange_name, 'paper'):
+                if cycle['state'] == 'HOLDING':
+                    self._manage_exit(cycle, params, operator=True)
+                    results.append(cycle['symbol'])
+        finally:
+            with engine.lock:
+                engine._manual_order_active = engine.control_busy = False
+                engine.scan_lock.release()
+        return {'queued': False, 'attempted': results}
+
+    # ------------------------------------------------------------ status
+    def results(self) -> dict:
+        rows = storage.rows("SELECT * FROM micro_cycles WHERE exchange=? AND mode='paper' AND state='CLOSED' "
+                            'ORDER BY closed_wall DESC LIMIT 500', (self.engine.exchange_name,))
+        values = [(_dec(r['realized_net'], money.ZERO) or money.ZERO) for r in reversed(rows)]
+        wins = [v for v in values if v > 0]
+        losses = [v for v in values if v < 0]
+        target = self.target_net()
+        equity, peak, drawdown = money.ZERO, money.ZERO, money.ZERO
+        for value in values:
+            equity = money.add(equity, value)
+            peak = max(peak, equity)
+            drawdown = max(drawdown, money.sub(peak, equity))
+        fees = money.add(*[money.add(_dec(r['entry_fee_quote'], money.ZERO) or money.ZERO,
+                                     _dec(r['exit_fees'], money.ZERO) or money.ZERO) for r in rows])
+        turnover = money.add(*[money.add(_dec(r['entry_gross'], money.ZERO) or money.ZERO,
+                                         _dec(r['exit_gross'], money.ZERO) or money.ZERO) for r in rows])
+        # Gains before fees (net result plus that cycle's fees): the share fees take of what the price moves
+        # earned. For a cycle that left a residual, its whole entry fee is counted (a slight overstatement).
+        before_fees = [money.add(_dec(r['realized_net'], money.ZERO) or money.ZERO,
+                                 _dec(r['entry_fee_quote'], money.ZERO) or money.ZERO,
+                                 _dec(r['exit_fees'], money.ZERO) or money.ZERO) for r in rows]
+        positive = [v for v in before_fees if v > 0]
+        gross_gains = money.add(*positive) if positive else money.ZERO
+        holds = [max(0.0, float(r['closed_wall'] or 0) - float(r['opened_wall'] or 0)) for r in rows if r['opened_wall']]
+        triggers = Counter(r['last_exit_trigger'] or 'unknown' for r in rows)
+        near_even = sum(1 for v in values if abs(v) <= money.mul(target, Decimal('0.25')))
+        residuals = storage.rows("SELECT symbol, residual_base, residual_basis FROM micro_cycles WHERE exchange=? AND mode='paper' "
+                                 "AND state='CLOSED' AND residual_base NOT IN ('0', '') ORDER BY closed_wall DESC LIMIT 20",
+                                 (self.engine.exchange_name,))
+        unconfirmed = [v for v, r in zip(reversed(values), rows) if r['realized_status'] != 'confirmed']
+        bins = Counter()
+        cap = self.budget_cap()
+        for value in values:
+            ratio = float(money.div(value, cap)) * 10000 if cap else 0.0
+            edge = int(math.floor(ratio / 10.0)) * 10
+            bins[f'{edge}..{edge + 10} bps'] += 1
+        return {
+            'closed_cycles': len(values), 'wins': len(wins), 'losses': len(losses), 'flat': len(values) - len(wins) - len(losses),
+            'realized_net_total': money.text(money.add(*values)) if values else '0',
+            'realized_unconfirmed_count': len(unconfirmed),
+            'average_net': money.text(money.div(money.add(*values), Decimal(len(values)))) if values else None,
+            'worst_loss': money.text(min(values)) if values else None,
+            'best_gain': money.text(max(values)) if values else None,
+            'max_drawdown': money.text(drawdown), 'fees_paid': money.text(fees), 'turnover': money.text(turnover),
+            'fees_share_of_gross_gains': (round(float(money.div(fees, gross_gains)), 4) if gross_gains > 0 else None),
+            'average_hold_s': round(sum(holds) / len(holds), 1) if holds else None,
+            'near_break_even_exits': near_even, 'exit_triggers': dict(triggers), 'distribution_bps_of_cap': dict(bins),
+            'residuals': [{'symbol': r['symbol'], 'base': r['residual_base'], 'basis': r['residual_basis']} for r in residuals],
+            'note': 'PAPER simulated fills. Win rate and cycle count are not success measures; see net result, '
+                    'drawdown and fees.',
+        }
+
+    def status(self) -> dict:
+        engine = self.engine
+        try:
+            cap = self.budget_cap()
+            reserved, basis = self._committed()
+            opened = open_cycles(engine.exchange_name, 'paper')
+        except Exception as exc:
+            return {'active': self.active(), 'error': f'micro status unavailable: {type(exc).__name__}'}
+        cycles = []
+        for cycle in opened:
+            row = self.pairs.get(cycle['symbol'], {})
+            exit_view = row.get('exit') or {}
+            cycles.append({key: cycle[key] for key in (
+                'cycle_id', 'symbol', 'state', 'strategy', 'opened_at', 'owned_base', 'basis_quote', 'entry_debit',
+                'entry_price', 'entry_fee_status', 'entry_partial', 'carried_base', 'target_net', 'stop_net',
+                'max_hold_s', 'peak_est_net', 'realized_net', 'exit_count', 'last_reason', 'review_reason',
+                'reserved_quote')} | {
+                'age_s': round(time.time() - float(cycle['opened_wall']), 1) if cycle['opened_wall'] else None,
+                'estimate': exit_view.get('estimate'), 'exit_verdict': exit_view.get('verdict'),
+                'depth_model': exit_view.get('depth_model')})
+        with self.lock:
+            pairs = []
+            for symbol in self.selected() + sorted(set(self.pairs) - set(self.selected())):
+                row = dict(self.pairs.get(symbol, {'symbol': symbol}))
+                row['selected'] = symbol in self.selected()
+                waiting = row.get('waiting') or {}
+                if waiting.get('since'):
+                    waiting = {**waiting, 'waiting_s': round(time.time() - waiting['since'], 1)}
+                    row['waiting'] = waiting
+                pairs.append(row)
+            counters = dict(self.counters)
+        latch = self.latch()
+        return {
+            'active': self.active(), 'paper_only': True, 'paper_only_reason': micro_policy.PAPER_ONLY,
+            'running': engine.running and self.active(),
+            'budget': {'cap': money.text(cap), 'absolute_cap': money.text(econ.MICRO_MAX_ALL_IN_USDT),
+                       'configured': str(engine.cfg['micro_budget_usdt']), 'allocation': money.text(self.allocation()),
+                       'reserved': money.text(reserved), 'committed_basis': money.text(basis),
+                       'max_cycles': int(engine.cfg['micro_max_cycles']),
+                       'meaning': 'All-in quote debit per entry including the fee reserve; never raised automatically.'},
+            'params': {key: engine.cfg[key] for key in storage.MICRO_FIELDS} | {
+                'uncertainty_floor_bps': UNCERTAINTY_FLOOR_BPS, 'max_spread_bps': self.params().max_spread_bps,
+                'max_vol_bps': MAX_VOL_BPS, 'edge_ratio': EDGE_RATIO},
+            'latch': latch, 'review_block': self.review_block(), 'recovery': list(self.recovery),
+            'pairs': pairs, 'cycles': cycles, 'results': self.results(), 'counters': counters,
+            'books': self.books.status(time.monotonic()), 'last_tick': self.last_tick, 'last_error': self.last_error,
+            'heuristic_note': 'Setup checks are transparent heuristics, not calibrated probabilities of profit.',
+        }
+
+    def recent_decisions(self, limit: int = 50) -> list[dict]:
+        with self.lock:
+            items = list(self.decisions)[-max(1, min(limit, 300)):]
+        return list(reversed(items))
+
+    def reset_memory(self) -> None:
+        with self.lock:
+            self.pairs.clear()
+            self.counters.clear()
+            self.waiting_since.clear()
+            self.context.clear()
+            self.decisions.clear()
+            self.recovery = []

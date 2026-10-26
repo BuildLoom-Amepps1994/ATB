@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+import micro_policy
 import observability
 import storage
 
@@ -33,8 +34,8 @@ SLIPPAGE_SAMPLE, SLIPPAGE_MULTIPLE = 3, 3.0
 EXIT_RATE_MULTIPLE = 3
 MIN_ORDER_USDT = 12.0
 
-ENTRY_KINDS = ('entry', 'manual_entry')
-EXIT_KINDS = ('exit', 'manual_exit')
+ENTRY_KINDS = ('entry', 'manual_entry', 'micro_entry')
+EXIT_KINDS = ('exit', 'manual_exit', 'micro_exit')
 
 
 def _today() -> str:
@@ -59,7 +60,7 @@ class OrderRequest:
     mode: str
     symbol: str
     side: str                      # 'BUY' | 'SELL'
-    kind: str                      # 'entry' | 'exit' | 'manual_entry' | 'manual_exit'
+    kind: str                      # 'entry' | 'exit' | 'manual_entry' | 'manual_exit' | 'micro_entry' | 'micro_exit'
     notional: float                # USDT to spend (buys) or qty * price (sells)
     price: float                   # executable quote the request is priced from
     quantity: float | None = None
@@ -70,6 +71,8 @@ class OrderRequest:
     spread_pct: float | None = None
     reason: str = ''
     decision_id: str | None = None
+    # Micro entries only: the venue-aware sizing verdict (micro_economics.SizingResult.as_dict()).
+    sizing: dict | None = None
 
     def __post_init__(self):
         if self.side not in ('BUY', 'SELL'):
@@ -91,7 +94,7 @@ class Authorization:
     failed: tuple[str, ...]
     checks: tuple[dict, ...]
     token: str
-    issued_at: float = field(default_factory=time.monotonic)
+    issued_at: float = field(default_factory=lambda: time.monotonic())   # read at issue time, never bound early
 
     @property
     def reason(self) -> str:
@@ -411,6 +414,11 @@ class RiskGate:
               age_seconds=request.quote_age_seconds, limit_seconds=cfg['data_max_age_seconds'])
         check('price_finite', bool(_finite(request.price)) and request.price > 0, 'Executable price is invalid')
         check('notional_finite', bool(_finite(request.notional)) and request.notional > 0, 'Order notional is invalid')
+        micro_order = micro_policy.is_micro(kind=request.kind)
+        if micro_order or micro_policy.is_micro(horizon=cfg.get('time_horizon')):
+            refusal = (micro_policy.live_refusal(mode, kind=request.kind)
+                       or micro_policy.live_refusal(mode, horizon=cfg.get('time_horizon')))
+            check('micro_paper_only', refusal is None, refusal or '')
         if request.is_entry:
             check('kill_switch', not switch['engaged'], 'Kill switch engaged: new orders blocked')
             check('settings_review', not (mode == 'live' and storage.settings_health()['review_required']),
@@ -419,7 +427,21 @@ class RiskGate:
             check('valuation_available', cash is not None and equity is not None and _finite(equity) and equity > 0,
                   'Portfolio valuation unavailable; new entries blocked')
             eq = float(equity) if equity is not None and _finite(equity) else 0.0
-            check('min_order', request.notional >= MIN_ORDER_USDT, f'Order below the {MIN_ORDER_USDT:.0f} USDT minimum')
+            if request.kind == 'micro_entry':
+                # The micro profile replaces the local 12 USDT floor with the venue's own
+                # minimums, checked by the one sizing component, and a hard all-in cap.
+                from micro_economics import MICRO_MAX_ALL_IN_USDT
+                cap = min(float(MICRO_MAX_ALL_IN_USDT), float(cfg.get('micro_budget_usdt', MICRO_MAX_ALL_IN_USDT)))
+                sizing = request.sizing if isinstance(request.sizing, dict) else {}
+                sized_debit = _finite(sizing.get('max_debit'))
+                check('micro_all_in_cap', request.notional <= cap + 1e-9,
+                      f'Order debit {request.notional:.4f} exceeds the {cap:.2f} USDT all-in micro cap', limit=cap)
+                check('micro_sizing', bool(sizing.get('eligible')) and sized_debit is not None
+                      and abs(sized_debit - request.notional) <= 1e-9,
+                      'Order is not backed by an eligible venue-aware sizing result'
+                      + (f' ({sizing.get("code")})' if sizing.get('code') else ''))
+            else:
+                check('min_order', request.notional >= MIN_ORDER_USDT, f'Order below the {MIN_ORDER_USDT:.0f} USDT minimum')
             max_order = float(cfg['max_order_notional_usdt'])
             check('max_order_notional', request.notional <= max_order + 1e-6,
                   f'Order notional {request.notional:.2f} exceeds the {max_order:.0f} USDT per-order cap', limit=max_order)

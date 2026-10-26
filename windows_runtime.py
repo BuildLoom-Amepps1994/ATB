@@ -21,6 +21,8 @@ REQUIRED_MODULES = frozenset({
     'launcher', 'app', 'credentials', 'storage', 'market_data', 'trader',
     'strategy', 'recovery', 'updater',
     'decision', 'feed', 'observability', 'orders', 'paper_exchange', 'risk',
+    'micro', 'micro_book', 'micro_economics', 'micro_policy', 'micro_strategy', 'micro_venue',
+    'money', 'venue_rules',
 })
 REQUIRED_ASSETS = ('index.html', 'dashboard.js', 'dashboard-core.js')
 

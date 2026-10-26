@@ -26,7 +26,7 @@ class MarketData:
     so protective price checks never wait behind queued candle downloads.
     """
 
-    PRIORITY_METHODS = ('fetch_ticker', 'fetch_tickers', 'fetch_bids_asks')
+    PRIORITY_METHODS = ('fetch_ticker', 'fetch_tickers', 'fetch_bids_asks', 'fetch_order_book')
 
     def __init__(self, client, *, clock=time.time, monotonic=time.monotonic, wait=None,
                  concurrency: int = 1):
@@ -162,6 +162,15 @@ class MarketData:
 
     def ticker(self,symbol):
         result = self.read('fetch_ticker',symbol)
+        return self._received(result, self.clock())
+
+    def order_book(self, symbol, limit=20):
+        """A public depth snapshot (MEXC REST depth weight 3 at limit<=100), stamped on receipt.
+
+        Validation is the caller's (``micro_book.from_ccxt_order_book``): this
+        only reads, so a malformed book is refused there, never repaired here.
+        """
+        result = self.read('fetch_order_book', symbol, int(limit))
         return self._received(result, self.clock())
 
     def tickers(self,symbols):

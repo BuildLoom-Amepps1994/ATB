@@ -24,6 +24,8 @@ REQUIRED_APP = {
     'app.py', 'launcher.py', 'trader.py', 'strategy.py', 'storage.py',
     'credentials.py', 'market_data.py', 'recovery.py', 'updater.py',
     'decision.py', 'feed.py', 'observability.py', 'orders.py', 'paper_exchange.py', 'risk.py',
+    'micro.py', 'micro_book.py', 'micro_economics.py', 'micro_policy.py', 'micro_strategy.py',
+    'micro_venue.py', 'money.py', 'venue_rules.py',
     'requirements-lock.txt',
     'static/index.html', 'static/dashboard.js', 'static/dashboard-core.js',
 }

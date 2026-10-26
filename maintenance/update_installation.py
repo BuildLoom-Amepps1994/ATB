@@ -22,13 +22,6 @@ MODULES = (
     'observability.py', 'orders.py', 'paper_exchange.py', 'recovery.py', 'risk.py',
     'storage.py', 'strategy.py', 'trader.py', 'updater.py',
 )
-# Every release since 1.4.0 ships at least these. Recovery from an interrupted
-# update restores the record of the release that came before, which can list
-# fewer modules than this one (an upgrade) or more (a downgrade).
-BASE_MODULES = (
-    'app.py', 'credentials.py', 'launcher.py', 'market_data.py',
-    'recovery.py', 'storage.py', 'strategy.py', 'trader.py', 'updater.py',
-)
 METADATA_FILES = ('requirements-lock.txt',)
 REQUIRED_ASSETS = ('static/index.html', 'static/dashboard.js', 'static/dashboard-core.js')
 ASSET_EXTENSIONS = {'.html', '.js', '.css', '.svg', '.png', '.jpg', '.jpeg',
@@ -36,7 +29,6 @@ ASSET_EXTENSIONS = {'.html', '.js', '.css', '.svg', '.png', '.jpg', '.jpeg',
 JOURNAL = 'update-transaction.json'
 _HASH = re.compile(r'[0-9a-f]{64}\Z')
 _RESERVED = re.compile(r'(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?\Z', re.I)
-_MODULE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\.py\Z')
 
 
 class UpdateError(RuntimeError):
@@ -122,7 +114,7 @@ class InstallationLock:
             self.handle = None
 
 
-def _relative_file(name: str, *, any_module: bool = False) -> bool:
+def _relative_file(name: str) -> bool:
     if not isinstance(name, str) or '\\' in name or ':' in name or '\0' in name:
         return False
     path = PurePosixPath(name)
@@ -131,8 +123,6 @@ def _relative_file(name: str, *, any_module: bool = False) -> bool:
     if any(part in ('.', '..') or part.endswith(('.', ' ')) or _RESERVED.fullmatch(part)
            for part in path.parts):
         return False
-    if any_module and len(path.parts) == 1 and _MODULE.fullmatch(name):
-        return True
     return name in (*MODULES, *METADATA_FILES) or (len(path.parts) > 1 and path.parts[0] == 'static'
                                and path.suffix.lower() in ASSET_EXTENSIONS)
 
@@ -150,9 +140,7 @@ def _load_json(path: Path) -> dict:
     return value
 
 
-def _validate_manifest(value: dict, *, other_release: bool = False) -> dict:
-    """``other_release`` checks a record another release wrote: same format and
-    safety rules, but only the modules every release ships are required."""
+def _validate_manifest(value: dict) -> dict:
     files = value.get('app_files')
     if (value.get('format') != 1 or value.get('product') != 'CryptoPilot'
             or not isinstance(value.get('installed_version'), str)
@@ -161,12 +149,11 @@ def _validate_manifest(value: dict, *, other_release: bool = False) -> dict:
             or not _HASH.fullmatch(value['requirements_sha256'])
             or not isinstance(files, dict) or not 1 <= len(files) <= 5000):
         raise UpdateError('Unsupported CryptoPilot installation metadata.')
-    required = BASE_MODULES if other_release else MODULES
-    if not set((*required, *METADATA_FILES, *REQUIRED_ASSETS)).issubset(files):
+    if not set((*MODULES, *METADATA_FILES, *REQUIRED_ASSETS)).issubset(files):
         raise UpdateError('Installation metadata is missing required application files.')
     seen = set()
     for name, digest in files.items():
-        if (not _relative_file(name, any_module=other_release) or name.casefold() in seen
+        if (not _relative_file(name) or name.casefold() in seen
                 or not isinstance(digest, str) or not _HASH.fullmatch(digest)):
             raise UpdateError('Installation metadata contains an unsafe application path or hash.')
         seen.add(name.casefold())
@@ -282,9 +269,7 @@ def recover_if_needed(root: str | Path) -> bool:
     if not marker.exists():
         return False
     backup, _ = _transaction_paths(root, _load_json(marker))
-    # The backup record was written by the release being replaced, which may
-    # ship a different module set from this helper's own release.
-    previous = _validate_manifest(_load_json(backup / 'installation.json'), other_release=True)
+    previous = _validate_manifest(_load_json(backup / 'installation.json'))
     application = root / 'app'
     old_application = backup / 'app'
     _plain_path(application)

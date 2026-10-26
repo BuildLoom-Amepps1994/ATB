@@ -23,22 +23,31 @@ Semantics:
   spread, and walking the book already contains the depth impact, so a walk
   only moves each level price against us by the latency margin and never adds
   flat slippage. The flat fallback slippage applies only where depth is
-  unknown, and only to exit estimates: an entry needs depth.
+  unknown, and only to exit estimates: an entry needs depth. Beyond the last
+  visible bid depth is unknown too, so an exit the visible bids cannot absorb
+  prices the rest with the fallback, from the worst visible bid, and is never
+  labelled a book estimate (profit exits need one; safety exits need a figure).
 * An unknown fee currency is sized both ways (a quote fee reserved and a base
   fee assumed), the conservative reading of each.
 * Functions are pure: rules, books, cash and ``now`` are explicit inputs. A
   book is any object with ``bids`` and ``asks`` (``(price, quantity or None)``
-  pairs, best first), ``depth_known``, ``best_bid`` and ``best_ask``. Its
+  pairs, best first), ``depth_known``, ``best_bid`` and ``best_ask``, and
+  optionally ``exchange`` and ``symbol``, which must then match the rules. Its
   levels are validated again here, because a corrupt or hostile level must not
   reach the arithmetic even if it got past the book module.
+* ``now`` is a finite wall-clock reading. A missing or non-finite clock, a
+  malformed age limit, or rules stamped later than ``now`` make the rules' age
+  unknown, which fails the staleness gate instead of skipping it.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields
 from decimal import Decimal
 
 import money
 from money import BPS, ONE, ZERO, MoneyError
+from venue_rules import METADATA_STALE
 
 MICRO_MAX_ALL_IN_USDT = Decimal('25')     # absolute cap of the micro profile; never raised by code
 # Sizing obeys the smaller of this literal and the public name, so rebinding the
@@ -127,6 +136,44 @@ def _record(obj) -> dict:
     return {item.name: convert(getattr(obj, item.name)) for item in fields(obj)}
 
 
+def _clock(value) -> float | None:
+    """A wall-clock reading or duration as a finite float; None when missing, boolean, text or not finite."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _rules_age(rules, now_wall, max_age) -> tuple[bool, str, float | None, float | None]:
+    """``(ok, detail, age_s, limit_s)`` for the step-2 staleness gate.
+
+    The clock is required even without a limit (the contract makes it an
+    input). With a limit, an age that cannot be established (no load time,
+    rules stamped after ``now``) is stale, never zero.
+    """
+    now, loaded = _clock(now_wall), _clock(rules.loaded_at)
+    age = now - loaded if now is not None and loaded is not None and now >= loaded else None
+    if now is None:
+        return False, ('The current time is missing or not a finite number, so the age of the market rules '
+                       'cannot be checked'), None, None
+    if max_age is None:
+        return True, '', age, None
+    limit = _clock(max_age)
+    if limit is None or limit < 0:
+        return False, 'The market-rules age limit is not a finite, non-negative number of seconds', age, None
+    if loaded is None:
+        return False, f'{rules.symbol} market rules have no valid load time, so their age is unknown', None, limit
+    if now < loaded:
+        return False, (f'{rules.symbol} market rules are stamped {loaded - now:.3f} s after the current time '
+                       '(clock or units mismatch), so their age is unknown'), None, limit
+    if age > limit:
+        return False, f'{rules.symbol} market rules are {age:.0f} s old, older than the {limit:.0f} s limit', age, limit
+    return True, '', age, limit
+
+
 def _tick_up(value: Decimal, tick: Decimal | None) -> Decimal:
     """The first venue price at or above ``value``: the bid that is actually needed."""
     return value if tick is None else money.q_up(value, tick)
@@ -213,6 +260,7 @@ class _Book:
     depth_known: bool
     best_bid: Decimal
     best_ask: Decimal
+    exchange: str | None
     symbol: str | None
 
 
@@ -247,9 +295,14 @@ def _book(book) -> _Book:
             raise MoneyError(f'{name} does not match the first level')
     if bids[0][0] >= asks[0][0]:
         raise MoneyError('order book is crossed or locked')
-    symbol = getattr(book, 'symbol', None)
+    market = {}
+    for name in ('exchange', 'symbol'):
+        value = getattr(book, name, None)
+        if value is not None and not isinstance(value, str):
+            raise MoneyError(f'order book {name} is not text')
+        market[name] = value
     return _Book(bids=bids, asks=asks, depth_known=getattr(book, 'depth_known', False) is True,
-                 best_bid=bids[0][0], best_ask=asks[0][0], symbol=symbol if isinstance(symbol, str) else None)
+                 best_bid=bids[0][0], best_ask=asks[0][0], **market)
 
 
 def _try_book(book):
@@ -257,6 +310,15 @@ def _try_book(book):
         return _book(book)
     except MoneyError as exc:
         return exc
+
+
+def _foreign(book: _Book, rules) -> str | None:
+    """Why ``book`` is not a book of the market ``rules`` describe, or None. An unlabelled book is not foreign."""
+    if book.exchange is not None and book.exchange != rules.exchange:
+        return f'Order book is from {book.exchange}, not {rules.exchange}'
+    if book.symbol is not None and book.symbol != rules.symbol:
+        return f'Order book is for {book.symbol}, not {rules.symbol}'
+    return None
 
 
 @dataclass(frozen=True)
@@ -420,8 +482,9 @@ def _plan(target: Decimal, *, rules, book, cost: CostModel, stress: Decimal, rec
     if isinstance(book, MoneyError):
         gate('ask_depth', 5, False, PRICE_UNKNOWN, f'Order book refused: {book}')
         return plan
-    if book.symbol is not None and book.symbol != rules.symbol:
-        gate('ask_depth', 5, False, PRICE_UNKNOWN, f'Order book is for {book.symbol}, not {rules.symbol}')
+    foreign = _foreign(book, rules)
+    if foreign is not None:
+        gate('ask_depth', 5, False, PRICE_UNKNOWN, foreign)
         return plan
     if not book.depth_known:
         gate('ask_depth', 5, False, DEPTH_UNKNOWN,
@@ -510,6 +573,9 @@ def _minimum_feasible(*, rules, book, cost: CostModel, stress: Decimal) -> tuple
     """
     if isinstance(book, MoneyError):
         return None, f'Not calculated: the order book was refused ({book})'
+    foreign = _foreign(book, rules)
+    if foreign is not None:
+        return None, f'Not calculated: {foreign}'
     minimum, _ = _market_minimum(rules)
     upper = SEARCH_FLOOR_USDT if minimum is None else max(SEARCH_FLOOR_USDT, money.mul(SEARCH_MIN_COST_MULTIPLE, minimum))
     top = int(money.div(money.q_down(upper, SEARCH_STEP), SEARCH_STEP))
@@ -608,12 +674,14 @@ def size_entry(*, rules, book, cost: CostModel, budget_cap: Decimal, cash_availa
 
     # 2. Both legs must be tradable now: an entry without a possible exit is not an entry.
     if failure is None:
-        age = rules.age_seconds(now_wall) if now_wall is not None else None
         for side, name in (('BUY', 'venue_buy'), ('SELL', 'venue_sell')):
-            ok, code, detail = rules.tradable(side, now=now_wall, max_age_seconds=max_rules_age_s)
-            if not gate(name, 2, ok, code, detail, rules_age_s=age, max_rules_age_s=max_rules_age_s,
-                        issues='; '.join(rules.issues) or None):
+            ok, code, detail = rules.tradable(side)
+            if not gate(name, 2, ok, code, detail, issues='; '.join(rules.issues) or None):
                 break
+    if failure is None:
+        ok, detail, age, limit = _rules_age(rules, now_wall, max_rules_age_s)
+        gate('rules_age', 2, ok, METADATA_STALE, detail, rules_age_s=age, max_rules_age_s=limit,
+             now_wall=_clock(now_wall), loaded_at=_clock(rules.loaded_at))
 
     # 3-9. Quote, fee reserve, minimums, depth, fees, quantity step and exit feasibility.
     plan = None
@@ -621,10 +689,12 @@ def size_entry(*, rules, book, cost: CostModel, budget_cap: Decimal, cash_availa
         plan = _plan(target, rules=rules, book=validated, cost=cost, stress=stress, record=record)
         failure = plan.failure
         if failure is not None and failure[0] in _SMALL_BUDGET_CODES and limited_by in ('cash', 'allocation'):
-            # When the cap alone would clear the minimum, the binding limit (not the venue) is the reason;
-            # the order stays at the reduced target either way.
+            # Only when the cap-sized order would be eligible is the binding limit (not the venue) the
+            # reason. A cap-sized order that fails for any other cause (a refused book, unknown depth, a
+            # maximum) is not cured by cash, so the venue minimum stays the reason. The order stays at
+            # the reduced target either way.
             at_cap = _plan(cap, rules=rules, book=validated, cost=cost, stress=stress, record=_ignore)
-            if at_cap.failure is None or at_cap.failure[0] not in _SMALL_BUDGET_CODES:
+            if at_cap.failure is None:
                 code = CASH_INSUFFICIENT if limited_by == 'cash' else ALLOCATION_EXHAUSTED
                 detail = (f'{failure[1]}; the {_show(cap)} USDT budget cap would meet it, but {limited_by} '
                           f'limits the target budget to {_show(target)} USDT')
@@ -704,9 +774,13 @@ def estimate_exit(*, owned_base: Decimal, basis_quote: Decimal, rules, book, cos
 
     With known depth the bid walk prices the sale (latency once per level, no
     flat slippage). With unknown depth the best bid is reduced by the fallback
-    slippage and the latency margin. A refused book is ``unavailable``. When
-    the visible bids cannot absorb the sale the proceeds are unknown (None) and
-    the labels carry what the book did show.
+    slippage and the latency margin. A refused book, or one of another market,
+    is ``unavailable``. When the visible bids cannot absorb the sale, depth
+    beyond them is unknown: the visible levels price what they absorb and the
+    rest is priced by the flat fallback from the worst visible bid. That is a
+    conservative estimate a safety exit can act on, not a book walk, so it is
+    ``flat_fallback`` with ``depth_exhausted`` set (profit exits need ``book``);
+    the labels also carry the floor where nothing beyond the visible bids sells.
     """
     owned = money.parse(owned_base, field='owned base')
     basis = money.parse(basis_quote, field='basis')
@@ -727,8 +801,8 @@ def estimate_exit(*, owned_base: Decimal, basis_quote: Decimal, rules, book, cos
         labels['fees'] = 'modeled; billed in base, valued at the exit price'
 
     validated = _try_book(book)
-    if isinstance(validated, MoneyError) or (validated.symbol is not None and validated.symbol != rules.symbol):
-        reason = str(validated) if isinstance(validated, MoneyError) else f'book is for {validated.symbol}'
+    reason = str(validated) if isinstance(validated, MoneyError) else _foreign(validated, rules)
+    if reason is not None:
         labels.update(proceeds='unknown', depth=f'unavailable: {reason}')
         return ExitEstimate(sellable_base=sellable, gross_proceeds=None, sell_fee=None, net_proceeds=None,
                             allocated_basis=allocated, est_net_pnl=None,
@@ -736,30 +810,42 @@ def estimate_exit(*, owned_base: Decimal, basis_quote: Decimal, rules, book, cos
                             depth_exhausted=False, break_even_bid=None, target_bid=None, residual_base=residual,
                             labels=labels)
 
+    fallback = money.sub(ONE, money.bps(money.add(cost.fallback_slippage_bps, cost.latency_bps)))
     model, walk = ('book' if validated.depth_known else 'flat_fallback'), None
     if model == 'book' and sellable > 0:
         walk = _walk(validated.bids, sellable, latency, buy=False, depth_known=True)
         if not walk.depth_known:
             model, walk = 'flat_fallback', None
             labels['depth'] = 'a bid level has no quantity; flat fallback used'
+    exhausted = walk is not None and walk.exhausted
+    if exhausted:
+        model = 'flat_fallback'     # partly priced beyond the visible book: never a profit-exit estimate
     if model == 'book':
         factor = money.sub(ONE, latency)
         labels.setdefault('depth', 'bid walk')
         labels['slippage'] = 'none added: the bid walk already contains the spread and depth impact'
     else:
-        factor = money.sub(ONE, money.bps(money.add(cost.fallback_slippage_bps, cost.latency_bps)))
+        factor = fallback
         labels.setdefault('depth', 'unknown (top of book only)')
         labels['slippage'] = f'flat fallback {_show(cost.fallback_slippage_bps)} bps because depth is unknown'
     labels['latency'] = f'{_show(cost.latency_bps)} bps against the bid, once'
 
-    exhausted = walk is not None and walk.exhausted
     gross = None
     if sellable <= 0:
         labels['proceeds'] = 'unknown: nothing is sellable at the quantity step'
     elif exhausted:
-        labels['proceeds'] = (f'unknown: bid depth exhausted after {walk.levels_used} levels '
-                              f'({_show(walk.base)} of {_show(sellable)} {base_ccy})')
+        worst_bid = validated.bids[walk.levels_used - 1][0]
+        unabsorbed = money.sub(sellable, walk.base)
+        gross = money.add(walk.quote, money.mul(unabsorbed, worst_bid, fallback))
+        labels['depth'] = (f'bid depth exhausted after {walk.levels_used} levels ({_show(walk.base)} of '
+                           f'{_show(sellable)} {base_ccy}); depth beyond them is unknown')
+        labels['slippage'] = (f'none added to the visible levels; flat fallback {_show(cost.fallback_slippage_bps)} bps '
+                              f'on the {_show(unabsorbed)} {base_ccy} beyond them, from the worst visible bid '
+                              f'{_show(worst_bid)}')
+        labels['proceeds'] = ('estimated, conservatively: visible bids for what they absorb, the flat fallback '
+                              'from the worst visible bid for the rest; not a book estimate')
         labels['visible_gross_proceeds'] = money.text(walk.quote)
+        labels['floor_net_pnl'] = money.text(money.sub(money.sub(walk.quote, money.mul(walk.quote, fee)), allocated))
     elif walk is not None:
         gross = walk.quote
     else:
@@ -952,13 +1038,33 @@ def move_units(ratio: Decimal) -> dict:
     return {'ratio': ratio, 'fraction': move, 'percent': money.mul(move, HUNDRED), 'bps': money.mul(move, BPS)}
 
 
-def _min_fee_ratio(budget: Decimal, target: Decimal, fee: Decimal, slip: Decimal, min_fee: Decimal) -> Decimal | None:
-    """The target ratio when each leg pays ``max(rate * notional, min_fee)``; None if the fee eats the budget."""
+def _min_fee_entry_value(budget: Decimal, fee: Decimal, slip: Decimal, min_fee: Decimal) -> Decimal | None:
+    """Quantity times the unchanged price bought by an all-in ``budget``; the buy pays ``max(rate * notional, min_fee)``."""
     proportional_gross = money.div(budget, money.add(ONE, fee))
     buy_gross = proportional_gross if money.mul(proportional_gross, fee) >= min_fee else money.sub(budget, min_fee)
     if buy_gross <= 0:
         return None
-    entry_value = money.div(buy_gross, money.add(ONE, slip))      # quantity times entry price
+    return money.div(buy_gross, money.add(ONE, slip))
+
+
+def _min_fee_flat_net(budget: Decimal, fee: Decimal, slip: Decimal, min_fee: Decimal) -> Decimal | None:
+    """The round-trip net at an unchanged price when each leg pays ``max(rate * notional, min_fee)``.
+
+    Computed leg by leg: with a minimum fee the loss is not ``budget / break-even``,
+    because the minimum may bind at the unchanged price and not at break-even.
+    """
+    entry_value = _min_fee_entry_value(budget, fee, slip, min_fee)
+    if entry_value is None:
+        return None
+    proceeds = money.mul(entry_value, money.sub(ONE, slip))
+    return money.sub(money.sub(proceeds, max(money.mul(proceeds, fee), min_fee)), budget)
+
+
+def _min_fee_ratio(budget: Decimal, target: Decimal, fee: Decimal, slip: Decimal, min_fee: Decimal) -> Decimal | None:
+    """The target ratio when each leg pays ``max(rate * notional, min_fee)``; None if the fee eats the budget."""
+    entry_value = _min_fee_entry_value(budget, fee, slip, min_fee)      # quantity times entry price
+    if entry_value is None:
+        return None
     needed = money.add(budget, target)
     sell_gross = money.div(needed, money.sub(ONE, fee))
     if money.mul(sell_gross, fee) < min_fee:
@@ -1003,9 +1109,12 @@ def sensitivity(budgets, fee_rates, slips, target_bps, *, min_fee_quote: Decimal
                     if even is None or goal is None:
                         row.update(feasible=False)
                     else:
-                        # At an unchanged price the round trip returns budget / break-even ratio; one
-                        # factor times the budget keeps the proportional loss exactly proportional.
-                        flat_net = money.mul(budget, money.sub(money.div(ONE, even), ONE))
+                        if min_fee is None:
+                            # Proportional costs only: at an unchanged price the round trip returns
+                            # budget / break-even ratio, so the loss is exactly proportional to the budget.
+                            flat_net = money.mul(budget, money.sub(money.div(ONE, even), ONE))
+                        else:
+                            flat_net = _min_fee_flat_net(budget, fee, slip, min_fee)
                         even_units, goal_units = move_units(even), move_units(goal)
                         row.update(feasible=True, break_even_ratio=even, break_even_pct=even_units['percent'],
                                    break_even_bps=even_units['bps'], target_ratio=goal,

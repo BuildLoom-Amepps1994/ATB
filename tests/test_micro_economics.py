@@ -27,15 +27,18 @@ class Book:
     bids: tuple
     asks: tuple
     depth_known: bool = True
-    symbol: str = 'ETH/USDT'
+    symbol: object = 'ETH/USDT'
+    exchange: object = 'mexc'
+    stated_bid: object = None     # a best_bid / best_ask the snapshot states, when it differs from its levels
+    stated_ask: object = None
 
     @property
     def best_bid(self):
-        return self.bids[0][0]
+        return self.bids[0][0] if self.stated_bid is None else self.stated_bid
 
     @property
     def best_ask(self):
-        return self.asks[0][0]
+        return self.asks[0][0] if self.stated_ask is None else self.stated_ask
 
 
 RULES = VenueRules(
@@ -272,7 +275,36 @@ def test_venue_rule_codes_pass_through_and_an_entry_needs_a_possible_exit(info, 
 
 def test_stale_rules_block_sizing_when_an_age_limit_is_given():
     assert size(max_rules_age_s=3600).eligible
+    assert size(max_rules_age_s=1000).eligible          # exactly at the limit
     assert size(max_rules_age_s=60).code == venue_rules.METADATA_STALE
+    assert not check(size(max_rules_age_s=60), 'rules_age')['passed']
+
+
+def sized_at(now, limit, rules_=RULES):
+    return me.size_entry(rules=rules_, book=deep_book(), cost=cost(), budget_cap=D('25'), cash_available=D('1000'),
+                         allocation_remaining=D('1000'), target_net=D('0.05'), exit_stress_bps=D('10'),
+                         now_wall=now, max_rules_age_s=limit)
+
+
+@pytest.mark.parametrize('now,limit,rules_', [
+    (None, 60, RULES), (float('nan'), 60, RULES), (float('inf'), 60, RULES), (True, 60, RULES), ('2000', 60, RULES),
+    (None, None, RULES), (float('nan'), None, RULES),                      # now_wall is required even without a limit
+    (2000.0, float('nan'), RULES), (2000.0, float('inf'), RULES), (2000.0, -1, RULES), (2000.0, True, RULES),
+    (2000.0, '60', RULES),
+    (0.0, 60, RULES),                                                       # earlier than loaded_at: age unknown, not 0
+    (2000.0, 60, rules(loaded_at=float('nan'))), (2000.0, 60, rules(loaded_at=None)),
+])
+def test_an_unusable_clock_or_age_limit_fails_closed_instead_of_skipping_the_staleness_gate(now, limit, rules_):
+    result = sized_at(now, limit, rules_)
+    assert not result.eligible and result.code == venue_rules.METADATA_STALE
+    assert result.gross_quote is None and result.max_debit is None
+    assert not check(result, 'rules_age')['passed']
+
+
+def test_a_usable_clock_still_sizes_without_an_age_limit():
+    assert sized_at(2000, None).eligible and sized_at(2000.0, None).eligible
+    assert sized_at(2000.0, None, rules(loaded_at=None)).eligible     # no limit given: the age is not judged
+    assert sized_at(1000.0, 0).eligible                              # loaded this instant
 
 
 # ------------------------------------------------- 6. exit below the venue rules
@@ -466,17 +498,51 @@ def test_adversarial_best_levels_are_refused_on_either_side(level):
         me.walk_asks(Book(bids=((D('99.99'), D('5')),), asks=(level,)), quote_amount=D('10'), latency_bps=D('0'))
 
 
-@pytest.mark.parametrize('bids,asks', [
-    (((D('100.02'), D('1')),), ((D('100.01'), D('1')),)),                         # crossed
-    (((D('100.01'), D('1')),), ((D('100.01'), D('1')),)),                         # locked
-    (((D('99.98'), D('1')), (D('99.99'), D('1'))), ((D('100.01'), D('1')),)),     # bids ascending
-    (((D('99.99'), D('1')),), ((D('100.02'), D('1')), (D('100.02'), D('1')))),    # duplicate ask
-    ((), ((D('100.01'), D('1')),)),                                               # empty side
-])
-def test_crossed_unsorted_or_empty_books_are_refused(bids, asks):
-    book = Book(bids=bids, asks=asks)
+MALFORMED_BOOKS = {
+    'crossed': Book(bids=((D('100.02'), D('1')),), asks=((D('100.01'), D('1')),)),
+    'locked': Book(bids=((D('100.01'), D('1')),), asks=((D('100.01'), D('1')),)),
+    'bids ascending': Book(bids=((D('99.98'), D('1')), (D('99.99'), D('1'))), asks=((D('100.01'), D('1')),)),
+    'duplicate ask': Book(bids=((D('99.99'), D('1')),), asks=((D('100.02'), D('1')), (D('100.02'), D('1')))),
+    'empty bids': Book(bids=(), asks=((D('100.01'), D('1')),)),
+    'empty asks': Book(bids=((D('99.99'), D('1')),), asks=()),
+    'stated best bid differs': deep_book(stated_bid=D('99.98')),
+    'stated best ask differs': deep_book(stated_ask=D('100.02')),
+    'too many levels': Book(bids=tuple((money.sub(D('99.99'), money.mul(D('0.001'), D(i))), D('1'))
+                                       for i in range(me.MAX_BOOK_LEVELS + 1)), asks=((D('100.01'), D('1000')),)),
+    'symbol not text': deep_book(symbol=42),
+    'exchange not text': deep_book(exchange=b'mexc'),
+}
+FOREIGN_BOOKS = {
+    'other symbol': deep_book(symbol='BTC/USDT'),
+    'other exchange': deep_book(exchange='kraken'),
+}
+
+
+@pytest.mark.parametrize('name', sorted(MALFORMED_BOOKS))
+def test_crossed_unsorted_empty_or_mislabelled_books_are_refused_everywhere(name):
+    book = MALFORMED_BOOKS[name]
     with pytest.raises(money.MoneyError):
         me.walk_asks(book, quote_amount=D('1'), latency_bps=D('0'))
+    with pytest.raises(money.MoneyError):
+        me.walk_bids(book, base_amount=D('0.1'), latency_bps=D('0'))
+    assert_refused(book)
+
+
+@pytest.mark.parametrize('name', sorted(FOREIGN_BOOKS))
+def test_a_book_of_another_market_is_refused_for_this_market(name):
+    book = FOREIGN_BOOKS[name]
+    assert not me.walk_asks(book, quote_amount=D('10'), latency_bps=D('0')).exhausted   # a valid book in itself
+    assert_refused(book)
+    assert size(book_=deep_book()).eligible                                              # the same levels, this market
+
+
+def assert_refused(book):
+    result = size(book_=book)
+    assert not result.eligible and result.code == me.PRICE_UNKNOWN
+    assert result.gross_quote is None and result.max_debit is None and result.minimum_feasible_budget is None
+    estimate = exit_estimate(D('0.25'), D('25'), book)
+    assert estimate.depth_model == 'unavailable' and estimate.gross_proceeds is None
+    assert estimate.net_proceeds is None and estimate.est_net_pnl is None
 
 
 # ------------------------------------------------- budget-revision regressions
@@ -517,6 +583,25 @@ def test_minimum_fee_rounding_and_depth_impact_make_small_and_large_budgets_diff
     assert D(minimum_fee[0]['break_even_ratio']) > D(minimum_fee[1]['break_even_ratio'])
     assert minimum_fee[1]['break_even_ratio'] == proportional[1]['break_even_ratio']
     assert D(minimum_fee[0]['flat_net']) < money.mul(D('0.4'), D(minimum_fee[1]['flat_net']))
+
+
+@pytest.mark.parametrize('budget,min_fee', [
+    ('10', '0.02'), ('1', '0.1'), ('2', '0.5'), ('25', '0.02'), ('25', None), ('3.33', None), ('0.5', '0.3'),
+])
+def test_flat_net_matches_an_independent_round_trip_at_an_unchanged_price(budget, min_fee):
+    B, f, s = D(budget), D('0.001'), D('0.002')
+    m = None if min_fee is None else D(min_fee)
+    row = me.sensitivity([B], [f], [s], D('20'), min_fee_quote=m)[0]
+    with localcontext() as context:
+        context.prec = 60
+        floor = D(0) if m is None else m
+        bought = B / (1 + f)                         # buy leg: gross + max(gross * f, m) = B
+        if bought * f < floor:
+            bought = B - floor
+        value = bought / (1 + s)                     # quantity times the unchanged price
+        proceeds = value * (1 - s)                   # sell leg at that price
+        expected = proceeds - max(proceeds * f, floor) - B
+    assert row['feasible'] and abs(D(row['flat_net']) - expected) < D('1E-25')
 
     # Rounding: a coarse quantity step leaves a residual whose basis the sellable part must carry.
     coarse = rules(amount_step=D('0.01'), cost_step=D('0.00000001'), price_tick=D('0.00000001'))
@@ -572,6 +657,21 @@ def test_no_compounding_and_no_upsizing_from_cash_or_allocation():
     assert size(rules_=rules(min_cost_market=D('5')), allocation='3').code == me.ALLOCATION_EXHAUSTED
 
 
+@pytest.mark.parametrize('book_,own_code', [
+    (MALFORMED_BOOKS['crossed'], me.PRICE_UNKNOWN),
+    (Book(bids=((D('99.99'), None),), asks=((D('100.01'), None),), depth_known=False), me.DEPTH_UNKNOWN),
+    (Book(bids=((D('99.99'), D('1000')),), asks=((D('100.01'), D('0.1')), (D('100.02'), None))), me.DEPTH_UNKNOWN),
+])
+@pytest.mark.parametrize('shortfall', [dict(cash='3'), dict(allocation='3')])
+def test_a_shortfall_is_blamed_only_when_the_cap_sized_order_would_be_eligible(book_, own_code, shortfall):
+    pair = rules(min_cost_market=D('5'))
+    assert size(rules_=pair, book_=book_).code == own_code       # more cash can never cure this book
+    result = size(rules_=pair, book_=book_, **shortfall)
+    assert result.code == me.BUDGET_BELOW_VENUE_MINIMUM and result.gross_quote is None
+    assert 'would meet it' not in result.detail
+    assert not any(item['check'] == 'binding_limit' for item in result.checks)
+
+
 # --------------------------------------------------------------- depth handling
 def test_a_larger_amount_crossing_more_levels_gets_a_worse_vwap():
     book = Book(bids=((D('99.99'), D('0.05')), (D('99.90'), D('0.05')), (D('99.50'), D('10'))),
@@ -592,8 +692,36 @@ def test_exhausted_depth_has_its_own_codes():
     shallow_bids = Book(bids=((D('99.99'), D('0.1')),), asks=((D('100.01'), D('1000')),))
     assert size(book_=shallow_bids).code == me.INSUFFICIENT_BID_DEPTH
     estimate = exit_estimate(D('0.25'), D('25'), shallow_bids)
-    assert estimate.depth_exhausted and estimate.gross_proceeds is None and estimate.est_net_pnl is None
-    assert D(estimate.labels['visible_gross_proceeds']) == money.mul(D('99.99'), D('0.1'), D('0.9997'))
+    visible = money.mul(D('99.99'), D('0.1'), D('0.9997'))
+    assert D(estimate.labels['visible_gross_proceeds']) == visible
+    # the 0.15 the bids cannot absorb is priced like unknown depth, from the worst visible bid
+    assert estimate.depth_exhausted and estimate.depth_model == 'flat_fallback'
+    assert estimate.gross_proceeds == money.add(visible, money.mul(D('0.15'), D('99.99'), D('0.9977')))
+    assert estimate.est_net_pnl == money.sub(estimate.net_proceeds, D('25'))
+
+
+def test_exhausted_bid_depth_in_a_crash_still_gives_safety_exits_a_conservative_loss():
+    crash = Book(bids=((D('60'), D('0.1')), (D('59'), D('0.1'))), asks=((D('61'), D('1')),))
+    estimate = exit_estimate(D('0.25'), D('25'), crash)
+    assert estimate.depth_exhausted and estimate.est_net_pnl is not None
+    # no profit exit can rest on it: profit exits need depth_model 'book'
+    assert estimate.depth_model == 'flat_fallback' and estimate.depth_model != 'book'
+    visible = money.mul(money.add(money.mul(D('60'), D('0.1')), money.mul(D('59'), D('0.1'))), D('0.9997'))
+    remainder = money.mul(D('0.05'), D('59'), D('0.9977'))           # worst visible bid, 20 bps fallback + 3 latency
+    gross = money.add(visible, remainder)
+    assert estimate.gross_proceeds == gross and estimate.sell_fee == money.mul(gross, D('0.001'))
+    assert estimate.est_net_pnl == money.sub(money.sub(gross, estimate.sell_fee), D('25'))
+    assert estimate.est_net_pnl < D('-10')
+    # never better than if the unseen remainder sold at the worst visible level with latency only
+    optimistic = money.sub(money.mul(money.add(visible, money.mul(D('0.05'), D('59'), D('0.9997'))), D('0.999')), D('25'))
+    assert estimate.est_net_pnl < optimistic
+    # and no better than the same crash seen as a top-of-book ticker, which carries less information
+    ticker = Book(bids=((D('60'), None),), asks=((D('61'), None),), depth_known=False)
+    assert estimate.est_net_pnl <= exit_estimate(D('0.25'), D('25'), ticker).est_net_pnl
+    # the floor (nothing beyond the visible bids sells) is reported too
+    floor = D(estimate.labels['floor_net_pnl'])
+    assert floor == money.sub(money.mul(visible, D('0.999')), D('25')) and floor < estimate.est_net_pnl
+    assert 'flat fallback' in estimate.labels['slippage'] and 'estimated' in estimate.labels['proceeds']
 
 
 def test_unknown_depth_blocks_entries_but_exits_use_the_flat_fallback():

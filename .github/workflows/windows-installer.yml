@@ -48,10 +48,11 @@ jobs:
           import build_installer
           commits = int(subprocess.run(['git', 'rev-list', '--count', 'HEAD'], check=True,
                                        capture_output=True, text=True).stdout)
-          version = build_installer.release_version(commits)
-          # Only main publishes; pull requests and other branches build an artifact only.
+          # Only main publishes; pull requests and other branches build an artifact only,
+          # stamped X.Y.0 so an installed test build never outranks a real release.
           publish = (os.environ['GITHUB_EVENT_NAME'] in ('push', 'workflow_dispatch')
                      and os.environ['GITHUB_REF'] == 'refs/heads/main')
+          version = build_installer.build_version(commits, publish)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write(f'version={version}\npublish={str(publish).lower()}\n')
           print('CryptoPilot', version, '(publish)' if publish else '(artifact only)')
@@ -138,9 +139,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
+          set -euo pipefail
           # A re-run of the same commit has the same version; never replace a published release.
-          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          draft=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || true)
+          if [ "$draft" = "false" ]; then
             echo "Release v$VERSION already exists."
+            exit 0
+          fi
+          if [ "$draft" = "true" ]; then
+            # An interrupted upload leaves a draft; installed copies never see drafts, so start again.
+            echo "Removing the unfinished draft of v$VERSION."
+            gh release delete "v$VERSION" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          # Re-running an older main build must not replace a newer Latest release.
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)
+          if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "${latest#v}" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
+            echo "$latest is newer than v$VERSION and already includes this commit; nothing to publish."
             exit 0
           fi
           gh release create "v$VERSION" release/* \

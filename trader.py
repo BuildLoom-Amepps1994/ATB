@@ -14,6 +14,7 @@ import ccxt
 
 import credentials
 import decision
+import feed
 import observability
 import orders
 import paper_exchange
@@ -92,6 +93,7 @@ class TradingEngine:
         self.paper = self._new_paper_exchange()
         self.unresolved_probe: list[dict] = []
         self.decisions = decision.DecisionLog()
+        self.feed: feed.QuoteFeed | None = None
         # A simulated order has no exchange-side effect; a crash mid-paper-order
         # leaves nothing to reconcile, so its intent is closed at startup.
         storage.abandon_stale_paper_intents(self.exchange_name)
@@ -396,6 +398,7 @@ class TradingEngine:
                 self.exchange_name = revised['exchange']
                 self.public, self.data = candidate_public, candidate_data
                 self.paper = self._new_paper_exchange()
+                self._stop_feed()
                 self.private = self.api_key = self.api_secret = None
                 self.credential_source = 'none'
                 self.latest_balance = self.balance_updated_at = None
@@ -443,6 +446,7 @@ class TradingEngine:
                 self.stop_event.clear()
                 self.thread = threading.Thread(target=self._loop, daemon=True, name='TradingEngine')
                 self.thread.start()
+            self._start_feed()
             storage.audit('warning' if self.mode == 'live' else 'info', f'Bot started in {self.mode.upper()} mode.')
         finally:
             with self.lock:
@@ -459,6 +463,7 @@ class TradingEngine:
             storage.audit('info', 'Stop requested. Waiting for any in-flight exchange operation to finish.')
         if thread and thread is not threading.current_thread():
             thread.join(timeout=2)
+        self._stop_feed()
 
     def _loop(self):
         next_scan = 0.0
@@ -480,8 +485,75 @@ class TradingEngine:
         finally:
             with self.lock:
                 self.running = self.stopping = False
+            self._stop_feed()
 
     CLOSE_GRACE_SECONDS = 5.0
+    # A stream quote older than this is not used; REST takes over for that symbol.
+    STREAM_MAX_AGE_SECONDS = 10.0
+    # With every held asset streaming, protective checks run this often (no REST cost).
+    STREAM_MONITOR_SECONDS = 1.0
+
+    # ------------------------------------------------------------ quote feed
+    def _feed_symbols(self) -> list[str]:
+        held = [p['symbol'] for p in self._active_positions(self.mode)]
+        return list(dict.fromkeys(held + list(self.cfg['watchlist']) + list(self.discovered)))[:40]
+
+    def _start_feed(self) -> None:
+        """Start the websocket quote stream when the setting asks for it.
+
+        Failure to start is logged and leaves REST polling in charge; the
+        stream is an accelerator, never a dependency.
+        """
+        if not self.cfg.get('streaming_quotes'):
+            return
+        try:
+            if self.feed is None or self.feed.state in ('stopped', 'failed'):
+                self.feed = feed.QuoteFeed(self.exchange_name, self._feed_symbols(), metrics=self.metrics,
+                                           heartbeat_seconds=max(5.0, min(60.0, float(self.cfg['data_max_age_seconds']) / 4)))
+            self.feed.start()
+        except Exception as exc:
+            self.feed = None
+            storage.audit('warning', f'Streaming quotes unavailable ({type(exc).__name__}); REST polling remains in use.')
+
+    def _stop_feed(self) -> None:
+        current, self.feed = self.feed, None
+        if current is not None:
+            try:
+                current.stop(timeout=3)
+            except Exception:
+                pass
+
+    def _ticker_time(self, ticker) -> float | None:
+        raw = ticker.get('timestamp') if isinstance(ticker, dict) else None
+        if raw is not None and finite_positive(raw):
+            return finite_positive(raw) / 1000 + self._clock_offset()
+        received = finite_positive(ticker.get('_received_at')) if isinstance(ticker, dict) else 0.0
+        return received or None
+
+    def _quote(self, symbol: str, rest_ticker=None, *, need_volume: bool = False):
+        """The freshest executable quote: the stream while live and recent, else REST.
+
+        A REST ticker keeps its turnover and any newer timestamp; only bid,
+        ask and the quote time come from the stream, and only when the stream
+        is healthy and the quote is younger than ``STREAM_MAX_AGE_SECONDS``.
+        Turnover exists only on REST tickers, so a caller that needs it gets
+        a single REST read when no bulk snapshot was available.
+        """
+        current = self.feed
+        streamed = current.ticker(symbol, max_age=self.STREAM_MAX_AGE_SECONDS) if current is not None else None
+        if streamed is None:
+            return rest_ticker
+        if need_volume and not isinstance(rest_ticker, dict):
+            rest_ticker = self.data.ticker(symbol)
+        self.metrics.observe('feed.age_at_use_ms', max(0.0, time.time() - streamed['_received_at']) * 1000)
+        if isinstance(rest_ticker, dict):
+            rest_time, stream_time = self._ticker_time(rest_ticker), self._ticker_time(streamed)
+            if rest_time is not None and stream_time is not None and rest_time > stream_time:
+                return rest_ticker
+            merged = dict(rest_ticker)
+            merged.update({key: streamed[key] for key in ('bid', 'ask', 'timestamp', '_received_at', '_source')})
+            return merged
+        return streamed
 
     def _seconds_to_next_close(self) -> float:
         """Seconds until the next primary candle close plus a short grace.
@@ -513,16 +585,26 @@ class TradingEngine:
             self.last_monitor, self.monitor_error = now(), None
         if not positions:
             return exited
-        try:
-            tickers = self.data.tickers([p['symbol'] for p in positions])
-        except Exception:
+        started = time.monotonic()
+        held = [p['symbol'] for p in positions]
+        streamed = self.feed is not None and self.feed.covers(held, max_age=self.STREAM_MAX_AGE_SECONDS)
+        if streamed:
+            # Every held asset has a live stream quote: no REST round trip, and
+            # the protective check repeats every second instead of every poll.
+            interval = min(interval, self.STREAM_MONITOR_SECONDS)
             tickers = {}
+        else:
+            try:
+                tickers = self.data.tickers(held)
+            except Exception:
+                tickers = {}
+        self.metrics.incr('monitor.source.stream' if streamed else 'monitor.source.rest')
         for position in positions:
             if not self._orders_allowed():
                 break
             symbol = position['symbol']
             try:
-                ticker = tickers.get(symbol)
+                ticker = self._quote(symbol, tickers.get(symbol))
                 try:
                     price, _, _ = self._observe_ticker(symbol, ticker or self.data.ticker(symbol))
                 except ValueError:
@@ -544,6 +626,7 @@ class TradingEngine:
                 failures += 1
         # Finish-relative scheduling avoids hot loops on slow or failing reads.
         self._next_monitor = time.monotonic() + interval
+        self.metrics.observe('monitor.cycle_ms', (time.monotonic() - started) * 1000)
         with self.lock:
             if observed:
                 self.last_successful_monitor = now()
@@ -1379,6 +1462,8 @@ class TradingEngine:
                 held = [p['symbol'] for p in self._active_positions(self.mode)]
                 symbols = list(dict.fromkeys(held + self.cfg['watchlist']))
                 storage.audit('warning', f'Market catalogue refresh unavailable: {type(exc).__name__}.')
+            if self.feed is not None:
+                self.feed.set_symbols(symbols)
             try:
                 tickers = self.data.tickers(symbols)
             except Exception:
@@ -1402,7 +1487,7 @@ class TradingEngine:
                                         'status': 'Pair unavailable, inactive, or not an allowed spot market'})
                     continue
                 try:
-                    ticker = tickers.get(symbol)
+                    ticker = self._quote(symbol, tickers.get(symbol), need_volume=True)
                     try:
                         mark, volume, spread = self._observe_ticker(symbol, ticker or self.data.ticker(symbol))
                     except ValueError:
@@ -1903,6 +1988,8 @@ class TradingEngine:
                                           for symbol in self.last_price_times},
                     'metrics': dict(self.data.metrics.copy()),
                     'risk': self.risk.status(),
+                    'feed': self.feed.status() if self.feed is not None else {
+                        'state': 'off', 'enabled': bool(self.cfg.get('streaming_quotes'))},
                     'unresolved_orders': len(unresolved), 'unresolved_probe': list(self.unresolved_probe),
                     'legacy_live_records': storage.legacy_live_records(),
                     'trades': storage.rows('SELECT * FROM trades WHERE exchange=? AND mode=? ORDER BY id DESC LIMIT 70',

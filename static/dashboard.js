@@ -69,14 +69,20 @@ async function action(name, path, data, message, configRefresh = false) {
     await refresh(configRefresh && accepted, true); busy.delete(name); updateControls();
   }
 }
+function feedNote(f) {
+  if (!f || f.state === 'off') return f && f.enabled ? ' Streaming quotes start with the bot.' : '';
+  if (f.state === 'live') return ' Streaming quotes live (' + f.quoted + ' of ' + f.symbols + ' pairs, ' + f.messages + ' updates' + (f.reconnects ? ', ' + f.reconnects + ' reconnects' : '') + ').';
+  return ' Streaming quotes ' + f.state + (f.last_error ? ' (' + f.last_error + ')' : '') + '; REST polling in use.';
+}
+
 function readSettings() {
-  return {exchange: $('exchange').value, watchlist: $('symbols').value.split(/[\s,;]+/).map(x => x.trim().toUpperCase()).filter(Boolean), auto_discovery: $('autoDiscovery').checked, market_filters: $('marketFilters').checked, time_horizon: $('timeHorizon').value, scan_seconds: +$('scanSeconds').value, protective_poll_seconds: +$('protectiveSeconds').value, risk_pct: +$('riskPct').value, max_position_pct: +$('maxPositionPct').value, max_exposure_pct: +$('maxExposurePct').value, max_portfolio_risk_pct: +$('maxPortfolioRisk').value, data_max_age_seconds: +$('dataMaxAge').value, max_positions: +$('maxPositions').value, max_meme_position_pct: +$('maxMemePosition').value, max_meme_exposure_pct: +$('maxMemeExposure').value, daily_loss_limit_pct: +$('dailyLossPct').value, min_quote_volume: +$('minVolume').value, max_order_notional_usdt: +$('maxOrderNotional').value, max_asset_notional_usdt: +$('maxAssetNotional').value, max_orders_per_minute: +$('maxOrdersPerMinute').value, daily_realized_loss_limit_pct: +$('dailyRealizedLoss').value, max_drawdown_pct: +$('maxDrawdown').value};
+  return {exchange: $('exchange').value, watchlist: $('symbols').value.split(/[\s,;]+/).map(x => x.trim().toUpperCase()).filter(Boolean), auto_discovery: $('autoDiscovery').checked, market_filters: $('marketFilters').checked, streaming_quotes: $('streamingQuotes').checked, time_horizon: $('timeHorizon').value, scan_seconds: +$('scanSeconds').value, protective_poll_seconds: +$('protectiveSeconds').value, risk_pct: +$('riskPct').value, max_position_pct: +$('maxPositionPct').value, max_exposure_pct: +$('maxExposurePct').value, max_portfolio_risk_pct: +$('maxPortfolioRisk').value, data_max_age_seconds: +$('dataMaxAge').value, max_positions: +$('maxPositions').value, max_meme_position_pct: +$('maxMemePosition').value, max_meme_exposure_pct: +$('maxMemeExposure').value, daily_loss_limit_pct: +$('dailyLossPct').value, min_quote_volume: +$('minVolume').value, max_order_notional_usdt: +$('maxOrderNotional').value, max_asset_notional_usdt: +$('maxAssetNotional').value, max_orders_per_minute: +$('maxOrdersPerMinute').value, daily_realized_loss_limit_pct: +$('dailyRealizedLoss').value, max_drawdown_pct: +$('maxDrawdown').value};
 }
 function syncExchangeGuide() { $('apiGuide').href = $('exchange').value === 'mexc' ? 'https://www.mexc.com/user/openapi' : 'https://www.kraken.com/u/security/api'; }
 function fillSettings(c) {
   const fields = {exchange: 'exchange', time_horizon: 'timeHorizon', scan_seconds: 'scanSeconds', protective_poll_seconds: 'protectiveSeconds', risk_pct: 'riskPct', max_position_pct: 'maxPositionPct', max_exposure_pct: 'maxExposurePct', max_portfolio_risk_pct: 'maxPortfolioRisk', data_max_age_seconds: 'dataMaxAge', max_positions: 'maxPositions', max_meme_position_pct: 'maxMemePosition', max_meme_exposure_pct: 'maxMemeExposure', daily_loss_limit_pct: 'dailyLossPct', min_quote_volume: 'minVolume', max_order_notional_usdt: 'maxOrderNotional', max_asset_notional_usdt: 'maxAssetNotional', max_orders_per_minute: 'maxOrdersPerMinute', daily_realized_loss_limit_pct: 'dailyRealizedLoss', max_drawdown_pct: 'maxDrawdown'};
   for (const [key, id] of Object.entries(fields)) $(id).value = c[key];
-  $('symbols').value = c.watchlist.join(', '); $('autoDiscovery').checked = c.auto_discovery; $('marketFilters').checked = c.market_filters !== false; syncExchangeGuide();
+  $('symbols').value = c.watchlist.join(', '); $('autoDiscovery').checked = c.auto_discovery; $('marketFilters').checked = c.market_filters !== false; $('streamingQuotes').checked = c.streaming_quotes === true; syncExchangeGuide();
 }
 function render(s) {
   $('settingsRecovery').hidden = !s.settings_health?.review_required;
@@ -93,7 +99,7 @@ function render(s) {
   $('monitorStatus').textContent = !s.running ? 'Automatic stops are inactive while the bot is stopped.' : !s.positions.length ? 'No tracked positions need exit monitoring.'
     : 'Exit quote check target: every ' + (s.config.protective_poll_seconds || 5) + ' seconds. '
       + (s.last_successful_monitor ? 'Latest successful quote: ' + new Date(s.last_successful_monitor).toLocaleTimeString() + '. ' : 'Waiting for a successful held-position quote. ')
-      + 'Network requests and exchange limits can delay checks.';
+      + 'Network requests and exchange limits can delay checks.' + feedNote(s.feed);
   $('connectStatus').textContent = s.connected ? '● Verified (' + s.credential_source + ')' : s.credentials_stored ? '◌ Saved keys · not yet verified' : '○ Not connected';
   $('connectStatus').className = 'sub ' + (s.connected ? 'green' : '');
   const unresolved = Array.isArray(s.unresolved_orders) ? s.unresolved_orders.length : Number(s.unresolved_orders || 0);

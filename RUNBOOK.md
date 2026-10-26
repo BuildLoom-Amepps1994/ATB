@@ -11,13 +11,13 @@ trading stays off until it is enabled deliberately with the phrase
 | Layer | What it guarantees | Where it lives |
 |---|---|---|
 | Risk gate | Every order, automatic or manual, paper or live, needs a fresh authorization from one choke point. A blocked order is never sent. | `risk.py` (`RiskGate.authorize`), enforced in `trader.TradingEngine._submit` |
-| Kill switch | Blocks new orders instantly from the dashboard or `POST /api/risk`; optionally blocks exits too. Survives restarts. | `risk.py`, `storage` meta `kill_switch` |
-| Latches | Daily equity-loss guard, daily realised-loss stop and drawdown-from-peak stop block new entries until cleared with `RESUME TRADING`. | `risk.py` |
-| Breakers | Three order failures in ten minutes pause entries for thirty minutes; a rejection spike or adverse slippage beyond three times the assumption pauses entries. | `risk.py` |
+| Kill switch | Blocks new orders instantly from the dashboard or `POST /api/risk`; optionally blocks exits too. Survives restarts. Stored per exchange; an engaged switch is carried over when you change exchanges, and one that blocks exits also tightens an entries-only switch already engaged there. | `risk.py`, `storage` meta `kill_switch` |
+| Latches | The daily realised-loss stop and the drawdown-from-peak stop block new entries until cleared with `RESUME TRADING`. The daily equity-loss guard blocks them until the next UTC day. | `risk.py`, `trader.py` |
+| Breakers | Three order failures in ten minutes, three exchange rejections in ten minutes, or fills averaging more than three times the assumed slippage pause entries; each closes on its own (section 4). | `risk.py` |
 | Order state machine | Each order is a journaled intent: `pending → acked → filled → accounted`, or `rejected`, or `uncertain`. Illegal transitions are refused. | `storage.py`, `orders.py` |
 | Idempotency | Every order carries a client order id derived from its intent id. After an ambiguous submit the engine looks the order up by that id and never resends. | `orders.py`, `trader._submit` |
 | Fail closed | Stale quotes, an unreadable kill-switch record, missing marks on a held asset, or an unknown order outcome all block new orders. An uncertain live outcome halts live trading until reconciled. | `risk.py`, `trader.py`, `recovery.py` |
-| Decision records | Every scan writes one replayable record per symbol with all checks, the data timestamps and the reason for abstaining. | `decision.py`, `GET /api/decisions`, `logs/events.jsonl` |
+| Decision records | Every scan makes one replayable record per symbol with all checks, the data timestamps and the reason for abstaining (`GET /api/decisions`). The event log gets every entry and every change of a symbol's outcome, and a `decision.withheld` line for each entry that did not become an order. | `decision.py`, `logs/events.jsonl` |
 
 ## 2. Start and stop
 
@@ -33,8 +33,10 @@ order's final state; the UI shows *Stopping* until the worker finishes. The
 websocket feed stops with the bot.
 
 **Shut down the app.** One Ctrl+C in the console (or the in-app update's
-exit) runs the same stop, prints `Stopping CryptoPilot: waiting up to 30 s…`
-and waits up to thirty seconds for an in-flight order to reach the ledger. If
+exit) stops the engine at once (no new scan or order starts) and prints
+`Stop requested: …`. Open dashboard requests then get up to thirty seconds to
+finish, and the app prints `Stopping CryptoPilot: waiting up to 30 s…` and
+waits up to thirty seconds more for an in-flight order to reach the ledger. If
 that wait expires, an `error` activity line says so: inspect the order journal
 (section 6) before the next start. A **second Ctrl+C, or closing the console
 window, is a hard kill**: nothing more is written, and the next start relies
@@ -66,7 +68,7 @@ Change them while the bot is stopped.
 | `max_position_pct`, `max_exposure_pct`, `max_positions` | 8 %, 40 %, 5 | Position, exposure and count caps. |
 | `risk_pct`, `max_portfolio_risk_pct` | 0.65 %, 3 % | Per-trade loss budget and total open stop risk. |
 | `daily_loss_limit_pct` | 3 % | Equity-based daily guard; latches until the next UTC day. |
-| `daily_realized_loss_limit_pct` | 3 % | Sum of today's realised losses; latches durably until `RESUME TRADING` (`clear_realized_stop`) or a paper reset. A looser setting or a later profit does not lift it. |
+| `daily_realized_loss_limit_pct` | 3 % | Net realised P/L today, UTC: profits offset losses (fees included, also when billed in another asset). Checked when any exit books (automatic or manual) and at every valuation, so it latches as soon as the loss is booked; it holds until `RESUME TRADING` (`clear_realized_stop`) or a paper reset. A looser setting or a later profit does not lift it. After a clear, it latches again when today's net realised P/L is both beyond the current limit and below the level at which it was cleared (a clear on an earlier day does not count). |
 | `max_drawdown_pct` | 10 % | Equity drawdown from the tracked peak; latches until `RESUME TRADING`. |
 | `max_orders_per_minute` | 6 | Order-rate limit per exchange and mode (exits are allowed three times that). |
 | `data_max_age_seconds` | 120 | A quote older than this is stale; stale quotes block entries and fall back to REST for exits. |
@@ -83,8 +85,10 @@ POST /api/risk  {"action": "engage", "reason": "operator", "allow_exits": true}
 ```
 
 It takes effect immediately, including during a scan, and persists across
-restarts. With `allow_exits` true, protective exits continue; with it false,
-nothing is sent at all.
+restarts. An order the risk gate had already approved is checked against the
+switch again right before it is sent, and is journaled `rejected` with a
+`risk.blocked_at_submit` event if the switch now blocks it. With `allow_exits`
+true, protective exits continue; with it false, nothing is sent at all.
 
 **Release** needs the phrase:
 
@@ -93,15 +97,39 @@ POST /api/risk  {"action": "release", "confirmation": "RESUME TRADING"}
 ```
 
 **Clear a drawdown stop** the same way with `"action": "clear_drawdown_stop"`,
-and **a realised-loss stop** with `"action": "clear_realized_stop"`. Both
-latches are shown in `GET /api/state` under `risk.drawdown_stop` and
-`risk.realized_stop` and as a dashboard warning. The daily equity guard clears
+and **a realised-loss stop** with `"action": "clear_realized_stop"`, or with
+the dashboard's **Clear latched stop** button, which appears only while one
+is latched and asks for the same phrase. Both latches are shown in
+`GET /api/state` under `risk.drawdown_stop` and `risk.realized_stop` and as a
+dashboard warning. The daily equity guard clears
 itself at the next UTC day.
 
-Breakers open and close on their own; `GET /api/state` shows them under
-`risk.breakers_open` with seconds remaining, and `risk.last_block` names the
-most recent blocked check. Every block is also an activity line starting with
-`RISK BLOCK` and an event of kind `risk.blocked`.
+**Breakers** pause entries only, never exits, and close on their own.
+`GET /api/state` lists each open one under `risk.breakers_open` with the
+seconds until it closes:
+
+* `failures`: three execution failures (rejections, uncertain outcomes,
+  ledger failures) within ten minutes hold entries for thirty minutes. The
+  hold is in memory, so a restart ends it.
+* `reject_spike`: three requests the exchange rejected within ten minutes. It
+  closes as those rejections age out of the window. Orders the engine refused
+  itself before sending (a Stop, the kill switch) do not count.
+* `slippage`: the last three fills averaged more than three times the
+  configured slippage against the quote they were priced from. It is judged
+  as each fill is booked, so it is listed and the hold starts when the third
+  bad fill lands. Entries hold for thirty minutes, also across a restart; after that only fills made
+  since the trip count, so the same fills cannot trip it again. A PC clock
+  corrected backwards cannot stretch the hold past thirty minutes from the
+  moment it is next checked. A paper reset clears a paper hold.
+
+`risk.last_block` names the most recent blocked check. Every block is also
+an activity line starting with `RISK BLOCK` and an event of kind
+`risk.blocked`.
+
+The `POST /api/risk` calls above are what the dashboard buttons send. Every
+dashboard action needs the per-session `X-CryptoPilot-Token` header that only
+the dashboard page carries, so a hand-written request is refused with
+`Invalid local action token`; use the buttons.
 
 ## 5. Streaming quotes
 
@@ -122,6 +150,21 @@ Rules the engine applies: a stream quote is used only while the feed is
 healthy and the quote is under ten seconds old; if REST produced a newer
 quote, REST wins; turnover always comes from REST; and if any held asset
 lacks a fresh stream quote the protective check uses REST for that tick.
+
+How the feed subscribes:
+
+* **MEXC** sends top-of-book only as protobuf frames, so the feed keeps one
+  per-symbol ticker subscription and needs the `protobuf` package (installed
+  by Setup; a source-only update cannot add it). MEXC allows 30
+  subscriptions per connection: held positions come first, and
+  `feed.unsubscribed` counts symbols left on REST.
+* **Kraken** uses one combined best bid/ask subscription.
+* Only pairs in the loaded market catalogue are streamed; a pair the exchange
+  rejects anyway is listed under `feed.unlisted` and left to REST.
+* The feed reads CCXT's own quote cache on every message and at least once a
+  second, so a burst of updates cannot leave a symbol on an older quote.
+* When a connection ends, its quotes are discarded; after a reconnect only
+  new quotes are served.
 
 ## 6. Order journal and halts
 
@@ -159,18 +202,50 @@ the exchange knows an order with that client order id and what state it is in.
   `decision.exit`; `execution.filled`, `execution.rejected`,
   `execution.unfilled`, `execution.ambiguous`, `execution.located`,
   `execution.lookup_failed`, `execution.halt`, `execution.probe`,
-  `execution.entry_error`, `execution.fee_unvalued`; `risk.authorize`,
-  `risk.blocked`, `risk.breaker`, `risk.kill_switch`, `risk.drawdown_stop`,
+  `execution.entry_error`, `execution.fee_unvalued`, `execution.submitted`;
+  `risk.authorize`, `risk.blocked`, `risk.blocked_at_submit`, `risk.breaker`,
+  `risk.kill_switch`, `risk.drawdown_stop`,
   `risk.drawdown_stop_cleared`, `risk.realized_stop`,
   `risk.realized_stop_cleared`, `risk.unauthorized_submit`; `feed.state`,
-  `feed.connected`; `ledger.accounted`, `ledger.failure`.
-* **Correlation.** Every entry decision has a `decision_id` and every exit
-  decision an `exit_…` id; both are passed to the authorization, the submit
-  and the journal row. One `grep` over the `intent_id` gives the
-  authorization, the submit, the fill and the `ledger.accounted` (or
-  `ledger.failure`) line; the `decision_id` on those lines leads back to the
-  `decision.entry` / `decision.exit` record. The same ids appear in
-  `GET /api/decisions`, in the dashboard row and in the journal.
+  `feed.connected`, `feed.symbols_unlisted`; `decision.withheld`;
+  `ledger.accounted`, `ledger.failure`, `ledger.post_commit_error`.
+* **Decision lines.** `decision.entry` is written for every `enter` decision
+  and whenever a symbol's action, status or reasons change; an unchanged
+  repeat is counted (`decision.entry_unchanged`) and kept only in
+  `GET /api/decisions`, so a fast scan cannot rotate the order trail out of
+  the log. `decision.withheld` names why an `enter` decision did not become an
+  order (`per_scan_cap`, `max_positions`, `held`, `same_candle`,
+  `requote_unavailable` (for the rest of the pass too when the re-quote
+  fails with a network-class error: a transport failure after its retries,
+  a rate limit or the exchange being unavailable; the pass then ends and the
+  scan reports the error), `requote_liquidity`, `requote_moved`, `budget`,
+  `stale_marks`, `protective_exit_pending`, `daily_loss_guard`,
+  `settings_review`, `orders_not_allowed`, `risk_gate` when the risk gate
+  refused it (the matching `risk.blocked` event carries the same
+  `decision_id` and names the check), `not_submitted` when no order reached
+  the journal for another reason, `entry_error` for an entry that failed
+  unexpectedly before reaching the journal and for the rest of a live pass it
+  stopped, `live_halted` for the rest of a live pass a halt stopped,
+  `entry_pass_error` for the candidates not yet tried when an unexpected
+  error ended the pass). An entry that reached the journal has no withheld
+  line: its journal row says what happened. `decision.exit` names its
+  `source` (`protective`, `monitor` or `scan`) and `trigger` (`stored`,
+  `trailing` or `trend`).
+* **Correlation.** Every entry decision has a `decision_id`, every exit
+  decision an `exit_…` id and every manual order `manual_<request id>`; the id
+  is passed to the authorization, the submit and the journal row. One `grep`
+  over the `intent_id` (the journal and `recovery.py` list it) gives the
+  `execution.submitted` line, the fill, and the `ledger.accounted` line, or
+  `ledger.failure` and `execution.halt` when something went wrong. A booked
+  fill always has its `ledger.accounted` line; `ledger.post_commit_error`
+  next to it means a report written after the booking failed, and the fill
+  still counts. The
+  authorization is written before the intent exists, so it carries no intent
+  id: the `token` on `execution.submitted` finds its `risk.authorize` line,
+  and the `decision_id` on all of them leads back to the `decision.entry` /
+  `decision.exit` record. Entry ids also appear in `GET /api/decisions` and
+  the dashboard row; exit ids appear only in `decision.exit` events and the
+  journal.
 * **Metrics** `GET /api/metrics`: counters (`decision.enter`, `decision.abstain`,
   `risk.blocked`, `feed.messages`, …), gauges and latency reservoirs with
   p50/p95/p99 (`decision.quote_to_decision_ms`, `execution.submit_to_ack_ms`,
@@ -191,8 +266,10 @@ Run these on the machine that will trade. None of them places an order.
    and compare with `benchmarks/results/`.
 4. **Paper soak, streaming off.** Start the bot in paper mode for at least a
    few full candles of the chosen horizon. Check `GET /api/decisions` shows a
-   record per symbol per scan with sensible reasons, and that `risk.last_block`
-   explains every withheld entry.
+   record per symbol per scan with sensible reasons, and that every `enter`
+   record either reaches the order journal or has a `decision.withheld` event
+   naming why (`risk.last_block` names the most recent check the risk gate
+   refused).
 5. **Paper soak, streaming on.** Repeat with **Streaming quotes** on and watch
    the feed counters in section 5.
 6. **Kill switch drill.** Engage during a running scan; confirm
@@ -210,11 +287,23 @@ is not part of this procedure.
 Each hardening step is one commit on the feature branch, so a rollback is a
 `git revert` of the commits you do not want, newest first. Data compatibility:
 
-* The database schema change is additive (new nullable columns on
-  `order_journal`, `PRAGMA user_version = 3`). An older build opens the same
-  file; it ignores the new columns. Stop the bot before downgrading so no paper
-  intent is left non-terminal, because older builds do not distinguish paper
-  journal rows from live ones.
+* The database schema change adds columns to `order_journal`
+  (`PRAGMA user_version = 3`). Builds from before it (up to `7207e82`, v1.4.0)
+  open the file but insert journal rows by position, so every order they try
+  fails and their first live exit halts instead of being sent. Before running
+  such a build, stop the bot, close the app and run:
+
+  ```
+  python recovery.py --prepare-downgrade --confirm "I AM ROLLING BACK CRYPTOPILOT"
+  ```
+
+  It refuses while any live journal intent is not final (open paper intents
+  are dropped with the other paper rows). It saves a full copy of
+  the database to `backups/portfolio-before-downgrade-<time>.sqlite3` in the
+  data folder, keeps the live journal rows in the old layout and drops the
+  paper ones, which older builds would read as live. The current build
+  migrates the file forward again at its next start. Reverting only commits
+  from after the schema change needs none of this.
 * New settings keys are optional and have defaults; an older build ignores
   them without requiring a settings review.
 * The event log and the decision log are informational and can be deleted.
@@ -223,8 +312,9 @@ Each hardening step is one commit on the feature branch, so a rollback is a
 
 * Stops and targets are still monitored by this process, not placed at the
   exchange. Sleep, crashes and connectivity loss interrupt protection.
-* The websocket feed has been exercised only against a scripted fake client;
-  it has not yet been run against MEXC or Kraken from this environment.
+* The websocket feed has been exercised against scripted clients and against
+  the real CCXT MEXC client fed locally built protobuf frames; it has not yet
+  been run against MEXC or Kraken themselves.
 * Nothing here has been run against a real exchange account. The read-only
   probe, the client-order-id lookups and the `fciq` fee flag follow the CCXT
   4.5 adapters as documented and tested with fakes.

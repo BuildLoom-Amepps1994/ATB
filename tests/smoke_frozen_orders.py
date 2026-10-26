@@ -104,6 +104,10 @@ def main():
     launcher=(app/'launcher.py').read_text(encoding='utf8')
     injected=('            from simulated_exchange import FakeExchange\n'
               '            import ccxt.pro  # the streaming quote feed needs this in the runtime\n'
+              '            from ccxt.protobuf.mexc import PushDataV3ApiWrapper_pb2 as _pb  # MEXC frames are protobuf\n'
+              "            _frame = _pb.PushDataV3ApiWrapper(channel='spot@public.aggre.bookTicker.v3.api.pb@100ms@BTCUSDT', symbol='BTCUSDT')\n"
+              "            _frame.publicAggreBookTicker.bidPrice = '1'\n"
+              "            assert ccxt.pro.mexc().decode_proto_msg(_frame.SerializeToString())['symbol'] == 'BTCUSDT'\n"
               '            import trader, credentials\n'
               '            trader.TradingEngine._new_exchange = staticmethod(lambda *a: FakeExchange.shared())\n'
               '            credentials.load = lambda _: None\n')

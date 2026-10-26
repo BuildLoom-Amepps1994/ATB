@@ -1,11 +1,23 @@
 """Offline hot-path benchmark. No exchange is contacted.
 
-Run from the repository root:  python benchmarks/bench_hot_path.py [--json out.json]
+Run from the repository root:  python benchmarks/bench_hot_path.py [--json out.json] [--warmup N]
 
 Measures the CPU cost of the per-symbol indicator pipeline and research
 backtests, plus the wall clock of a cold strategy scan and a protective
 monitor tick against a fake exchange that sleeps a fixed round-trip time on
 every request and declares a CCXT-style ``rateLimit``.
+
+Every ``timed`` row first runs ``--warmup`` discarded iterations (the same
+number for every row), so a one-off first call is not part of the median.
+
+The monitor rows open the requested number of paper positions before timing
+and assert that they are all open. Each buy is preceded by a fresh bid/ask
+mark for every symbol through the engine's own ``_observe_ticker``: the risk
+gate on the hardening branch refuses an entry while any held asset has a
+stale or missing mark, and the previous release ignores marks for paper
+entries, so seeding keeps the two revisions measuring the same portfolio.
+The same file runs unchanged on the previous release (``7207e82``) and on
+the branch.
 """
 from __future__ import annotations
 
@@ -13,6 +25,7 @@ import argparse
 import json
 import math
 import os
+import platform
 import random
 import statistics
 import sys
@@ -31,6 +44,9 @@ import strategy  # noqa: E402
 import trader  # noqa: E402
 
 SECONDS = {'1m': 60, '5m': 300, '1h': 3600, '4h': 14400, '1d': 86400, '1w': 604800}
+
+# Discarded iterations before every timed row; main() can override it.
+WARMUP = 5
 
 
 def walk(count: int, duration: int, *, seed: int = 7, end: int | None = None) -> list[list[float]]:
@@ -105,13 +121,46 @@ class LatencyExchange:
         return {'free': {'USDT': 10000.0}}
 
 
-def timed(fn, repeat: int) -> dict:
+def timed(fn, repeat: int, *, warmup: int | None = None) -> dict:
+    warmup = WARMUP if warmup is None else warmup
+    for _ in range(warmup):
+        fn()
     samples = []
     for _ in range(repeat):
         start = time.perf_counter()
         fn()
         samples.append((time.perf_counter() - start) * 1000)
-    return {'median_ms': round(statistics.median(samples), 3), 'min_ms': round(min(samples), 3)}
+    return {'median_ms': round(statistics.median(samples), 3), 'min_ms': round(min(samples), 3),
+            'samples': repeat, 'warmup_discarded': warmup}
+
+
+def seed_marks(engine, symbols) -> None:
+    """Give every symbol a fresh bid/ask mark through the engine's quote path.
+
+    ``_observe_ticker`` exists with the same signature on both revisions. The
+    quote is the fake exchange's own (bid 99.99, ask 100.01, timestamp now).
+    """
+    for symbol in symbols:
+        engine._observe_ticker(symbol, LatencyExchange._quote(), for_buy=True)
+
+
+def open_paper_positions(engine, symbols, *, budget: float = 50, price: float = 100,
+                         fraction: float = .04) -> list[dict]:
+    """Open one paper position per symbol from an empty ledger and prove they are all open."""
+    # Every engine in this process shares one paper ledger.
+    storage.reset_paper(engine.exchange_name)
+    engine.cfg['max_positions'] = max(8, len(symbols))
+    if 'max_orders_per_minute' in engine.cfg:      # branch risk gate; absent on the previous release
+        engine.cfg['max_orders_per_minute'] = 10 ** 6
+    for symbol in symbols:
+        # The branch's gate needs a fresh mark for every held asset (and uses
+        # the new symbol's mark once it has one); refresh all of them each time.
+        seed_marks(engine, symbols)
+        assert engine._buy(symbol, budget, price, fraction), f'paper buy of {symbol} was refused'
+    held = engine._active_positions(engine.mode)
+    assert engine.mode == 'paper' and len(held) == len(symbols), (
+        f'expected {len(symbols)} open paper positions, found {len(held)}')
+    return held
 
 
 def cpu_benchmarks() -> dict:
@@ -166,27 +215,47 @@ def scan_benchmark(symbol_count: int, rtt: float, rate_limit_ms: float, horizon:
             'warm_requests': exchange.requests}
 
 
-def monitor_benchmark(positions: int) -> dict:
+def monitor_benchmark(positions: int, repeat: int = 100) -> dict:
     symbols = [f'C{i:02d}/USDT' for i in range(positions)]
     engine, exchange = make_engine(symbols, 0.0, 0, 'balanced')
-    engine.cfg['max_positions'] = 8
-    for symbol in symbols:
-        engine._buy(symbol, 50, 100, .04)
+    held = open_paper_positions(engine, symbols)
     engine.running = True
     engine.stop_event.clear()
 
     def tick():
         engine._monitor_if_due(force=True)
-    result = timed(tick, 40)
+    warmup = WARMUP
+    for _ in range(warmup):
+        tick()
+    exchange.requests = 0
+    result = timed(tick, repeat, warmup=0)
+    result['warmup_discarded'] = warmup
+    requests = exchange.requests
     engine.running = False
-    return {'positions': positions, **result}
+    still_open = len(engine._active_positions(engine.mode))
+    assert still_open == positions, f'{positions - still_open} position(s) closed during the timed ticks'
+    return {'positions': positions, 'open_positions': len(held), 'requests_per_tick': requests / repeat, **result}
 
 
 def main():
+    global WARMUP
     parser = argparse.ArgumentParser()
     parser.add_argument('--json')
+    parser.add_argument('--warmup', type=int, default=WARMUP)
+    parser.add_argument('--revision', default='', help='label for the measured tree (default: git rev-parse)')
     args = parser.parse_args()
-    results = {'cpu': cpu_benchmarks(),
+    WARMUP = max(0, args.warmup)
+    revision = args.revision
+    if not revision:
+        try:
+            import subprocess
+            revision = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT, capture_output=True,
+                                      text=True, check=False).stdout.strip()
+        except OSError:
+            revision = ''
+    results = {'tree': str(ROOT), 'revision': revision or 'unknown', 'python': platform.python_version(),
+               'warmup': WARMUP,
+               'cpu': cpu_benchmarks(),
                'scan': [scan_benchmark(8, .15, 50, 'balanced'),     # MEXC-like
                         scan_benchmark(20, .15, 50, 'rapid'),
                         scan_benchmark(8, .15, 1000, 'balanced')],  # Kraken-like

@@ -1,8 +1,10 @@
-"""Offline reconciliation report, plus one explicit, confirmed halt reset.
+"""Offline reconciliation report, plus two explicit, confirmed repairs.
 
 The report never resolves orders or contacts APIs. --clear-halt only records a
 reconciliation a person has already completed against the exchange's own
 order history; it never retries, cancels or guesses an order outcome.
+--prepare-downgrade returns the order journal to the layout builds before
+schema 3 can write, after saving a full copy of the database.
 """
 from __future__ import annotations
 
@@ -24,6 +26,12 @@ RESOLVED = ('accounted', 'rejected', 'reconciled')
 
 def confirmation_phrase(exchange: str) -> str:
     return f'I HAVE RECONCILED {exchange.upper()} ORDERS'
+
+
+DOWNGRADE_PHRASE = 'I AM ROLLING BACK CRYPTOPILOT'
+# The order journal as builds before schema 3 create it and insert into it, by position.
+LEGACY_JOURNAL = ('intent_id', 'created_at', 'updated_at', 'exchange', 'symbol', 'side',
+                  'quantity', 'cost', 'status', 'order_id')
 SETTINGS_REASONS = {'invalid_json', 'invalid_values', 'unreadable', 'missing',
                     'save_in_progress', 'recovery_record_invalid', 'backup_unavailable'}
 MANUAL_KEY = re.compile(r'^manual_request\.(paper|live)\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(mexc|kraken)$')
@@ -231,16 +239,104 @@ def clear_halt(folder: Path | None, exchange: str, confirmation: str) -> dict:
             'legacy_live_record_count': legacy, 'other_exchange_unresolved': others, 'notice': notice}
 
 
+def prepare_downgrade(folder: Path | None, confirmation: str) -> dict:
+    """Make the database writable by a build from before schema 3.
+
+    Those builds insert journal rows by position into ten columns, so after
+    the additive schema-3 migration every order they journal fails, and a live
+    protective exit halts instead of being sent. This keeps the live journal
+    rows in the old layout and drops the paper ones, which older builds would
+    misread as live. A full copy of the database is saved first, and the
+    newer build migrates the file forward again at its next start.
+    """
+    if confirmation != DOWNGRADE_PHRASE:
+        raise ValueError('The exact confirmation phrase is required: ' + DOWNGRADE_PHRASE)
+    location = _existing_folder(folder)
+    with InstanceLock(location):
+        database = location / 'portfolio.sqlite3'
+        if not database.is_file():
+            raise FileNotFoundError('No local database exists; there is nothing to prepare.')
+        connection = sqlite3.connect(str(database), timeout=5)
+        connection.row_factory = sqlite3.Row
+        try:
+            version = connection.execute('PRAGMA user_version').fetchone()[0]
+            journal_columns = [row[1] for row in connection.execute('PRAGMA table_info(order_journal)')]
+            if version < 3 and tuple(journal_columns) in (LEGACY_JOURNAL, ()):
+                return {'changed': False, 'schema_version': version, 'backup': None,
+                        'notice': 'The database already has the layout older builds use. Nothing was changed.'}
+            if not set(LEGACY_JOURNAL) <= set(journal_columns):
+                raise ValueError('The database schema is not one this tool can update.')
+            placeholders = ','.join('?' * len(RESOLVED))
+            # Paper rows are dropped below, so only an open live intent blocks
+            # the rollback (it is also the only kind the report lists).
+            live_only = " AND mode='live'" if 'mode' in journal_columns else ''
+            open_intents = connection.execute(
+                f'SELECT COUNT(*) FROM order_journal WHERE status NOT IN ({placeholders}){live_only}', RESOLVED).fetchone()[0]
+            if open_intents:
+                raise ValueError(f'{open_intents} live order intent(s) are not final. Stop the bot and reconcile them '
+                                 '(see the report) before rolling back.')
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            backups = location / 'backups'
+            backups.mkdir(exist_ok=True)
+            backup = backups / f'portfolio-before-downgrade-{stamp}.sqlite3'
+            copy = sqlite3.connect(str(backup))
+            try:
+                connection.backup(copy)
+            finally:
+                copy.close()
+            columns = ','.join(LEGACY_JOURNAL)
+            live_only = " WHERE mode='live'" if 'mode' in journal_columns else ''
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute('CREATE TABLE order_journal_legacy ('
+                               'intent_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, '
+                               'exchange TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, '
+                               'quantity REAL, cost REAL, status TEXT NOT NULL, order_id TEXT)')
+            kept = connection.execute(f'INSERT INTO order_journal_legacy({columns}) '
+                                      f'SELECT {columns} FROM order_journal{live_only}').rowcount
+            total = connection.execute('SELECT COUNT(*) FROM order_journal').fetchone()[0]
+            connection.execute('DROP TABLE order_journal')
+            connection.execute('ALTER TABLE order_journal_legacy RENAME TO order_journal')
+            connection.execute('CREATE INDEX IF NOT EXISTS orders_unresolved ON order_journal(status,exchange)')
+            timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+            connection.execute('INSERT INTO audit(created_at,level,message) VALUES (?,?,?)',
+                               (timestamp, 'warning', 'Order journal returned to the pre-schema-3 layout for a rollback; '
+                                                      f'{kept} live row(s) kept, {total - kept} paper row(s) removed. '
+                                                      f'Full copy saved as {backup.name}.'))
+            connection.execute('PRAGMA user_version=2')
+            connection.commit()
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+    return {'changed': True, 'schema_version': 2, 'live_rows_kept': kept, 'paper_rows_removed': total - kept,
+            'backup': str(backup),
+            'notice': 'An older build can now journal orders in this data folder. The current build migrates it '
+                      'forward again when it next starts.'}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--output', type=Path, help='Also save a new JSON report outside the application data folder (existing files are never overwritten).')
     parser.add_argument('--clear-halt', choices=EXCHANGES, metavar='EXCHANGE',
                         help='After reconciling every listed order against the exchange, mark the intents reconciled and remove the live halt for this exchange.')
     parser.add_argument('--confirm', default='',
-                        help='Required with --clear-halt: the exact phrase "I HAVE RECONCILED <EXCHANGE> ORDERS".')
+                        help='Required with --clear-halt: the exact phrase "I HAVE RECONCILED <EXCHANGE> ORDERS". '
+                             f'Required with --prepare-downgrade: "{DOWNGRADE_PHRASE}".')
+    parser.add_argument('--prepare-downgrade', action='store_true',
+                        help='Before running a build older than schema 3: save a copy of the database and return the '
+                             'order journal to the layout that build writes.')
     args = parser.parse_args(argv)
     try:
         folder = data_directory().resolve()
+        if args.prepare_downgrade:
+            if args.clear_halt or args.output is not None:
+                print('Use --prepare-downgrade on its own, with --confirm.', file=sys.stderr)
+                return 1
+            result = prepare_downgrade(folder, args.confirm)
+            print(json.dumps(result, indent=2, allow_nan=False))
+            return 0
         if args.clear_halt:
             if args.output is not None:
                 print('Use --output with a report, not with --clear-halt.', file=sys.stderr)
@@ -264,7 +360,7 @@ def main(argv=None) -> int:
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
     except ValueError as exc:
-        if args.clear_halt:
+        if args.clear_halt or args.prepare_downgrade:
             print(str(exc) + ' Nothing was changed.', file=sys.stderr)
         else:
             print('Could not read the local database or create the report. No trading state was changed; check file access and the output location.', file=sys.stderr)

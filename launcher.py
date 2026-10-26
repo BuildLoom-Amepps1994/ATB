@@ -167,6 +167,34 @@ def report_startup_failure(exc: BaseException) -> None:
         pass
 
 
+def begin_engine_stop(engine, announce=print) -> threading.Thread:
+    """Stop scanning and new orders now, on a helper thread (never inside a signal handler)."""
+    def run():
+        announce('Stop requested: the bot stops scanning and placing orders now; open dashboard requests '
+                 'get up to 30 s to finish, then in-flight exchange operations get up to 30 s.')
+        engine.stop()
+    thread = threading.Thread(target=run, daemon=True, name='StopOnExit')
+    thread.start()
+    return thread
+
+
+def engine_first_server(server_class, engine, announce=print):
+    """A uvicorn Server that stops the engine the moment an exit is requested.
+
+    uvicorn first drains open connections (up to ``timeout_graceful_shutdown``)
+    and only then runs the app's shutdown, which used to be the first place
+    the engine was told to stop. Stopping here keeps the worker from starting
+    another scan or entry during that drain. A second Ctrl+C still forces exit.
+    """
+    class EngineFirstServer(server_class):
+        def handle_exit(self, sig, frame):
+            first = not self.should_exit
+            super().handle_exit(sig, frame)
+            if first:
+                begin_engine_stop(engine, announce)
+    return EngineFirstServer
+
+
 def main() -> int:
     listener = None
     stop_browser = threading.Event()
@@ -180,7 +208,7 @@ def main() -> int:
                 return 1
             # Initialize application state only after owning the data folder and port.
             import uvicorn
-            from app import CSRF, app
+            from app import CSRF, app, engine
             url = f'http://127.0.0.1:{port}/'
             print('=' * 58)
             print(' CryptoPilot Local - SPOT trading workstation')
@@ -193,12 +221,19 @@ def main() -> int:
                 threading.Thread(target=open_when_ready, args=(url, CSRF, stop_browser), daemon=True).start()
             # Nothing proxies this loopback server; forwarded-for headers from
             # a local client must not rewrite the peer address it is judged by.
-            # The connection-drain phase is bounded so a slow request cannot hold the
-            # shutdown open; the engine's own 30 s wait runs after it in app.lifespan.
+            # The engine stops as soon as an exit is requested; the connection
+            # drain that follows is bounded so a slow request cannot hold the
+            # shutdown open, and the engine's own 30 s in-flight wait runs after
+            # it in app.lifespan.
             config = uvicorn.Config(app, host='127.0.0.1', port=port, log_level='warning',
                                     access_log=False, proxy_headers=False, timeout_graceful_shutdown=30)
-            server = uvicorn.Server(config)
-            app.state.request_exit = lambda: setattr(server, 'should_exit', True)
+            server = engine_first_server(uvicorn.Server, engine)(config)
+
+            def request_exit():
+                if not server.should_exit:
+                    begin_engine_stop(engine)
+                server.should_exit = True
+            app.state.request_exit = request_exit
             server.run(sockets=[listener])
             print('Stopped.')
         return 0

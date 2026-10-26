@@ -142,6 +142,8 @@ impact on live capital or on the integrity of the record.
 | 61 | Med. | The documented rollback was unsafe: builds before the schema-3 migration insert journal rows by position into ten columns, so on a migrated database every order they journal fails, and the first live protective exit halts instead of being sent. Reproduced against the real `7207e82` code. | **Fixed**: `recovery.py --prepare-downgrade` (confirmation phrase, refuses open intents, full database copy first) returns the journal to the old layout; rehearsed against `7207e82`, which then journals orders, and the current build migrates forward again. Runbook §9 and §G corrected. |
 | 62 | Low | A Stop that landed while Start was preparing the stream left the websocket thread running with the bot stopped, and it kept serving quotes after **Streaming quotes** was switched off. | **Fixed**: Start re-checks after the stream starts and stops it if a Stop or a worker exit came in between; saving settings with streaming off stops any stream. |
 | 63 | Low | The kill switch was read once at the start of authorization, so an order authorized just before the switch was engaged was still sent, including an exit the operator meant to block. | **Fixed**: `_submit` re-reads the switch right before sending, under the submission lock, and journals the intent `rejected` with a `risk.blocked_at_submit` event. |
+| 64 | Med. | The documented recovery for a broken source-only update ran `--update-source` on the backup inside the installation folder, which the helper always refuses. | **Fixed** (docs): copy the backup outside the installation first, or run Setup. The reviewer's rehearsal confirmed that the copied backup restores. |
+| 65 | Med. | An interrupted Setup upgrade from 1.4.0 could not be recovered: the new helper checked the 1.4.0 backup record against its own 15-module list and refused it, and Setup refuses to run while that record exists. | **Fixed**: recovery accepts a record from another release (the nine modules every release ships are required, safe module names only); the old app is restored and Setup can run again. The reverse case, a 1.4.0 helper restoring a newer record during a downgrade, cannot be fixed from here and is documented in §G. |
 
 ---
 
@@ -175,6 +177,7 @@ impact on live capital or on the integrity of the record.
 | `tests/test_review_round3.py` (new), `tests/test_dashboard.js` | 32 + 1 tests for findings 39–60. Each new test was checked to fail with its fix removed. |
 | `recovery.py`, `trader.py`, `risk.py`, `RUNBOOK.md` | Findings 61–63: `--prepare-downgrade` for a rollback across the schema change, stream lifecycle on a fast Stop or with streaming off, kill switch re-read at submit. |
 | `tests/test_review_round3.py` | 7 more tests for findings 61–63, also checked to fail with each fix removed. |
+| `maintenance/update_installation.py`, `tests/test_source_updates.py` | Finding 65: interrupted-update recovery accepts another release's backup record; 8 tests, checked to fail without the fix. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -250,7 +253,7 @@ machine with Python 3.14 (section H).
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **591 passed** |
+| `python -m pytest tests -q` | 434 passed | **599 passed** |
 | `node --test tests/test_dashboard.js` | 11 passed | 14 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
 | `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
@@ -397,7 +400,7 @@ What the records can and cannot say:
 
 Commits 1–10 below reached `main` through pull request #5 (merged 2026-10-26
 01:07 UTC) and commit 11 through pull request #6 (merged 01:31 UTC). Pull
-request #8 carries commits 12–14, plus a documentation update, on top of
+request #8 carries commits 12–15, plus documentation updates, on top of
 `main` after pull request #7 (automatic releases). Oldest first:
 
 1. `a83667d` Add an independent risk gate, kill switch and structured events
@@ -414,8 +417,9 @@ request #8 carries commits 12–14, plus a documentation update, on top of
 12. `220edcd` Make MEXC streaming go live; one exit attempt per tick; compare quotes on one clock
 13. `db82565` Close the final review: latch on booking, stream cache sweep, clock steps, decision trail
 14. `5ddd2df` Close the concurrency review: safe rollback, stream lifecycle, kill switch at submit
+15. `0d277d4` Recover an interrupted update whose backup came from another release
 
-`git revert` them newest first. Reverting commits 11–14 needs no data step:
+`git revert` them newest first. Reverting commits 11–15 needs no data step:
 their data changes are meta keys that older builds ignore.
 
 Going back past commit 1 (to `7207e82`, v1.4.0) crosses the schema change
@@ -431,6 +435,15 @@ was rehearsed against the real `7207e82` code: before the step its journal
 insert failed, after it the insert succeeded, and the current build migrated
 the file forward again. The new settings keys are ignored by older builds.
 The event log and decision log are informational and can be deleted.
+
+A downgrade by running an older Setup over this installation must not be
+interrupted. If it is, the older release's helper cannot read this release's
+backup record (finding 65), so the app will not start and either Setup asks
+for recovery first. Restore by hand with the app closed: move
+`backups\setup-<stamp>\app` back to `app` (keep any `app` already there under
+another name), copy `backups\setup-<stamp>\installation.json` to the
+installation folder, delete `update-transaction.json`, then run the Setup you
+want.
 
 ---
 
@@ -469,9 +482,11 @@ dependency, so a source-only update is refused (the lock file differs) and only
 Setup brings the new runtime. Applied to a 1.4.0 installation, a source-only
 update from a tree before commit 12 (`main` with pull requests #5–#7) would
 instead copy only the nine modules the old helper knows, and the app would
-stop at start with `No module named 'decision'`. Recovery from that state is
-`CryptoPilotRuntime.exe --update-source <installation>\backups\update-<stamp>\app`,
-which restores the backed-up source.
+stop at start with `No module named` one of the new modules. To recover, copy
+`<installation>\backups\update-<stamp>\app` to a folder outside the
+installation and run `CryptoPilotRuntime.exe --update-source <that copy>`;
+the helper refuses a source inside the installation folder (finding 64).
+Setup is the simpler fix: it installs the matching app and runtime.
 
 **What only you can verify.**
 
@@ -494,7 +509,7 @@ which restores the backed-up source.
 
 **Explicit approvals requested.**
 
-* Approval to merge pull request #8 (commits 12–14) after its Windows build
+* Approval to merge pull request #8 (commits 12–15) after its Windows build
   is green. Pull requests #5 and #6 (commits 1–11) are already merged.
 * Whether to take the follow-ups above in a further branch.
 * Since pull request #7, every merge to `main` publishes a release

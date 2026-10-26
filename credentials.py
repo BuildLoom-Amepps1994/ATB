@@ -28,6 +28,20 @@ def _backend():
     return backend
 
 
+def _keep_local(backend) -> None:
+    """Windows: keep the record on this machine only.
+
+    keyring's default persistence (CRED_PERSIST_ENTERPRISE) lets a generic
+    credential roam with a domain profile to other workstations.
+    """
+    if type(backend).__name__ != 'WinVaultKeyring':
+        return
+    try:
+        backend.persist = 'local machine'
+    except Exception as exc:
+        raise CredentialStoreUnavailable('Credential storage could not be limited to this machine.') from exc
+
+
 def _account(exchange: str) -> str:
     if exchange not in storage.EXCHANGES:
         raise ValueError('Unsupported credential exchange.')
@@ -63,6 +77,7 @@ def save(exchange: str, key: str, secret: str) -> None:
     storage.register_secrets(key, secret)
     try:
         backend = _backend()
+        _keep_local(backend)
         record = json.dumps({'key': key, 'secret': secret}, separators=(',', ':'))
         backend.set_password(SERVICE, account, record)
         if backend.get_password(SERVICE, account) != record:

@@ -32,10 +32,18 @@ while every held asset has a live stream quote.
 order's final state; the UI shows *Stopping* until the worker finishes. The
 websocket feed stops with the bot.
 
-**Shut down the app.** Closing the window or stopping the service calls the
-same stop and then waits up to thirty seconds for an in-flight order to reach
-the ledger. If that wait expires, an `error` activity line says so: inspect the
-order journal (section 6) before the next start.
+**Shut down the app.** One Ctrl+C in the console (or the in-app update's
+exit) runs the same stop, prints `Stopping CryptoPilot: waiting up to 30 s…`
+and waits up to thirty seconds for an in-flight order to reach the ledger. If
+that wait expires, an `error` activity line says so: inspect the order journal
+(section 6) before the next start. A **second Ctrl+C, or closing the console
+window, is a hard kill**: nothing more is written, and the next start relies
+on the order journal (live: halt until reconciled; paper: the stale intent is
+abandoned). Wait for `Stopped.` instead.
+
+**If the app will not start**, the console shows one line naming the failure
+class and the data folder, and `logs/startup.log` inside the data folder holds
+the redacted traceback.
 
 **Restart.** The app always starts stopped and in paper mode. On start it:
 
@@ -58,7 +66,7 @@ Change them while the bot is stopped.
 | `max_position_pct`, `max_exposure_pct`, `max_positions` | 8 %, 40 %, 5 | Position, exposure and count caps. |
 | `risk_pct`, `max_portfolio_risk_pct` | 0.65 %, 3 % | Per-trade loss budget and total open stop risk. |
 | `daily_loss_limit_pct` | 3 % | Equity-based daily guard; latches until the next UTC day. |
-| `daily_realized_loss_limit_pct` | 3 % | Sum of today's realised losses; latches until `RESUME TRADING`. |
+| `daily_realized_loss_limit_pct` | 3 % | Sum of today's realised losses; latches durably until `RESUME TRADING` (`clear_realized_stop`) or a paper reset. A looser setting or a later profit does not lift it. |
 | `max_drawdown_pct` | 10 % | Equity drawdown from the tracked peak; latches until `RESUME TRADING`. |
 | `max_orders_per_minute` | 6 | Order-rate limit per exchange and mode (exits are allowed three times that). |
 | `data_max_age_seconds` | 120 | A quote older than this is stale; stale quotes block entries and fall back to REST for exits. |
@@ -84,8 +92,11 @@ nothing is sent at all.
 POST /api/risk  {"action": "release", "confirmation": "RESUME TRADING"}
 ```
 
-**Clear a drawdown stop** the same way with `"action": "clear_drawdown_stop"`.
-The daily equity guard clears itself at the next UTC day.
+**Clear a drawdown stop** the same way with `"action": "clear_drawdown_stop"`,
+and **a realised-loss stop** with `"action": "clear_realized_stop"`. Both
+latches are shown in `GET /api/state` under `risk.drawdown_stop` and
+`risk.realized_stop` and as a dashboard warning. The daily equity guard clears
+itself at the next UTC day.
 
 Breakers open and close on their own; `GET /api/state` shows them under
 `risk.breakers_open` with seconds remaining, and `risk.last_block` names the
@@ -141,18 +152,25 @@ the exchange knows an order with that client order id and what state it is in.
   bounded.
 * **Event log** `logs/events.jsonl` (rotated, 5 MB × 3): one JSON object per
   line with `ts`, `kind`, `level` and fields. Secrets and key-like strings are
-  redacted before writing. Event kinds: `engine.start`; `decision.entry`,
+  redacted before writing. Event kinds: `engine.start`, `engine.started`,
+  `engine.stopped`, `mode.changed`, `settings.saved`, `paper.reset`,
+  `credentials.disconnected`; `manual_order.requested`,
+  `manual_order.completed`, `manual_order.failed`; `decision.entry`,
   `decision.exit`; `execution.filled`, `execution.rejected`,
   `execution.unfilled`, `execution.ambiguous`, `execution.located`,
   `execution.lookup_failed`, `execution.halt`, `execution.probe`,
-  `execution.entry_error`; `risk.authorize`, `risk.blocked`, `risk.breaker`,
-  `risk.kill_switch`, `risk.drawdown_stop`, `risk.drawdown_stop_cleared`,
-  `risk.unauthorized_submit`; `feed.state`, `feed.connected`; `ledger.failure`.
-* **Correlation.** Every order path binds `intent_id`, `decision_id` and
-  `mode` into the event context, so one `grep` over the intent id gives the
-  decision, the authorization, the submit, the fill and the ledger update in
-  order. The same `decision_id` appears in `GET /api/decisions`, in the
-  dashboard row and in the journal.
+  `execution.entry_error`, `execution.fee_unvalued`; `risk.authorize`,
+  `risk.blocked`, `risk.breaker`, `risk.kill_switch`, `risk.drawdown_stop`,
+  `risk.drawdown_stop_cleared`, `risk.realized_stop`,
+  `risk.realized_stop_cleared`, `risk.unauthorized_submit`; `feed.state`,
+  `feed.connected`; `ledger.accounted`, `ledger.failure`.
+* **Correlation.** Every entry decision has a `decision_id` and every exit
+  decision an `exit_…` id; both are passed to the authorization, the submit
+  and the journal row. One `grep` over the `intent_id` gives the
+  authorization, the submit, the fill and the `ledger.accounted` (or
+  `ledger.failure`) line; the `decision_id` on those lines leads back to the
+  `decision.entry` / `decision.exit` record. The same ids appear in
+  `GET /api/decisions`, in the dashboard row and in the journal.
 * **Metrics** `GET /api/metrics`: counters (`decision.enter`, `decision.abstain`,
   `risk.blocked`, `feed.messages`, …), gauges and latency reservoirs with
   p50/p95/p99 (`decision.quote_to_decision_ms`, `execution.submit_to_ack_ms`,

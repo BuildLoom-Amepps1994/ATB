@@ -71,8 +71,9 @@ The order of operations for one quote is now:
 
 Sources: a parallel eight-lens audit of `7207e82` (execution, risk bypass,
 market data, concurrency, strategy leakage, latency, persistence, security)
-whose findings were deduplicated and checked against the code, plus
-observations made while implementing. Severity is the reviewer's judgement of
+whose findings were deduplicated and checked against the code, observations
+made while implementing, and a second, adversarial review of the branch
+itself (findings 27 onwards), each reproduced before it was fixed. Severity is the reviewer's judgement of
 impact on live capital or on the integrity of the record.
 
 | # | Sev. | Finding | Status on this branch |
@@ -101,8 +102,20 @@ impact on live capital or on the integrity of the record.
 | 22 | Low | Candle prefetch threads can outlive Stop. | **Open**. |
 | 23 | Low | In-app update: the idle check is not latched before the forced shutdown. | **Open**. |
 | 24 | Low | The protective tick ends with a paced private balance read at least every 30 s. | **Open**; measured tick cost stays small. |
-| 25 | Low | The hot path opens many short SQLite connections per tick. | **Open**; measured tick cost is 1.8 ms with one position. |
+| 25 | Low | The hot path opens many short SQLite connections per tick; because each call is the only connection, every write also checkpoints and deletes the WAL (measured 2.5–9× slower per write than with one anchor connection held open). | **Open**; measured tick cost is 1.8 ms with one position. Keeping one idle connection open is the follow-up; it needs care with Windows file locks during tests and exchange switches. |
 | 26 | Info | CCXT 4.5.90 does not support `watch_tickers` for MEXC spot. | The feed uses `watch_bids_asks` on both exchanges, `watch_tickers` as a fallback where the former is missing. |
+| 27 | Med. | The daily realised-loss stop was a live threshold, not the latch the runbook described: a looser setting or a later profit the same day lifted it. | **Fixed**: durable latch (`realized_stop.<mode>.<exchange>`), cleared only with `RESUME TRADING` (`clear_realized_stop`) or a paper reset; shown as `risk.realized_stop`. |
+| 28 | Med. | A confirmed MEXC fill whose fee is billed in a third asset (the MX deduction) halted live trading with the position missing from the ledger, so a real holding went unprotected. | **Fixed**: the fill is booked exactly (such a fee touches neither quote cash nor base quantity); its value is the configured estimate, with an audit warning and `execution.fee_unvalued`. The paper exchange can bill a third asset so the parity tests cover it. |
+| 29 | Med. | `recovery.py` rendered the new `acked` journal state as `unknown`, hiding the one fact the journal had captured. | **Fixed**; a test ties the two status sets together. |
+| 30 | Med. | Exits and the ledger step were not correlated in the event log; the runbook's "one grep over the intent id" claim did not hold for them. | **Fixed**: every exit decision carries an id through authorization, submit and the journal; `ledger.accounted` and `ledger.failure` carry the intent id. |
+| 31 | Med. | Operator and lifecycle actions (start, stop, mode, settings, credentials, manual orders) were recorded only in the 300-row, de-duplicating audit table. | **Fixed**: `engine.started/stopped`, `mode.changed`, `settings.saved`, `paper.reset`, `credentials.disconnected`, `manual_order.requested/completed/failed` events. |
+| 32 | Med. | Graceful shutdown printed nothing while it waited; a second Ctrl+C or closing the console window skips the engine stop, which the runbook contradicted. | **Mitigated**: a console line on stop, a bounded connection drain, runbook corrected. A Windows console-close handler is a follow-up (H). |
+| 33 | Med. | Start-up failures outside three known classes printed a bare traceback to a console that closes, and were recorded nowhere. | **Fixed**: one safe console line naming the failure class and the data folder, and a redacted traceback in `logs/startup.log`. |
+| 34 | Low | `_authorize` judged a symbol whose last quote had just been discarded as invalid on the price supplied, so a scan exit could go out on the stale mark. | **Fixed**: a symbol with a mark but no quote time is stale. |
+| 35 | Low | `orders.locate` treated MEXC's bare `ExchangeError` for an unknown order (code -2013) as a failed lookup, so the start-up probe never consulted the order lists. | **Fixed**. |
+| 36 | Low | The redaction heuristic could swallow a JSON string's closing quote, making exactly the incident-relevant event lines invalid JSON. | **Fixed**: strings are redacted before serialization and a quote ends a value. |
+| 37 | Low | `recovery --clear-halt` reported an exchange unblocked while intents on the other exchange still blocked live trading, and the engine's refusal did not say which. | **Fixed**: the notice and the refusal name the exchange and count. |
+| 38 | Low | Saved credentials used keyring's default roaming persistence on Windows. | **Fixed** in code (stored for this machine only); not verifiable outside Windows. |
 
 ---
 
@@ -123,16 +136,22 @@ impact on live capital or on the integrity of the record.
 | `recovery.py` | Reports and `--clear-halt` consider live journal rows only. |
 | `static/index.html`, `static/dashboard.js` | Kill switch button, five hard-limit inputs, streaming toggle, feed status line, risk warnings. |
 | `benchmarks/bench_latency.py`, `benchmarks/replay.py`, `benchmarks/results/` | Latency percentiles (runs on both trees), determinism check, raw results. |
-| `tests/test_risk_gate.py`, `test_order_lifecycle.py`, `test_decisions.py`, `test_quote_feed.py`, `test_hardening_fixes.py` (new) | 92 new tests; see D. |
+| `tests/test_risk_gate.py`, `test_order_lifecycle.py`, `test_decisions.py`, `test_quote_feed.py`, `test_hardening_fixes.py`, `test_app_manifest.py`, `test_review_round2.py` (new) | 115 new tests; see D. |
 | `tests/test_recovery.py`, `test_execution_speed.py`, `test_quote_protection.py`, `test_review_fixes.py` | Fixture updates for schema version 3, the 12 USDT minimum and client order ids. |
 | `scripts/build_installer.py`, `windows_runtime.py`, `maintenance/update_installation.py` | The six new modules join the installer's staged file list, the frozen runtime's required-module set and the offline source updater's module list. The first Windows build of the branch failed its frozen-runtime smoke test with `No module named 'decision'` because these lists are explicit. |
 | `tests/test_app_manifest.py` (new), `tests/smoke_frozen_orders.py` | A test keeps the three lists equal to the repository's modules and asserts everything the launcher imports is staged. The smoke test stages exactly the installer's file set (read from the builder), imports `ccxt.pro` inside the runtime, and can be rehearsed without the frozen runtime (`--work` alone). |
+| `risk.py`, `storage.py`, `app.py`, `static/dashboard.js` | Realised-loss latch, its release action and warning text; redaction stops at quotes. |
+| `trader.py`, `orders.py`, `recovery.py`, `observability.py`, `launcher.py`, `credentials.py`, `paper_exchange.py` | Review-round fixes 28–38: exit freshness, third-asset fees, exit decision ids and ledger events, operator events, MEXC unknown-order lookup, `acked` in the report, per-exchange halt messages, pre-serialization redaction, start-up failure log, local-only credential persistence, paper fee-asset injection. |
+| `tests/test_review_round2.py` (new) | 16 tests reproducing the review-round findings and asserting the fixes. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
 status strings, protective-exit semantics, manual ticket contract) is
 unchanged, and the previous 434 tests still pass unmodified except for the
-four fixture updates above.
+four fixture updates above and one deliberate expectation change: a confirmed
+fill whose fee is billed in a third asset used to be left unresolved (live
+halted, position absent from the ledger); it is now booked with the fee value
+flagged (finding 28), because an unrecorded holding is the worse outcome.
 
 ---
 
@@ -193,9 +212,10 @@ machine with Python 3.14 (section H).
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **528 passed** |
+| `python -m pytest tests -q` | 434 passed | **549 passed** |
 | `node --test tests/test_dashboard.js` | 11 passed | 11 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
+| `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
 
 New test files and what they prove:
 
@@ -224,18 +244,32 @@ New test files and what they prove:
   leaves REST in charge, stream overlay keeps turnover, monitor skips REST
   when every holding streams and falls back otherwise, scan preference,
   setting round trip.
-* `tests/test_hardening_fixes.py` (13): quote regression guard (unit and
+* `tests/test_hardening_fixes.py` (15): quote regression guard (unit and
   stop-firing scenario), `wait_idle`, app shutdown wait, exit and entry
   events, feature-dependent ids, withheld statuses, entry-error isolation in
-  paper and live, book-ticker quotes.
+  paper and live, book-ticker quotes, event-log file handling.
+* `tests/test_app_manifest.py` (3): the installer's staged file list, the
+  frozen runtime's required modules and the source updater's module list all
+  equal the repository's top-level modules; everything the launcher imports
+  is staged; every dashboard asset is staged.
+* `tests/test_review_round2.py` (16): the realised-loss latch (settings,
+  profit, phrase, API, paper reset), an invalidated quote is stale for the
+  gate, third-asset fees booked on the live and paper paths, MEXC unknown
+  order code treated as absent, recovery statuses match the journal, the
+  live refusal and `--clear-halt` name the other exchange, exit ids shared by
+  decision, authorization, journal and ledger events, operator and manual
+  order events, redaction keeps lines valid JSON, start-up failures are
+  logged safely.
 
 **Not runnable here.**
 
-* The Windows installer build and the frozen-app smoke test (`CryptoPilot.spec`,
-  `smoke_frozen_orders.py`). The repository's GitHub Actions workflow builds
-  the installer on every pull request, so opening the PR exercises it;
-  `ccxt.pro`/`aiohttp` are imported lazily and PyInstaller's analysis should
-  pick them up, but this is unverified until that run is green.
+* The Windows installer build and the frozen-app smoke test inside the real
+  runtime (`CryptoPilotEditable.spec`, `smoke_frozen_orders.py --runtime`).
+  The repository's GitHub Actions workflow builds the installer on every pull
+  request. Its first two runs on this branch found real problems (an open log
+  handle, the staged module list) that were fixed; the smoke test now also
+  imports `ccxt.pro` inside the runtime, so a missing websocket dependency
+  fails the build rather than the first streaming session.
 * Any test against a real MEXC or Kraken endpoint (both are unreachable from
   this environment). The websocket feed has only been exercised with a
   scripted fake client.
@@ -303,7 +337,9 @@ What the records can and cannot say:
 
 ## G. Rollback
 
-The branch is ten commits on top of `7207e82`, oldest first:
+Commits 1–10 below reached `main` through pull request #5 (merged 2026-10-26
+01:07 UTC); the follow-up pull request carries commit 11 on top of that merge.
+Oldest first:
 
 1. `a83667d` Add an independent risk gate, kill switch and structured events
 2. `185b346` Make order execution an explicit state machine shared by paper and live
@@ -314,7 +350,8 @@ The branch is ten commits on top of `7207e82`, oldest first:
 7. `eee9f1c` Read protective quotes from the lighter book-ticker endpoint where one exists
 8. `21c4692` Document the hardened engine: runbook, README summary and review deliverables
 9. `030a8f2` Append the event log per write so Windows can delete the data directory
-10. (fix) Ship the new modules in the installer, runtime and source updater
+10. `14033fc` Ship the new modules in the installer, runtime and source updater
+11. (review) Close the second review round: realised-loss latch, fee assets, correlation, operator events
 
 `git revert` them newest first, or check out `7207e82` to go back to v1.4.0
 entirely. Data: the schema change is additive (`PRAGMA user_version = 3`, new
@@ -343,7 +380,11 @@ decision log are informational and can be deleted.
    position, raise a dashboard warning and engage the entry side of the kill
    switch.
 5. Fee fallback on MEXC base-asset fees (13).
-6. Manifest-driven source updates: `maintenance/update_installation.py`
+6. Windows console close (32): register a `SetConsoleCtrlHandler` in the
+   frozen runtime that calls `engine.stop()` and waits briefly, so closing the
+   window behaves like Ctrl+C instead of a hard kill.
+7. One anchor SQLite connection (25) to stop the per-call WAL checkpoint.
+8. Manifest-driven source updates: `maintenance/update_installation.py`
    packages a fixed module list, so a source-only update applied by an
    *older* installed helper cannot add modules that a newer release
    introduces. Hashing the top-level modules actually present (with the
@@ -370,10 +411,14 @@ which restores the backed-up source.
   and the kill-switch drill (section F).
 * Optional, still without live trading: connect a read-only key and confirm
   the start-up probe reports no unresolved intents.
+* After saving a key with **Remember** on Windows, confirm in Credential
+  Manager that the `CryptoPilot` entry shows persistence *Local computer*
+  (finding 38 cannot be checked outside Windows).
 
 **Explicit approvals requested.**
 
-* Approval to merge this branch into `main` after the Windows build is green.
+* Approval to merge the follow-up pull request (commit 11) after its Windows
+  build is green. Pull request #5 (commits 1–10) is already merged.
 * Whether to take the follow-ups above in a further branch.
 * Whether this should become a tagged release (the app version is still
   1.4.0; a tag publishes an installer to GitHub Releases, which the app offers

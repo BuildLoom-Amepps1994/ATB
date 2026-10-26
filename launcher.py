@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.parse
 import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -130,6 +131,42 @@ def open_when_ready(url: str, token: str, stop: threading.Event) -> None:
         print('The dashboard did not open automatically. Open it in your browser: ' + url)
 
 
+def report_startup_failure(exc: BaseException) -> None:
+    """Leave one usable line on the console and in logs/startup.log when start-up fails.
+
+    The installed app runs in a console that closes with the process, so a bare
+    traceback is lost. The console gets the failure class and the data folder;
+    the redacted traceback goes to the data folder, never to the console.
+    """
+    folder = None
+    try:
+        folder = data_directory()
+    except Exception:
+        pass
+    stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    line = f'{stamp} CryptoPilot could not start: {type(exc).__name__}'
+    print(line + (f' (data folder: {folder}).' if folder else '.')
+          + ' Check that the data folder is writable and the portfolio database is intact; '
+            'the redacted traceback is in logs/startup.log inside the data folder.')
+    if folder is None:
+        return
+    try:
+        import traceback
+        try:
+            from storage import redact
+        except Exception:
+            def redact(text):
+                return str(text)
+        log = Path(folder) / 'logs' / 'startup.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        if log.exists() and log.stat().st_size > 1_000_000:
+            log.unlink()
+        with log.open('a', encoding='utf-8') as handle:
+            handle.write(line + '\n' + redact(''.join(traceback.format_exception(exc))) + '\n')
+    except Exception:
+        pass
+
+
 def main() -> int:
     listener = None
     stop_browser = threading.Event()
@@ -156,11 +193,14 @@ def main() -> int:
                 threading.Thread(target=open_when_ready, args=(url, CSRF, stop_browser), daemon=True).start()
             # Nothing proxies this loopback server; forwarded-for headers from
             # a local client must not rewrite the peer address it is judged by.
+            # The connection-drain phase is bounded so a slow request cannot hold the
+            # shutdown open; the engine's own 30 s wait runs after it in app.lifespan.
             config = uvicorn.Config(app, host='127.0.0.1', port=port, log_level='warning',
-                                    access_log=False, proxy_headers=False)
+                                    access_log=False, proxy_headers=False, timeout_graceful_shutdown=30)
             server = uvicorn.Server(config)
             app.state.request_exit = lambda: setattr(server, 'should_exit', True)
             server.run(sockets=[listener])
+            print('Stopped.')
         return 0
     except (AlreadyRunning, ValueError) as exc:
         print(str(exc))
@@ -169,6 +209,9 @@ def main() -> int:
         # Ctrl+C before the server owns the signal handler is a normal exit.
         print('Stopped.')
         return 0
+    except Exception as exc:
+        report_startup_failure(exc)
+        return 1
     finally:
         stop_browser.set()
         if listener is not None:

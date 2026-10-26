@@ -78,6 +78,17 @@ def supports_client_id_lookup(client) -> bool:
     return getattr(client, 'id', None) == 'mexc' and bool(getattr(client, 'has', {}).get('fetchOrder'))
 
 
+def unknown_order_error(client, exc: Exception) -> bool:
+    """True when the adapter reported an unknown order without raising ``OrderNotFound``.
+
+    CCXT 4.5 maps MEXC code -2013 ("Order does not exist.") to a bare
+    ``ExchangeError``; treating it as absent lets the open/closed-order
+    lists be consulted instead of reporting a failed lookup.
+    """
+    text = str(exc).lower()
+    return getattr(client, 'id', None) == 'mexc' and ('-2013' in text or 'order does not exist' in text)
+
+
 def locate(client, symbol: str, client_order_id: str, *, since_ms: int | None = None) -> dict | None:
     """Read-only search for an order by its client order id.
 
@@ -92,8 +103,9 @@ def locate(client, symbol: str, client_order_id: str, *, since_ms: int | None = 
             found = client.fetch_order(None, symbol, {'clientOrderId': client_order_id})
             if isinstance(found, dict) and found.get('id'):
                 return found
-        except ccxt.OrderNotFound:
-            pass
+        except ccxt.ExchangeError as exc:
+            if not isinstance(exc, ccxt.OrderNotFound) and not unknown_order_error(client, exc):
+                raise
     candidates: list[dict] = []
     if has.get('fetchOpenOrders'):
         candidates.extend(client.fetch_open_orders(symbol) or [])

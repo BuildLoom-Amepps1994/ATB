@@ -113,9 +113,11 @@ def test_stop_cancels_start_waiting_for_account_read(engine):
 @pytest.mark.parametrize('mutation', [
     {'id': None}, {'filled': 1e-308, 'cost': 1e308, 'average': None},
     {'filled': 1., 'cost': 100., 'average': 1000.},
-    {'fee': {'currency': 'OTHER', 'cost': 1}},
+    {'fee': {'currency': 'USDT', 'cost': -1}}, {'fee': {'currency': 'USDT', 'cost': 'free'}},
 ])
 def test_invalid_fill_identity_price_or_fee_remains_unresolved(engine, mutation):
+    # A fee billed in a third asset is no longer in this list: the fill is booked and the
+    # fee value flagged instead (tests/test_review_round2.py), so the holding stays protected.
     client = arm_fake_live(engine)
     client.fill.update(mutation)
     assert not engine._buy('BTC/USDT', 800, 100, .04)

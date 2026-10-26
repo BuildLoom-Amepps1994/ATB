@@ -187,6 +187,18 @@ class TradingEngine:
         return bool(storage.unresolved_orders() or storage.legacy_live_records()
                     or storage.get_meta(self._key('live_halt')) == '1')
 
+    def _live_block_detail(self) -> str:
+        """Name what blocks live trading, per exchange, so the recovery step is unambiguous."""
+        counts: dict[str, int] = {}
+        for row in storage.unresolved_orders():
+            counts[row['exchange']] = counts.get(row['exchange'], 0) + 1
+        parts = [f'{name}: {count} unresolved live order intent{"s" if count != 1 else ""}' for name, count in sorted(counts.items())]
+        if storage.legacy_live_records():
+            parts.append('legacy live records need a reviewed ledger repair')
+        if storage.get_meta(self._key('live_halt')) == '1':
+            parts.append(f'{self.exchange_name}: durable halt flag')
+        return '; '.join(parts) or 'see the recovery report'
+
     def _busy(self) -> bool:
         return bool(self.control_busy or self.running or (self.thread and self.thread.is_alive()) or self.scan_lock.locked())
 
@@ -330,6 +342,7 @@ class TradingEngine:
             self.credential_source = 'none'
             credentials.delete(self.exchange_name)
             storage.audit('info', 'Session credentials cleared and saved credential removal verified.')
+            observability.event('credentials.disconnected', exchange=self.exchange_name)
 
     def _ensure_private(self):
         with self.private_lock:
@@ -355,6 +368,7 @@ class TradingEngine:
                 self.manual_order_context = str(uuid.uuid4())
                 self.risk_block = None
                 storage.audit('info', 'Trading mode: PAPER (simulation).')
+                observability.event('mode.changed', mode='paper', exchange=self.exchange_name)
             elif mode == 'live':
                 if storage.settings_health()['review_required']:
                     raise storage.ConfigValidationError('Review and explicitly save the recovered settings before enabling live trading.')
@@ -362,7 +376,8 @@ class TradingEngine:
                     raise storage.ConfigValidationError('Live trading requires the exact confirmation and exchange eligibility acknowledgement.')
                 if self.live_halted or self._durable_live_block():
                     self.live_halted = True
-                    raise storage.ConfigValidationError('Live trading is blocked by unresolved orders or legacy account records; reconcile them manually first.')
+                    raise storage.ConfigValidationError('Live trading is blocked by unresolved orders or legacy account records '
+                                                        f'({self._live_block_detail()}); reconcile them manually first.')
                 self.control_busy = True
             else:
                 raise storage.ConfigValidationError('Invalid trading mode.')
@@ -374,6 +389,7 @@ class TradingEngine:
                     self.mode = mode
                     self.manual_order_context = str(uuid.uuid4())
                 storage.audit('warning', f'LIVE SPOT explicitly enabled for {self.exchange_name.upper()}.')
+                observability.event('mode.changed', level='warning', mode='live', exchange=self.exchange_name)
             finally:
                 with self.lock:
                     self.control_busy = False
@@ -393,6 +409,7 @@ class TradingEngine:
                 candidate_data = MarketData(candidate_public, wait=self._retry_wait,
                                             concurrency=self._public_concurrency(candidate_public))
             storage.save_settings(revised)
+            changed_keys = sorted(key for key in revised if revised.get(key) != self.cfg.get(key))
             self.cfg = revised
             if changed_exchange:
                 self.exchange_name = revised['exchange']
@@ -412,6 +429,7 @@ class TradingEngine:
             self.risk_block = None
             self.manual_order_context = str(uuid.uuid4())
             storage.audit('info', 'Trading configuration validated and saved.')
+            observability.event('settings.saved', changed=changed_keys, exchange=self.exchange_name)
 
     def reset_paper_portfolio(self):
         """Serialize reset with manual orders, scans, starts and account changes."""
@@ -421,6 +439,7 @@ class TradingEngine:
             storage.reset_paper(self.exchange_name)
             self.risk_block = None
             self.manual_order_context = str(uuid.uuid4())
+            observability.event('paper.reset', exchange=self.exchange_name)
 
     def start(self):
         with self.lock:
@@ -429,7 +448,8 @@ class TradingEngine:
                 if storage.settings_health()['review_required']:
                     raise storage.ConfigValidationError('Review and explicitly save the recovered settings before starting live trading.')
                 if self.live_halted or self._durable_live_block():
-                    raise storage.ConfigValidationError('Live trading is halted pending manual order/account reconciliation.')
+                    raise storage.ConfigValidationError('Live trading is halted pending manual order/account reconciliation '
+                                                        f'({self._live_block_detail()}).')
             self.control_busy = True
             generation = self.stop_generation
         try:
@@ -448,6 +468,9 @@ class TradingEngine:
                 self.thread.start()
             self._start_feed()
             storage.audit('warning' if self.mode == 'live' else 'info', f'Bot started in {self.mode.upper()} mode.')
+            observability.event('engine.started', level='warning' if self.mode == 'live' else 'info', mode=self.mode,
+                                exchange=self.exchange_name, streaming=bool(self.cfg.get('streaming_quotes')),
+                                settings_sha256=hashlib.sha256(repr(sorted(self.cfg.items())).encode('utf8')).hexdigest()[:16])
         finally:
             with self.lock:
                 self.control_busy = False
@@ -461,6 +484,7 @@ class TradingEngine:
             if not self.stopping:
                 self.running = False
             storage.audit('info', 'Stop requested. Waiting for any in-flight exchange operation to finish.')
+        observability.event('engine.stopped', mode=self.mode, exchange=self.exchange_name, in_flight=self.stopping)
         if thread and thread is not threading.current_thread():
             thread.join(timeout=2)
         self._stop_feed()
@@ -872,7 +896,7 @@ class TradingEngine:
         except Exception:
             pass
 
-    def _ledger_failure(self, description: str):
+    def _ledger_failure(self, description: str, *, intent_id: str | None = None):
         if self.mode == 'live':
             self._halt_uncertain(description)
         else:
@@ -880,7 +904,7 @@ class TradingEngine:
                 self.risk_block = self.last_error = description
                 self.stop_event.set()
             self.risk.record_failure('ledger')
-            observability.event('ledger.failure', level='error', description=description)
+        observability.event('ledger.failure', level='error', description=description, intent_id=intent_id, mode=self.mode)
 
     CONFIRM_DELAYS = (.25, .5, 1., 2., 3.)
 
@@ -1111,6 +1135,7 @@ class TradingEngine:
             raise ValueError('Unrecognized exchange fee response')
         quote_fee = base_fee = 0.0
         base, quote = symbol.split('/')
+        other: dict[str, float] = {}
         for fee in fees:
             if not isinstance(fee, dict):
                 raise ValueError('Malformed exchange fee')
@@ -1124,8 +1149,20 @@ class TradingEngine:
             elif fee.get('currency') == base:
                 base_fee += amount
             else:
-                raise ValueError('Fee in another asset cannot be valued reliably; reconcile manually')
-        return filled, price, gross, quote_fee, base_fee, quote_fee + base_fee * price
+                other[str(fee.get('currency'))] = other.get(str(fee.get('currency')), 0.0) + float(amount)
+        value = quote_fee + base_fee * price
+        if other:
+            # A fee billed in a third asset (MEXC's MX deduction) touches neither the
+            # quote cash nor the base quantity of this fill, so the position is booked
+            # exactly; only its reported fee value is an estimate. Dropping a confirmed
+            # fill from the ledger would leave a real holding unprotected.
+            estimate = gross * self.cfg['fee_pct'] / 100
+            value += estimate
+            charged = ', '.join(f'{amount:.8g} {currency}' for currency, amount in sorted(other.items()))
+            storage.audit('warning', f'{symbol}: fee charged in another asset ({charged}); its value is booked as the '
+                                     f'configured estimate {estimate:.4f} USDT. Check the exchange fee ledger.')
+            observability.event('execution.fee_unvalued', level='warning', symbol=symbol, fees=other, estimate=estimate)
+        return filled, price, gross, quote_fee, base_fee, value
 
     @staticmethod
     def _is_dust(position: dict, market: dict | None, price: float) -> bool:
@@ -1159,12 +1196,14 @@ class TradingEngine:
         """Build the request for the risk gate from the engine's current marks.
 
         Every production caller observes a ticker immediately before pricing
-        an order, so a quote that has since gone stale is blocked. A caller
-        that priced the order itself without any observation (tests,
-        benchmarks) is judged on the price it supplied.
+        an order, so a quote that has since gone stale is blocked. A symbol
+        whose last quote was discarded as invalid keeps its stale mark and is
+        therefore judged stale too. Only a caller that priced the order itself
+        without any observation ever (tests, benchmarks) is judged on the price
+        it supplied.
         """
         with self.lock:
-            observed = symbol in self.last_price_times
+            observed = symbol in self.last_price_times or symbol in self.last_prices
             mode = self.mode
         equity = self._equity(mode, cash, positions) if cash is not None else None
         request = risk.OrderRequest(exchange=self.exchange_name, mode=mode, symbol=symbol, side=side, kind=kind,
@@ -1307,12 +1346,16 @@ class TradingEngine:
                 with self.lock:
                     self.balance_updated_at = None
             storage.audit('trade', f'{mode.upper()} BUY {symbol}: {qty:.7g} at {fill_price:.7g}; cost {cost:.2f} USDT.')
+            observability.event('ledger.accounted', intent_id=intent, decision_id=decision_id, mode=mode, symbol=symbol,
+                                side='BUY', order_id=order_id, qty=qty, price=fill_price, cost=cost, fee=fee)
             return True
         except Exception as exc:
-            self._ledger_failure(f'{mode.upper()} BUY {symbol}: {type(exc).__name__}; portfolio ledger requires review')
+            self._ledger_failure(f'{mode.upper()} BUY {symbol}: {type(exc).__name__}; portfolio ledger requires review',
+                                 intent_id=intent)
             return False
 
-    def _sell(self, position: dict, market_price: float, reason: str, *, completion=None) -> bool:
+    def _sell(self, position: dict, market_price: float, reason: str, *, completion=None,
+              decision_id: str | None = None) -> bool:
         symbol, tracked, mode = position['symbol'], float(position['qty']), position['mode']
         if position.get('exchange', self.exchange_name) != self.exchange_name or mode != self.mode:
             raise ValueError('Position belongs to a different exchange or trading mode')
@@ -1324,11 +1367,12 @@ class TradingEngine:
         positions = self._active_positions(mode)
         if mode == 'paper':
             authorization = self._authorize(symbol, 'SELL', kind, tracked * market_price, market_price,
-                                            positions=positions, cash=None, quantity=tracked, reason=reason)
+                                            positions=positions, cash=None, quantity=tracked, reason=reason,
+                                            decision_id=decision_id)
             if not authorization.allowed:
                 return False
-            intent, order = self._submit(self.paper, symbol, 'SELL', quantity=tracked,
-                                         authorization=authorization, intended_price=market_price)
+            intent, order = self._submit(self.paper, symbol, 'SELL', quantity=tracked, authorization=authorization,
+                                         intended_price=market_price, decision_id=decision_id)
             if order is None:
                 return False
             try:
@@ -1338,7 +1382,8 @@ class TradingEngine:
                     raise ValueError('Simulated fill would consume untracked holdings')
                 order_id = self._order_id(order)
             except Exception as exc:
-                self._ledger_failure(f'PAPER SELL {symbol}: {type(exc).__name__}; simulated fill accounting requires review')
+                self._ledger_failure(f'PAPER SELL {symbol}: {type(exc).__name__}; simulated fill accounting requires review',
+                                     intent_id=intent)
                 return False
         else:
             if self.live_halted or self._durable_live_block():
@@ -1373,11 +1418,12 @@ class TradingEngine:
                 storage.audit('warning', self.risk_block)
                 return False
             authorization = self._authorize(symbol, 'SELL', kind, amount * market_price, market_price,
-                                            positions=positions, cash=None, quantity=amount, reason=reason)
+                                            positions=positions, cash=None, quantity=amount, reason=reason,
+                                            decision_id=decision_id)
             if not authorization.allowed:
                 return False
             intent, order = self._submit(client, symbol, 'SELL', quantity=amount, authorization=authorization,
-                                         intended_price=market_price)
+                                         intended_price=market_price, decision_id=decision_id)
             if order is None:
                 return False
             try:
@@ -1423,10 +1469,14 @@ class TradingEngine:
                 with self.lock:
                     self.balance_updated_at = None
             storage.audit('trade', f'{mode.upper()} SELL {symbol}: {filled:.7g} at {fill_price:.7g}; P/L {pnl:+.2f} USDT ({reason}).')
+            observability.event('ledger.accounted', intent_id=intent, decision_id=decision_id, mode=mode, symbol=symbol,
+                                side='SELL', order_id=order_id, qty=filled, price=fill_price, proceeds=proceeds, fee=fee,
+                                realized=pnl, remaining=remaining, reason=reason)
             # Reentry cooldown and fill were committed together above.
             return True
         except Exception as exc:
-            self._ledger_failure(f'{mode.upper()} SELL {symbol}: {type(exc).__name__}; portfolio ledger requires review')
+            self._ledger_failure(f'{mode.upper()} SELL {symbol}: {type(exc).__name__}; portfolio ledger requires review',
+                                 intent_id=intent)
             return False
 
     def _protect_positions(self, symbol: str, price: float):
@@ -1436,10 +1486,11 @@ class TradingEngine:
                 verdict = decision.evaluate_exit(position, price, dust=self._is_dust(
                     position, self._catalogue().get(symbol), price))
                 if verdict['action'] == 'exit':
-                    observability.event('decision.exit', symbol=symbol, reason=verdict['reason'], price=price,
-                                        stop=float(position['stop']), target=float(position['target']),
+                    exit_id = observability.new_id('exit')
+                    observability.event('decision.exit', decision_id=exit_id, symbol=symbol, reason=verdict['reason'],
+                                        price=price, stop=float(position['stop']), target=float(position['target']),
                                         highest=float(position['highest']), source='protective')
-                    self._sell(position, price, verdict['reason'])
+                    self._sell(position, price, verdict['reason'], decision_id=exit_id)
 
     def _mark_positions(self, symbol: str, price: float, atr: float, trend_broken: bool):
         for position in self._active_positions(self.mode):
@@ -1459,9 +1510,10 @@ class TradingEngine:
                     self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
                     return
             if verdict['action'] == 'exit' and self._orders_allowed():
-                observability.event('decision.exit', symbol=symbol, reason=verdict['reason'], price=price,
-                                    stop=stop, target=float(position['target']), highest=highest, source='scan')
-                self._sell(position, price, verdict['reason'])
+                exit_id = observability.new_id('exit')
+                observability.event('decision.exit', decision_id=exit_id, symbol=symbol, reason=verdict['reason'],
+                                    price=price, stop=stop, target=float(position['target']), highest=highest, source='scan')
+                self._sell(position, price, verdict['reason'], decision_id=exit_id)
 
     def scan_once(self, allow_orders: bool = False, exited_symbols=None):
         # Acquiring this while holding the state lock makes config/start checks
@@ -1735,6 +1787,8 @@ class TradingEngine:
         try:
             # Durable deduplication precedes every exchange operation.
             storage.set_meta(scope, json.dumps(record))
+            observability.event('manual_order.requested', level='warning' if self.mode == 'live' else 'info',
+                                request_id=request_id, symbol=symbol, side=side, quote_amount=amount, mode=self.mode)
             catalogue = self._fetch_markets()
             if not self._spot(symbol, catalogue.get(symbol)):
                 raise error('This pair is not an active supported USDT spot market.')
@@ -1811,8 +1865,12 @@ class TradingEngine:
             completed = json.loads(storage.get_meta(scope))
             if completed.get('status') != 'filled' or completed.get('fingerprint') != fingerprint:
                 raise error('The fill result is unavailable. Review trade history before another order.')
+            observability.event('manual_order.completed', request_id=request_id, symbol=symbol, side=side, mode=self.mode,
+                                status=completed['result'].get('status') if isinstance(completed.get('result'), dict) else None)
             return dict(completed['result'])
-        except Exception:
+        except Exception as exc:
+            observability.event('manual_order.failed', level='warning', request_id=request_id, symbol=symbol, side=side,
+                                mode=self.mode, error=type(exc).__name__)
             try:
                 with storage.connection() as db:
                     saved = db.execute('SELECT value FROM meta WHERE key=?', (scope,)).fetchone()

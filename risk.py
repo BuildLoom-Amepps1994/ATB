@@ -167,6 +167,25 @@ class RiskGate:
         storage.audit('warning', f'{mode.upper()} drawdown stop cleared after explicit confirmation; the equity peak restarts from the next fresh valuation.')
         observability.event('risk.drawdown_stop_cleared', level='warning', mode=mode)
 
+    def realized_stop(self, mode: str) -> str | None:
+        """ISO time at which today's realised-loss stop latched, or None."""
+        return storage.get_meta(self._key('realized_stop', mode)) or None
+
+    def _latch_realized_stop(self, mode: str, realized: float, limit: float) -> None:
+        storage.set_meta(self._key('realized_stop', mode), _now_iso())
+        storage.audit('error', f'{mode.upper()} daily realised-loss stop latched: {realized:.2f} USDT against a limit of '
+                               f'{limit:.2f} USDT. New entries are blocked until cleared with {RELEASE_PHRASE}.')
+        observability.event('risk.realized_stop', level='error', mode=mode, realized=realized, limit=limit)
+        self.metrics.incr('risk.realized_stop_latched')
+
+    def clear_realized_stop(self, mode: str, confirmation: str) -> None:
+        if confirmation != RELEASE_PHRASE:
+            raise storage.ConfigValidationError(f'Type {RELEASE_PHRASE} to clear the realised-loss stop.')
+        with storage.connection() as db:
+            db.execute('DELETE FROM meta WHERE key=?', (self._key('realized_stop', mode),))
+        storage.audit('warning', f'{mode.upper()} daily realised-loss stop cleared after explicit confirmation.')
+        observability.event('risk.realized_stop_cleared', level='warning', mode=mode)
+
     def observe_equity(self, mode: str, equity: float) -> dict:
         """Track the durable equity peak and latch the drawdown stop.
 
@@ -319,8 +338,14 @@ class RiskGate:
                   loss_pct=loss_today)
             realized = self._realized_today(mode)
             realized_limit = eq * cfg['daily_realized_loss_limit_pct'] / 100
-            check('daily_realized_loss', eq <= 0 or realized > -realized_limit,
-                  f'Realized loss today {realized:.2f} USDT reached the daily realized-loss limit', realized=round(realized, 2))
+            if eq > 0 and realized <= -realized_limit and not self.realized_stop(mode):
+                # A durable latch: a later profit, a new UTC day or a settings
+                # save does not lift it; only the release phrase does.
+                self._latch_realized_stop(mode, realized, realized_limit)
+            latched_at = self.realized_stop(mode)
+            check('daily_realized_loss', not latched_at,
+                  f'Realised-loss stop latched at {latched_at}; entries blocked until cleared with {RELEASE_PHRASE}'
+                  if latched_at else '', realized=round(realized, 2))
             check('drawdown_stop', not self.drawdown_stop(mode), 'Drawdown stop latched; entries blocked until cleared')
             if request.spread_pct is not None:
                 check('spread', request.spread_pct <= cfg['max_spread_pct'], 'Bid-ask spread exceeds the configured limit',
@@ -373,6 +398,7 @@ class RiskGate:
             breakers = {name: round(until - now, 1) for name, until in self._breaker_until.items() if until > now}
         mode = self.engine.mode
         return {'kill_switch': self.kill_switch(), 'drawdown_stop': self.drawdown_stop(mode),
+                'realized_stop': self.realized_stop(mode),
                 'peak_equity': _finite(storage.get_meta(self._key('peak_equity', mode))),
                 'blocked_total': self.blocked, 'last_block': self.last_block,
                 'breakers_open': breakers, 'release_phrase': RELEASE_PHRASE,

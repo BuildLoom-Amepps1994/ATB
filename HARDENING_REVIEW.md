@@ -571,7 +571,7 @@ What the records can and cannot say:
 
 Commits 1–10 below reached `main` through pull request #5 (merged 2026-10-26
 01:07 UTC) and commit 11 through pull request #6 (merged 01:31 UTC). Pull
-request #8 carries commits 12–20, plus documentation and benchmark updates, on top of
+request #8 carries commits 12–21, plus documentation and benchmark updates, on top of
 `main` after pull request #7 (automatic releases). Oldest first:
 
 1. `a83667d` Add an independent risk gate, kill switch and structured events
@@ -594,12 +594,13 @@ request #8 carries commits 12–20, plus documentation and benchmark updates, on
 18. `2fbe3a3` Close the documentation and test reviews: exit triggers, gate refusals withheld, slippage judged at each fill
 19. `1b0fb2e` Keep booked fills booked, end the entry pass on a connection failure, withhold raised entries
 20. `5b76b21` Run the loss and slippage checks after a booked fill whatever happens to its reports
+21. `0bd5a47` Pin the buy side, the loss-check fallback and the commit boundary of the booked-fill fix
 
 Commit `0d277d4` (recovery of an interrupted update from another release) and
 its revert `196f2da` cancel out; pull request #9 carries that fix instead
 (finding 65).
 
-`git revert` them newest first. Reverting commits 11–20 needs no data step:
+`git revert` them newest first. Reverting commits 11–21 needs no data step:
 their data changes are meta keys that older builds ignore.
 
 Going back past commit 1 (to `7207e82`, v1.4.0) crosses the schema change
@@ -703,7 +704,7 @@ Setup is the simpler fix: it installs the matching app and runtime.
 
 **Explicit approvals requested.**
 
-* Approval to merge pull request #8 (commits 12–20) after its Windows build
+* Approval to merge pull request #8 (commits 12–21) after its Windows build
   is green. Pull requests #5 and #6 (commits 1–11) are already merged.
 * Whether to take the follow-ups above in a further branch.
 * Whether the daily realised-loss stop should count today's losing trades

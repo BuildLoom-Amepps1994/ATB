@@ -119,7 +119,14 @@
     if (status.checked_at) return 'Up to date · checked ' + formatTime(status.checked_at);
     return '';
   }
-  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter};
+  // Latched entry stops the operator can clear with the release phrase, from /api/state's risk block.
+  function latchedStops(risk) {
+    const stops = [];
+    if (risk?.drawdown_stop) stops.push({action: 'clear_drawdown_stop', label: 'drawdown stop'});
+    if (risk?.realized_stop) stops.push({action: 'clear_realized_stop', label: 'daily realised-loss stop'});
+    return stops;
+  }
+  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, latchedStops};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CryptoPilotUI = api;
 })(typeof window === 'undefined' ? globalThis : window);

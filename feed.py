@@ -14,10 +14,14 @@ Continuity checks
   not ``healthy`` and callers use REST.
 * **Monotonic timestamps**: a quote whose exchange timestamp is older than
   the one already held for that symbol is dropped and counted.
-* **Backpressure**: CCXT Pro resolves each watch with the newest update, so
-  a slow consumer sees the latest quote rather than a growing queue; the
-  feed keeps exactly one quote per symbol and counts how many it overwrote
-  without anyone reading them.
+* **No lost updates**: a watch resolves with one message, so frames that
+  arrive while it is being re-armed reach only CCXT's own quote cache; the
+  feed reads that cache on every wake and at least once a second, so the
+  newest quote for each symbol is always the one served.
+* **Backpressure**: the feed keeps exactly one quote per symbol and counts
+  how many it overwrote without anyone reading them.
+* **Reconnect hygiene**: quotes from a closed connection are discarded; only
+  quotes received on the new connection are served.
 * **Reconnects** back off exponentially with jitter up to ``max_backoff``.
 
 Channels
@@ -90,6 +94,7 @@ class QuoteFeed:
         self._rng = rng or random.Random()
         self.lock = threading.Lock()
         self.requested = 0
+        self.unlisted: set[str] = set()     # symbols the exchange rejected as unknown
         self.symbols: tuple[str, ...] = self._capped(symbols)
         self.quotes: dict[str, dict] = {}
         self.counters = {'messages': 0, 'quotes': 0, 'out_of_order': 0, 'coalesced': 0, 'rejected': 0,
@@ -135,7 +140,7 @@ class QuoteFeed:
         Callers list held positions first, so the cap drops watchlist and
         discovery symbols, which then simply keep using REST.
         """
-        wanted = tuple(dict.fromkeys(symbols))
+        wanted = tuple(symbol for symbol in dict.fromkeys(symbols) if symbol not in self.unlisted)
         self.requested = len(wanted)
         limit = self.MAX_SUBSCRIPTIONS.get(self.exchange_name)
         return wanted[:limit] if limit else wanted
@@ -191,7 +196,8 @@ class QuoteFeed:
         with self.lock:
             now = self.clock()
             return {'state': self.state, 'exchange': self.exchange_name, 'symbols': len(self.symbols),
-                    'unsubscribed': max(0, self.requested - len(self.symbols)), 'quoted': len(self.quotes), 'last_message_age_s': (round(now - self.last_message_at, 1)
+                    'unsubscribed': max(0, self.requested - len(self.symbols)), 'unlisted': sorted(self.unlisted),
+                    'quoted': len(self.quotes), 'last_message_age_s': (round(now - self.last_message_at, 1)
                                                                        if self.last_message_at is not None else None),
                     'connected_at': self.connected_at, 'last_error': self.last_error, 'backoff_s': self.backoff,
                     'heartbeat_seconds': self.heartbeat_seconds, **self.counters}
@@ -241,6 +247,10 @@ class QuoteFeed:
                 self._set_state('stalled' if stalled else 'reconnecting', f'{type(exc).__name__}: {exc}'[:200])
             finally:
                 await self._close(client)
+                with self.lock:
+                    # Updates were missed while the connection was down: only
+                    # quotes received on the next connection are served.
+                    self.quotes.clear()
             if self._stop.is_set():
                 break
             delay = min(self.max_backoff, self.backoff) * (0.5 + self._rng.random())
@@ -276,6 +286,9 @@ class QuoteFeed:
             return 'watch_tickers'
         raise RuntimeError(f'{self.exchange_name} streams neither bid/ask nor tickers')
 
+    # How often the loop looks at CCXT's own quote cache while no watch resolves.
+    SWEEP_SECONDS = 1.0
+
     async def _stream(self, client) -> None:
         method = self._watch_method(client)
         with self.lock:
@@ -287,12 +300,17 @@ class QuoteFeed:
             raise Resubscribe('no symbols to watch')
         first = True
         pending: dict[str, asyncio.Future] = {}
+        seen: dict[str, dict] = {}
+        last_activity = time.monotonic()
         try:
             while not self._stop.is_set():
-                if method == 'watch_ticker':
-                    updates = await self._next_ticker_updates(client, symbols, pending, changed)
-                else:
-                    updates = await self._next_update(client, method, symbols, changed)
+                resolved = await self._next_updates(client, method, symbols, pending, changed)
+                updates = self._sweep_cache(client, symbols, dict(resolved or {}), seen)
+                if resolved is None and not updates:
+                    if time.monotonic() - last_activity > self.heartbeat_seconds:
+                        raise FeedStalled(f'no message for {self.heartbeat_seconds:g}s')
+                    continue
+                last_activity = time.monotonic()
                 received = self.clock()
                 if first:
                     first = False
@@ -312,59 +330,91 @@ class QuoteFeed:
                 if not future.done():
                     future.cancel()
 
-    async def _next_update(self, client, method: str, symbols: list[str], changed: asyncio.Event):
-        """The next message, a stall after the heartbeat window, or a wake-up to resubscribe."""
-        watch = asyncio.ensure_future(getattr(client, method)(symbols))
-        waiter = asyncio.ensure_future(changed.wait())
-        try:
-            done, _ = await asyncio.wait({watch, waiter}, timeout=self.heartbeat_seconds,
-                                         return_when=asyncio.FIRST_COMPLETED)
-            if watch in done:
-                return watch.result()
-            if waiter in done:
-                raise Resubscribe('symbol set changed')
-            raise FeedStalled(f'no message for {self.heartbeat_seconds:g}s')
-        finally:
-            for future in (watch, waiter):
-                if not future.done():
-                    future.cancel()
+    async def _next_updates(self, client, method: str, symbols: list[str], pending: dict, changed: asyncio.Event):
+        """Whatever the open watches delivered within one sweep interval, or None.
 
-    async def _next_ticker_updates(self, client, symbols: list[str], pending: dict, changed: asyncio.Event):
-        """Per-symbol watches: whatever arrived first, a stall, or a wake-up to resubscribe.
-
-        One ``watch_ticker`` future per symbol stays open across calls; only
-        the ones that resolved are re-armed, so a busy symbol cannot starve a
-        quiet one and nothing is resubscribed on every message.
+        Watches stay open across calls: MEXC keeps one ``watch_ticker`` per
+        symbol, so a busy symbol cannot starve a quiet one; the combined
+        channels keep one watch for the set. Only resolved watches are
+        re-armed, so nothing is resubscribed on every message.
         """
-        for symbol in symbols:
-            if symbol not in pending:
-                pending[symbol] = asyncio.ensure_future(client.watch_ticker(symbol))
+        if method == 'watch_ticker':
+            for symbol in symbols:
+                if symbol not in pending:
+                    pending[symbol] = asyncio.ensure_future(client.watch_ticker(symbol))
+        elif '*' not in pending:
+            pending['*'] = asyncio.ensure_future(getattr(client, method)(symbols))
         waiter = asyncio.ensure_future(changed.wait())
         try:
-            done, _ = await asyncio.wait({*pending.values(), waiter}, timeout=self.heartbeat_seconds,
+            done, _ = await asyncio.wait({*pending.values(), waiter},
+                                         timeout=min(self.heartbeat_seconds, self.SWEEP_SECONDS),
                                          return_when=asyncio.FIRST_COMPLETED)
-            updates, error = {}, None
-            for symbol, future in list(pending.items()):
+            updates, error, resolved = {}, None, False
+            for key, future in list(pending.items()):
                 if future not in done:
                     continue
-                del pending[symbol]
+                del pending[key]
                 if future.cancelled():
                     continue
                 exc = future.exception()
                 if exc is not None:
                     error = error or exc
-                else:
-                    updates[symbol] = future.result()
+                    continue
+                resolved = True
+                result = future.result()
+                if key != '*':
+                    updates[key] = result
+                elif isinstance(result, dict):
+                    updates.update(result)
             if error is not None:
+                self._drop_unlisted(client, symbols, error)
                 raise error
-            if updates:
+            if resolved:
                 return updates
             if waiter in done:
                 raise Resubscribe('symbol set changed')
-            raise FeedStalled(f'no message for {self.heartbeat_seconds:g}s')
+            return None
         finally:
             if not waiter.done():
                 waiter.cancel()
+
+    def _sweep_cache(self, client, symbols: list[str], updates: dict, seen: dict) -> dict:
+        """Add every quote CCXT stored since the last look, not only the ones a watch returned.
+
+        With ``newUpdates`` a watch resolves with the first message after it
+        was armed. Frames handled before it is armed again (a burst read in
+        one go, or one arriving during ingestion) reach only CCXT's own cache,
+        which stores a new dict per message. Reading that cache on every wake
+        and at least once per sweep interval means the newest quote for each
+        symbol is never left behind; it is stamped with the sweep time, at
+        most one interval after it arrived.
+        """
+        cache = getattr(client, 'tickers', None)
+        if isinstance(cache, dict):
+            for symbol in symbols:
+                entry = cache.get(symbol)
+                if isinstance(entry, dict) and entry is not seen.get(symbol):
+                    updates[symbol] = entry
+        for symbol, entry in updates.items():
+            if isinstance(entry, dict):
+                seen[symbol] = entry
+        return updates
+
+    def _drop_unlisted(self, client, symbols: list[str], error: Exception) -> None:
+        """A symbol the exchange does not list fails a whole subscription; stop asking for it."""
+        if type(error).__name__ != 'BadSymbol':
+            return
+        markets = getattr(client, 'markets', None)
+        if not isinstance(markets, dict) or not markets:
+            return
+        missing = [symbol for symbol in symbols if symbol not in markets]
+        if not missing:
+            return
+        with self.lock:
+            self.unlisted.update(missing)
+            self.symbols = tuple(symbol for symbol in self.symbols if symbol not in self.unlisted)
+        observability.event('feed.symbols_unlisted', level='warning', exchange=self.exchange_name, symbols=missing)
+        raise Resubscribe(f'{len(missing)} symbol(s) not listed on {self.exchange_name}')
 
     def _ingest(self, updates, received: float, client=None) -> None:
         if not isinstance(updates, dict):

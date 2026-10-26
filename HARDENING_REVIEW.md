@@ -72,8 +72,9 @@ The order of operations for one quote is now:
 Sources: a parallel eight-lens audit of `7207e82` (execution, risk bypass,
 market data, concurrency, strategy leakage, latency, persistence, security)
 whose findings were deduplicated and checked against the code, observations
-made while implementing, and a second, adversarial review of the branch
-itself (findings 27 onwards), each reproduced before it was fixed. Severity is the reviewer's judgement of
+made while implementing, and three further adversarial reviews of the branch
+itself (findings 27–38, 39–44 and 45–60), each finding reproduced before it
+was fixed. Severity is the reviewer's judgement of
 impact on live capital or on the integrity of the record.
 
 | # | Sev. | Finding | Status on this branch |
@@ -87,8 +88,8 @@ impact on live capital or on the integrity of the record.
 | 7 | High | Manual dust consolidation anchors stop/target/highest on the blended cost average; the merged position can be stopped out at the next poll. | **Open** (pre-existing manual-order behaviour; recommendation in H). |
 | 8 | High | MEXC private client's clock offset is measured once at connect; after a clock step every private call fails with code 700003 and exits silently stop. | **Open** (recommendation in H). |
 | 9 | High | Kraken candle completion is cut on the local clock; when the PC clock runs ahead an open candle is admitted as completed. | **Open** (recommendation in H). |
-| 10 | Med. | Every MEXC bulk ticker read costs 25 rate-limit units and, for two or more symbols, downloads the whole catalogue. | **Mitigated**: protective checks use the book-ticker endpoint (cost 10, bid/ask only); with streaming on, no REST read at all while every held asset streams. |
-| 11 | Med. | Decision records existed only in memory; the durable trail could not reconstruct an entry decision and no exit verdict was recorded. | **Fixed**: full record in every `decision.entry` event, `decision.exit` events with source and levels. |
+| 10 | Med. | Every MEXC bulk ticker read costs 25 rate-limit units and, for two or more symbols, downloads the whole catalogue. | **Mitigated**: protective checks use the book-ticker endpoint (cost 10, bid/ask only); one held pair is requested by name (finding 54), two or more still read the whole, smaller book-ticker list; with streaming on, no REST read at all while every held asset streams. |
+| 11 | Med. | Decision records existed only in memory; the durable trail could not reconstruct an entry decision and no exit verdict was recorded. | **Fixed**: full record in `decision.entry` events (every entry and every change of a symbol's outcome, finding 56), `decision.exit` events with source, trigger and levels, `decision.withheld` for entries that did not become orders. |
 | 12 | Med. | A pre-submit exception from one candidate aborted the whole entry pass with a generic error. | **Fixed**: recorded and counted; paper continues, live ends the pass deliberately. |
 | 13 | Med. | Fee-estimate fallback books the estimate as a quote fee; on MEXC base-asset fees the tracked quantity can be overstated. | **Open**. |
 | 14 | Med. | MEXC public clock offset refreshes only with the hourly catalogue load; a clock step mis-ages quotes until then. | **Open** (same remedy as 8). |
@@ -103,19 +104,41 @@ impact on live capital or on the integrity of the record.
 | 23 | Low | In-app update: the idle check is not latched before the forced shutdown. | **Open**. |
 | 24 | Low | The protective tick ends with a paced private balance read at least every 30 s. | **Open**; measured tick cost stays small. |
 | 25 | Low | The hot path opens many short SQLite connections per tick; because each call is the only connection, every write also checkpoints and deletes the WAL (measured 2.5–9× slower per write than with one anchor connection held open). | **Open**; measured tick cost is 1.8 ms with one position. Keeping one idle connection open is the follow-up; it needs care with Windows file locks during tests and exchange switches. |
-| 26 | Info | CCXT 4.5.90 does not support `watch_tickers` for MEXC spot. | The feed uses `watch_bids_asks` on both exchanges, `watch_tickers` as a fallback where the former is missing. |
+| 26 | Info | CCXT 4.5.90 does not support `watch_tickers` for MEXC spot, and its `watch_bids_asks` never resolves there (finding 39). | The feed keeps one `watch_ticker` per symbol on MEXC and uses `watch_bids_asks` on Kraken, `watch_tickers` as a fallback where neither exists. |
 | 27 | Med. | The daily realised-loss stop was a live threshold, not the latch the runbook described: a looser setting or a later profit the same day lifted it. | **Fixed**: durable latch (`realized_stop.<mode>.<exchange>`), cleared only with `RESUME TRADING` (`clear_realized_stop`) or a paper reset; shown as `risk.realized_stop`. |
 | 28 | Med. | A confirmed MEXC fill whose fee is billed in a third asset (the MX deduction) halted live trading with the position missing from the ledger, so a real holding went unprotected. | **Fixed**: the fill is booked exactly (such a fee touches neither quote cash nor base quantity); its value is the configured estimate, with an audit warning and `execution.fee_unvalued`. The paper exchange can bill a third asset so the parity tests cover it. |
 | 29 | Med. | `recovery.py` rendered the new `acked` journal state as `unknown`, hiding the one fact the journal had captured. | **Fixed**; a test ties the two status sets together. |
 | 30 | Med. | Exits and the ledger step were not correlated in the event log; the runbook's "one grep over the intent id" claim did not hold for them. | **Fixed**: every exit decision carries an id through authorization, submit and the journal; `ledger.accounted` and `ledger.failure` carry the intent id. |
 | 31 | Med. | Operator and lifecycle actions (start, stop, mode, settings, credentials, manual orders) were recorded only in the 300-row, de-duplicating audit table. | **Fixed**: `engine.started/stopped`, `mode.changed`, `settings.saved`, `paper.reset`, `credentials.disconnected`, `manual_order.requested/completed/failed` events. |
-| 32 | Med. | Graceful shutdown printed nothing while it waited; a second Ctrl+C or closing the console window skips the engine stop, which the runbook contradicted. | **Mitigated**: a console line on stop, a bounded connection drain, runbook corrected. A Windows console-close handler is a follow-up (H). |
+| 32 | Med. | Graceful shutdown printed nothing while it waited; a second Ctrl+C or closing the console window skips the engine stop, which the runbook contradicted. | **Mitigated**: the engine now stops the moment Ctrl+C arrives (finding 50) and says so, the connection drain is bounded, runbook corrected. A Windows console-close handler is a follow-up (H). |
 | 33 | Med. | Start-up failures outside three known classes printed a bare traceback to a console that closes, and were recorded nowhere. | **Fixed**: one safe console line naming the failure class and the data folder, and a redacted traceback in `logs/startup.log`. |
 | 34 | Low | `_authorize` judged a symbol whose last quote had just been discarded as invalid on the price supplied, so a scan exit could go out on the stale mark. | **Fixed**: a symbol with a mark but no quote time is stale. |
 | 35 | Low | `orders.locate` treated MEXC's bare `ExchangeError` for an unknown order (code -2013) as a failed lookup, so the start-up probe never consulted the order lists. | **Fixed**. |
 | 36 | Low | The redaction heuristic could swallow a JSON string's closing quote, making exactly the incident-relevant event lines invalid JSON. | **Fixed**: strings are redacted before serialization and a quote ends a value. |
 | 37 | Low | `recovery --clear-halt` reported an exchange unblocked while intents on the other exchange still blocked live trading, and the engine's refusal did not say which. | **Fixed**: the notice and the refusal name the exchange and count. |
-| 38 | Low | Saved credentials used keyring's default roaming persistence on Windows. | **Fixed** in code (stored for this machine only); not verifiable outside Windows. |
+| 38 | Low | Saved credentials used keyring's default roaming persistence on Windows. | **Fixed** in code for new saves (stored for this machine only); keys saved by an earlier build keep their old persistence until saved again (finding 51). Not verifiable outside Windows. |
+| 39 | Med. | Streaming quotes could never go live on MEXC: MEXC spot sends top-of-book only as protobuf frames, CCXT 4.5.90 routes them to the per-symbol ticker channel, so the combined `watch_bids_asks` subscription was accepted but never resolved and the feed reconnected forever; `protobuf` was not even in the shipped dependencies. | **Fixed**: one long-lived `watch_ticker` per symbol on MEXC; `protobuf` in the requirements, the lock and the runtime build; the frozen smoke test decodes a MEXC frame; a test drives the real `ccxt.pro.mexc` client with protobuf frames. |
+| 40 | Med. | A stored stop or target that failed to fill was submitted twice per tick (protective pass, then trailing pass at the same bid), doubling exit orders and rejections, and the trailing levels stopped rising while the bid stayed above the target. | **Fixed**: the trailing pass does not resubmit a stored-level exit already tried at that bid; levels ratchet on every outcome (dust included). |
+| 41 | Med. | Quote ordering compared an exchange timestamp with a local receipt time; an exchange clock running a few seconds ahead made every later receipt-stamped book-ticker bid look older, hiding a stop breach. | **Fixed**: two exchange timestamps compare directly, otherwise arrival order decides. |
+| 42 | Low | MEXC allows 30 subscriptions per websocket connection; the feed could ask for 40. | **Fixed**: capped at 30, held positions first; `feed.unsubscribed` counts the rest, which stay on REST. |
+| 43 | Low | The decision module changed the dashboard status precedence: a signal that ran away on a thin or wide market showed the volume or spread status. | **Fixed**: the original order restored. |
+| 44 | Low | `DecisionLog` was read by the dashboard while the scan appended to it without a lock; engine code re-read `self.feed` between check and use. | **Fixed**. |
+| 45 | Med. | The realised-loss stop was written only when an entry was being authorized, so a later profit or the UTC rollover could hide a crossing before any entry attempt latched it. | **Fixed**: checked and latched at every fresh valuation (each monitor poll and scan) as well as in the gate. |
+| 46 | Low | Clearing the realised-loss stop had no effect for the rest of the day (the next entry re-latched on the same loss), and the dashboard had no control for it. | **Fixed**: the clear records the day's realised total and only a further loss that day latches again; a **Clear latched stop** button clears both latches with the phrase. |
+| 47 | Low | A fee billed in a third asset was left out of realised P/L (so the realised-loss stop tripped later than set), and a fee split between USDT and a third asset counted the estimate on top of the USDT part. | **Fixed**: the estimate enters cost basis and realised P/L only, cash and quantity stay exact, and only the uncounted remainder of the configured rate is estimated. |
+| 48 | Low | Failure-path events (uncertain submit, unjournaled unfilled order, fill accounting failure, halt) carried no intent id, breaking the one-grep correlation exactly where it matters. | **Fixed**: `ledger.failure`, `execution.halt` and `execution.unfilled` carry the intent id. |
+| 49 | Low | `manual_order.failed` was logged before the committed-fill check, so a filled and booked manual order could appear failed; its test asserted a tautology. | **Fixed**, with a real test. |
+| 50 | Low | After Ctrl+C the engine kept scanning and could open entries during uvicorn's silent connection drain (up to 30 s) before it was told to stop. | **Fixed**: the exit request stops the engine at once and prints what follows. |
+| 51 | Low | Credentials saved before finding 38's fix keep roaming persistence. | **Open by choice**: rewriting stored secrets automatically was not done without approval. Saving the keys again with **Remember** switches them (H). |
+| 52 | Med. | After the PC clock stepped back, the quote guard kept the pre-step bid (every new quote looked older) and reported it fresh at age 0, so a stop could be missed for the size of the step. | **Fixed**: a stored arrival time later than now is distrusted, new quotes are accepted, and such a stored quote is not fresh; an exchange timestamp ahead of arrival is capped at arrival for ageing. |
+| 53 | Med. | The feed lost updates that arrived while a watch was being re-armed (a market-wide burst left all but one symbol at pre-move prices) and served quotes from a closed connection after reconnecting. | **Fixed**: CCXT's own quote cache is read on every wake and at least once a second; quotes are discarded when a connection ends. Tests drive the real CCXT MEXC client with a burst. |
+| 54 | Med. | With one held MEXC position, every protective read downloaded the whole book-ticker list, got nothing back from CCXT and then waited about 1.25 s of pacing for a second read. | **Fixed**: one pair is requested by name; a test uses the real CCXT MEXC adapter with its HTTP layer stubbed. |
+| 55 | Low | One unlisted watchlist pair failed the whole combined subscription, so streaming never worked. | **Fixed**: only catalogue-listed pairs are streamed, and the feed drops a pair the exchange rejects (`feed.unlisted`). |
+| 56 | Med. | Every scan wrote a full decision record per symbol, so in rapid mode the 20 MB event log rotated the decision, order and ledger trail away within hours. | **Fixed**: every entry and every change of a symbol's action, status or reasons is written in full; unchanged repeats are counted (`decision.entry_unchanged`) and stay in `GET /api/decisions`. |
+| 57 | Med. | A symbol blocked by the durable same-candle rule was recorded as `enter` / `BUY setup` with the re-entry check passed. | **Fixed**: the record applies the same durable rule as the entry pass. |
+| 58 | Low | `enter` decisions that did not become orders (per-scan cap, positions, re-quote, budget, guards) left no trace. | **Fixed**: one `decision.withheld` event per candidate with a reason code. |
+| 59 | Low | The runbook said exit ids appear in `GET /api/decisions`. | **Fixed** (runbook): exit ids are in `decision.exit` events and the journal. |
+| 60 | Low | Trailing exits decided by the protective monitor were labelled `source='scan'`. | **Fixed**: `source='monitor'`, and every `decision.exit` names its trigger. |
 
 ---
 
@@ -143,6 +166,10 @@ impact on live capital or on the integrity of the record.
 | `risk.py`, `storage.py`, `app.py`, `static/dashboard.js` | Realised-loss latch, its release action and warning text; redaction stops at quotes. |
 | `trader.py`, `orders.py`, `recovery.py`, `observability.py`, `launcher.py`, `credentials.py`, `paper_exchange.py` | Review-round fixes 28–38: exit freshness, third-asset fees, exit decision ids and ledger events, operator events, MEXC unknown-order lookup, `acked` in the report, per-exchange halt messages, pre-serialization redaction, start-up failure log, local-only credential persistence, paper fee-asset injection. |
 | `tests/test_review_round2.py` (new) | 16 tests reproducing the review-round findings and asserting the fixes. |
+| `feed.py`, `requirements.txt`, `requirements-lock.txt`, `CryptoPilotEditable.spec`, `scripts/bootstrap.py`, `tests/smoke_frozen_orders.py` | Findings 39, 42, 53, 55: per-symbol MEXC watches, the 30-subscription cap, the cache sweep, reconnect hygiene, unlisted pairs; `protobuf` shipped and checked in the frozen runtime. |
+| `decision.py`, `trader.py`, `risk.py`, `storage.py`, `market_data.py`, `launcher.py` | Findings 40, 41, 43–50, 52, 54, 56–60: exit retry and ratchet, quote clocks, status order, locks, realised-loss latching and clearing, fee P/L, failure correlation, manual-order events, Ctrl+C, single-pair MEXC reads, decision trail. |
+| `static/index.html`, `static/dashboard.js`, `static/dashboard-core.js` | **Clear latched stop** button and warning text (finding 46). |
+| `tests/test_review_round3.py` (new), `tests/test_dashboard.js` | 32 + 1 tests for findings 39–60. Each new test was checked to fail with its fix removed. |
 | `README.md`, `RUNBOOK.md`, `WINDOWS_INSTALL.md`, this file | Documentation. |
 
 Nothing was deleted. Existing behaviour that tests assert (paper arithmetic,
@@ -152,6 +179,12 @@ four fixture updates above and one deliberate expectation change: a confirmed
 fill whose fee is billed in a third asset used to be left unresolved (live
 halted, position absent from the ledger); it is now booked with the fee value
 flagged (finding 28), because an unrecorded holding is the worse outcome.
+Later review rounds changed three of the branch's own tests on purpose: the
+dashboard status precedence test now expects the original order (finding 43),
+the third-asset fee test expects the estimate in the cost basis (finding 47),
+and the manual-order event test exercises a real failure (finding 49). The
+spec test's stub of PyInstaller's `collect_submodules` accepts its `filter`
+argument.
 
 ---
 
@@ -212,8 +245,8 @@ machine with Python 3.14 (section H).
 
 | Suite | `main 7207e82` | this branch |
 |---|---|---|
-| `python -m pytest tests -q` | 434 passed | **549 passed** |
-| `node --test tests/test_dashboard.js` | 11 passed | 11 passed |
+| `python -m pytest tests -q` | 434 passed | **582 passed** |
+| `node --test tests/test_dashboard.js` | 11 passed | 12 passed |
 | `python benchmarks/replay.py --symbols 60` | n/a | 240 comparisons, **0 mismatches** |
 | `python tests/smoke_frozen_orders.py --work <dir>` (local rehearsal of the installer's staged app: paper and simulated-live manual orders through the launcher) | n/a | passed |
 
@@ -260,6 +293,20 @@ New test files and what they prove:
   decision, authorization, journal and ledger events, operator and manual
   order events, redaction keeps lines valid JSON, start-up failures are
   logged safely.
+* `tests/test_review_round3.py` (32): the real CCXT MEXC websocket client fed
+  protobuf frames goes live, keeps both symbols updating and serves the newest
+  quote after a burst; the 30-subscription cap; cache entries a combined watch
+  did not return; no pre-outage quotes after a reconnect; an unlisted pair;
+  protobuf in the dependency files; exchange clock ahead, PC clock stepped
+  back, and age capped at arrival; one exit order per poll for a rejected
+  target, with the trail still rising; a new bid between the two passes;
+  trigger names and dust ratchet; status order; concurrent decision-log reads;
+  the feed cleared mid-poll; realised-loss latching on booking, clearing and
+  re-latching; third-asset fees in P/L on both legs and split fees; intent ids
+  on failure and halt events; a filled manual order never logged as failed;
+  one MEXC pair read by name with the real adapter; catalogue-only streaming;
+  the same-candle rule in the record; unchanged abstentions; withheld reasons;
+  monitor-labelled exits; Ctrl+C stopping the engine first.
 
 **Not runnable here.**
 
@@ -271,8 +318,9 @@ New test files and what they prove:
   imports `ccxt.pro` inside the runtime, so a missing websocket dependency
   fails the build rather than the first streaming session.
 * Any test against a real MEXC or Kraken endpoint (both are unreachable from
-  this environment). The websocket feed has only been exercised with a
-  scripted fake client.
+  this environment). The websocket feed has been exercised with scripted
+  clients and with the real CCXT MEXC client fed locally built protobuf
+  frames, never against the exchange itself.
 * `tests/test_dashboard_browser.cjs` (Playwright) was not run.
 * Python 3.14 on Windows: the suite ran on 3.13 here. The pull request's
   Windows job (Python 3.14.9) then ran it: 528 passed, but five module
@@ -338,7 +386,8 @@ What the records can and cannot say:
 ## G. Rollback
 
 Commits 1–10 below reached `main` through pull request #5 (merged 2026-10-26
-01:07 UTC); the follow-up pull request carries commit 11 on top of that merge.
+01:07 UTC); the follow-up pull request #6 carries commits 11–13 on top of that
+merge.
 Oldest first:
 
 1. `a83667d` Add an independent risk gate, kill switch and structured events
@@ -351,7 +400,9 @@ Oldest first:
 8. `21c4692` Document the hardened engine: runbook, README summary and review deliverables
 9. `030a8f2` Append the event log per write so Windows can delete the data directory
 10. `14033fc` Ship the new modules in the installer, runtime and source updater
-11. (review) Close the second review round: realised-loss latch, fee assets, correlation, operator events
+11. `2ea317d` Close the second review round: realised-loss latch, fee assets, correlation, operator events
+12. `e6b32ee` Make MEXC streaming go live; one exit attempt per tick; compare quotes on one clock
+13. (review) Close the final review: latch on booking, stream cache sweep, clock steps, decision trail
 
 `git revert` them newest first, or check out `7207e82` to go back to v1.4.0
 entirely. Data: the schema change is additive (`PRAGMA user_version = 3`, new
@@ -393,9 +444,12 @@ decision log are informational and can be deleted.
 
 **Upgrade path for an existing installation.** If the 1.4.0 build from CI is
 installed anywhere, upgrade it with the new Setup (the in-app updater does
-this), not with `UPDATE_INSTALLED.bat` / `--update-source`: the installed
-helper would copy only the nine modules it knows, and the app would then stop
-at start with `No module named 'decision'`. Recovery from that state is
+this), not with `UPDATE_INSTALLED.bat` / `--update-source`. Commit 12 adds the
+`protobuf` dependency, so a source-only update is refused anyway (the lock file
+differs) and only Setup brings the new runtime. With a source tree from
+before commit 12 (pull request #5 alone) the installed helper would instead
+copy only the nine modules it knows, and the app would then stop at start
+with `No module named 'decision'`. Recovery from that state is
 `CryptoPilotRuntime.exe --update-source <installation>\backups\update-<stamp>\app`,
 which restores the backed-up source.
 
@@ -413,12 +467,15 @@ which restores the backed-up source.
   the start-up probe reports no unresolved intents.
 * After saving a key with **Remember** on Windows, confirm in Credential
   Manager that the `CryptoPilot` entry shows persistence *Local computer*
-  (finding 38 cannot be checked outside Windows).
+  (finding 38 cannot be checked outside Windows). Keys saved by an earlier
+  build keep their old persistence until you connect again with **Remember**
+  (finding 51); whether the app should rewrite them automatically is your
+  call.
 
 **Explicit approvals requested.**
 
-* Approval to merge the follow-up pull request (commit 11) after its Windows
-  build is green. Pull request #5 (commits 1–10) is already merged.
+* Approval to merge the follow-up pull request #6 (commits 11–13) after its
+  Windows build is green. Pull request #5 (commits 1–10) is already merged.
 * Whether to take the follow-ups above in a further branch.
 * Whether this should become a tagged release (the app version is still
   1.4.0; a tag publishes an installer to GitHub Releases, which the app offers

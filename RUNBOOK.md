@@ -17,7 +17,7 @@ trading stays off until it is enabled deliberately with the phrase
 | Order state machine | Each order is a journaled intent: `pending → acked → filled → accounted`, or `rejected`, or `uncertain`. Illegal transitions are refused. | `storage.py`, `orders.py` |
 | Idempotency | Every order carries a client order id derived from its intent id. After an ambiguous submit the engine looks the order up by that id and never resends. | `orders.py`, `trader._submit` |
 | Fail closed | Stale quotes, an unreadable kill-switch record, missing marks on a held asset, or an unknown order outcome all block new orders. An uncertain live outcome halts live trading until reconciled. | `risk.py`, `trader.py`, `recovery.py` |
-| Decision records | Every scan writes one replayable record per symbol with all checks, the data timestamps and the reason for abstaining. | `decision.py`, `GET /api/decisions`, `logs/events.jsonl` |
+| Decision records | Every scan makes one replayable record per symbol with all checks, the data timestamps and the reason for abstaining (`GET /api/decisions`). The event log gets every entry and every change of a symbol's outcome, and a `decision.withheld` line for each entry that did not become an order. | `decision.py`, `logs/events.jsonl` |
 
 ## 2. Start and stop
 
@@ -33,8 +33,10 @@ order's final state; the UI shows *Stopping* until the worker finishes. The
 websocket feed stops with the bot.
 
 **Shut down the app.** One Ctrl+C in the console (or the in-app update's
-exit) runs the same stop, prints `Stopping CryptoPilot: waiting up to 30 s…`
-and waits up to thirty seconds for an in-flight order to reach the ledger. If
+exit) stops the engine at once (no new scan or order starts) and prints
+`Stop requested: …`. Open dashboard requests then get up to thirty seconds to
+finish, and the app prints `Stopping CryptoPilot: waiting up to 30 s…` and
+waits up to thirty seconds more for an in-flight order to reach the ledger. If
 that wait expires, an `error` activity line says so: inspect the order journal
 (section 6) before the next start. A **second Ctrl+C, or closing the console
 window, is a hard kill**: nothing more is written, and the next start relies
@@ -66,7 +68,7 @@ Change them while the bot is stopped.
 | `max_position_pct`, `max_exposure_pct`, `max_positions` | 8 %, 40 %, 5 | Position, exposure and count caps. |
 | `risk_pct`, `max_portfolio_risk_pct` | 0.65 %, 3 % | Per-trade loss budget and total open stop risk. |
 | `daily_loss_limit_pct` | 3 % | Equity-based daily guard; latches until the next UTC day. |
-| `daily_realized_loss_limit_pct` | 3 % | Sum of today's realised losses; latches durably until `RESUME TRADING` (`clear_realized_stop`) or a paper reset. A looser setting or a later profit does not lift it. |
+| `daily_realized_loss_limit_pct` | 3 % | Sum of today's realised losses (fees included, also when billed in another asset). Checked at every valuation, so it latches as soon as an exit books the loss; it holds until `RESUME TRADING` (`clear_realized_stop`) or a paper reset. A looser setting or a later profit does not lift it. After a clear, a further loss the same UTC day latches it again. |
 | `max_drawdown_pct` | 10 % | Equity drawdown from the tracked peak; latches until `RESUME TRADING`. |
 | `max_orders_per_minute` | 6 | Order-rate limit per exchange and mode (exits are allowed three times that). |
 | `data_max_age_seconds` | 120 | A quote older than this is stale; stale quotes block entries and fall back to REST for exits. |
@@ -93,9 +95,11 @@ POST /api/risk  {"action": "release", "confirmation": "RESUME TRADING"}
 ```
 
 **Clear a drawdown stop** the same way with `"action": "clear_drawdown_stop"`,
-and **a realised-loss stop** with `"action": "clear_realized_stop"`. Both
-latches are shown in `GET /api/state` under `risk.drawdown_stop` and
-`risk.realized_stop` and as a dashboard warning. The daily equity guard clears
+and **a realised-loss stop** with `"action": "clear_realized_stop"`, or with
+the dashboard's **Clear latched stop** button, which appears only while one
+is latched and asks for the same phrase. Both latches are shown in
+`GET /api/state` under `risk.drawdown_stop` and `risk.realized_stop` and as a
+dashboard warning. The daily equity guard clears
 itself at the next UTC day.
 
 Breakers open and close on their own; `GET /api/state` shows them under
@@ -122,6 +126,21 @@ Rules the engine applies: a stream quote is used only while the feed is
 healthy and the quote is under ten seconds old; if REST produced a newer
 quote, REST wins; turnover always comes from REST; and if any held asset
 lacks a fresh stream quote the protective check uses REST for that tick.
+
+How the feed subscribes:
+
+* **MEXC** sends top-of-book only as protobuf frames, so the feed keeps one
+  per-symbol ticker subscription and needs the `protobuf` package (installed
+  by Setup; a source-only update cannot add it). MEXC allows 30
+  subscriptions per connection: held positions come first, and
+  `feed.unsubscribed` counts symbols left on REST.
+* **Kraken** uses one combined best bid/ask subscription.
+* Only pairs in the loaded market catalogue are streamed; a pair the exchange
+  rejects anyway is listed under `feed.unlisted` and left to REST.
+* The feed reads CCXT's own quote cache on every message and at least once a
+  second, so a burst of updates cannot leave a symbol on an older quote.
+* When a connection ends, its quotes are discarded; after a reconnect only
+  new quotes are served.
 
 ## 6. Order journal and halts
 
@@ -163,14 +182,27 @@ the exchange knows an order with that client order id and what state it is in.
   `risk.blocked`, `risk.breaker`, `risk.kill_switch`, `risk.drawdown_stop`,
   `risk.drawdown_stop_cleared`, `risk.realized_stop`,
   `risk.realized_stop_cleared`, `risk.unauthorized_submit`; `feed.state`,
-  `feed.connected`; `ledger.accounted`, `ledger.failure`.
+  `feed.connected`, `feed.symbols_unlisted`; `decision.withheld`;
+  `ledger.accounted`, `ledger.failure`.
+* **Decision lines.** `decision.entry` is written for every `enter` decision
+  and whenever a symbol's action, status or reasons change; an unchanged
+  repeat is counted (`decision.entry_unchanged`) and kept only in
+  `GET /api/decisions`, so a fast scan cannot rotate the order trail out of
+  the log. `decision.withheld` names why an `enter` decision did not become an
+  order (`per_scan_cap`, `max_positions`, `held`, `same_candle`,
+  `requote_unavailable`, `requote_liquidity`, `requote_moved`, `budget`,
+  `stale_marks`, `protective_exit_pending`, `daily_loss_guard`,
+  `settings_review`, `orders_not_allowed`). `decision.exit` names its
+  `source` (`protective`, `monitor` or `scan`) and `trigger` (`stored`,
+  `trailing` or `trend`).
 * **Correlation.** Every entry decision has a `decision_id` and every exit
   decision an `exit_…` id; both are passed to the authorization, the submit
   and the journal row. One `grep` over the `intent_id` gives the
   authorization, the submit, the fill and the `ledger.accounted` (or
-  `ledger.failure`) line; the `decision_id` on those lines leads back to the
-  `decision.entry` / `decision.exit` record. The same ids appear in
-  `GET /api/decisions`, in the dashboard row and in the journal.
+  `ledger.failure` and `execution.halt`) line; the `decision_id` on those
+  lines leads back to the `decision.entry` / `decision.exit` record. Entry ids
+  also appear in `GET /api/decisions` and the dashboard row; exit ids appear
+  only in `decision.exit` events and the journal.
 * **Metrics** `GET /api/metrics`: counters (`decision.enter`, `decision.abstain`,
   `risk.blocked`, `feed.messages`, …), gauges and latency reservoirs with
   p50/p95/p99 (`decision.quote_to_decision_ms`, `execution.submit_to_ack_ms`,
@@ -191,8 +223,10 @@ Run these on the machine that will trade. None of them places an order.
    and compare with `benchmarks/results/`.
 4. **Paper soak, streaming off.** Start the bot in paper mode for at least a
    few full candles of the chosen horizon. Check `GET /api/decisions` shows a
-   record per symbol per scan with sensible reasons, and that `risk.last_block`
-   explains every withheld entry.
+   record per symbol per scan with sensible reasons, and that every `enter`
+   record either reaches the order journal or has a `decision.withheld` event
+   naming why (`risk.last_block` names the most recent check the risk gate
+   refused).
 5. **Paper soak, streaming on.** Repeat with **Streaming quotes** on and watch
    the feed counters in section 5.
 6. **Kill switch drill.** Engage during a running scan; confirm
@@ -223,8 +257,9 @@ Each hardening step is one commit on the feature branch, so a rollback is a
 
 * Stops and targets are still monitored by this process, not placed at the
   exchange. Sleep, crashes and connectivity loss interrupt protection.
-* The websocket feed has been exercised only against a scripted fake client;
-  it has not yet been run against MEXC or Kraken from this environment.
+* The websocket feed has been exercised against scripted clients and against
+  the real CCXT MEXC client fed locally built protobuf frames; it has not yet
+  been run against MEXC or Kraken themselves.
 * Nothing here has been run against a real exchange account. The read-only
   probe, the client-order-id lookups and the `fciq` fee flag follow the CCXT
   4.5 adapters as documented and tested with fakes.

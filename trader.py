@@ -86,6 +86,8 @@ class TradingEngine:
         # 'receipt') and when it arrived here, so ordering compares like with like.
         self.last_quote_basis: dict[str, str] = {}
         self.last_received_at: dict[str, float] = {}
+        # Last (action, status, reasons) written to the event log per symbol.
+        self._entry_trail: dict[tuple, tuple] = {}
         self.latest_balance = self.balance_updated_at = None
         self.last_universe_update = 0.0
         self.discovered: list[str] = []
@@ -547,9 +549,18 @@ class TradingEngine:
     STREAM_MONITOR_SECONDS = 1.0
 
     # ------------------------------------------------------------ quote feed
-    def _feed_symbols(self) -> list[str]:
-        held = [p['symbol'] for p in self._active_positions(self.mode)]
-        return list(dict.fromkeys(held + list(self.cfg['watchlist']) + list(self.discovered)))[:40]
+    def _feed_symbols(self, symbols=None) -> list[str]:
+        """Symbols to stream, held positions first, limited to pairs the loaded catalogue lists.
+
+        One unknown pair fails a whole combined subscription, so a typo or a
+        delisted watchlist entry is left to REST instead.
+        """
+        if symbols is None:
+            held = [p['symbol'] for p in self._active_positions(self.mode)]
+            symbols = held + list(self.cfg['watchlist']) + list(self.discovered)
+        catalogue = self._catalogue()
+        listed = [symbol for symbol in dict.fromkeys(symbols) if not catalogue or symbol in catalogue]
+        return listed[:40]
 
     def _start_feed(self) -> None:
         """Start the websocket quote stream when the setting asks for it.
@@ -674,7 +685,7 @@ class TradingEngine:
                         # Trail with already validated ATR; monitoring never
                         # downloads candles or weakens a persisted stop.
                         self._mark_positions(symbol, price, finite_positive(saved.iloc[-1]['atr']), False,
-                                             stored_checked_at=price)
+                                             stored_checked_at=price, source='monitor')
                 if not any(p['symbol'] == symbol for p in self._active_positions(self.mode)):
                     exited.add(symbol)
             except Exception:
@@ -780,14 +791,29 @@ class TradingEngine:
             return value
         return float(self._read_balance()['free'].get('USDT', 0))
 
-    def _price_age(self, symbol: str) -> float | None:
+    def _quote_basis_time(self, symbol: str) -> float | None:
+        """When the stored quote existed, on this PC's clock.
+
+        An exchange timestamp ahead of the moment the quote arrived (a stale
+        clock offset) is capped at the arrival time, so it cannot make the
+        quote look younger than it is.
+        """
         timestamp = self.last_price_times.get(symbol)
-        return max(0.0, time.time() - timestamp) if timestamp is not None else None
+        if timestamp is None:
+            return None
+        received = self.last_received_at.get(symbol)
+        return min(timestamp, received) if received else timestamp
+
+    def _price_age(self, symbol: str) -> float | None:
+        basis = self._quote_basis_time(symbol)
+        return max(0.0, time.time() - basis) if basis is not None else None
 
     def _fresh(self, symbol: str) -> bool:
-        age = self._price_age(symbol)
+        age, basis = self._price_age(symbol), self._quote_basis_time(symbol)
+        # A quote stored "in the future" means this PC's clock stepped back
+        # since; its age is unknown, so it cannot count as fresh.
         return bool(finite_positive(self.last_prices.get(symbol)) and age is not None
-                    and age <= self.cfg['data_max_age_seconds'])
+                    and age <= self.cfg['data_max_age_seconds'] and basis <= time.time() + 1.0)
 
     def _marks_fresh(self, positions: list[dict]) -> bool:
         with self.lock:
@@ -839,6 +865,8 @@ class TradingEngine:
                 older = False
             elif basis == previous_basis == 'exchange':
                 older = timestamp < previous - self.QUOTE_REGRESSION_SECONDS
+            elif previous_received is not None and previous_received > observed:
+                older = False      # the PC clock stepped back since: the stored time cannot be trusted
             elif previous_received is not None:
                 older = received < previous_received - self.QUOTE_REGRESSION_SECONDS
             else:
@@ -895,20 +923,22 @@ class TradingEngine:
         if loss >= self.cfg['daily_loss_limit_pct']:
             storage.set_meta(breach_key, '1')
         allowed = storage.get_meta(breach_key) != '1'
-        # The same fresh valuation feeds the durable peak/drawdown stop.
+        # The same fresh valuation feeds the durable peak/drawdown stop and
+        # latches the realised-loss stop as soon as an exit books the loss.
         self.risk.observe_equity(mode, equity)
+        self.risk.observe_realized(mode, equity)
         if not allowed:
             with self.lock:
                 self.risk_block = 'Daily loss limit reached; entries blocked until the next UTC day'
         return allowed, round(loss, 2)
 
-    def _halt_uncertain(self, description: str):
+    def _halt_uncertain(self, description: str, *, intent_id: str | None = None):
         with self.lock:
             self.live_halted = True
             self.risk_block = self.last_error = description
             self.stop_event.set()
         self.risk.record_failure('uncertain')
-        observability.event('execution.halt', level='error', description=description)
+        observability.event('execution.halt', level='error', description=description, intent_id=intent_id)
         # Persist independently of an order journal so an intent/ledger failure
         # cannot be bypassed by restarting the process.
         try:
@@ -921,15 +951,21 @@ class TradingEngine:
         except Exception:
             pass
 
-    def _ledger_failure(self, description: str, *, intent_id: str | None = None):
-        if self.mode == 'live':
-            self._halt_uncertain(description)
+    def _ledger_failure(self, description: str, *, intent_id: str | None = None, mode: str | None = None):
+        """Stop on an order or ledger outcome that needs review; a live one halts durably.
+
+        Every caller that has an order intent passes its id, so the failure
+        line correlates with the journal row and the submit/fill events.
+        """
+        mode = mode or self.mode
+        if mode == 'live':
+            self._halt_uncertain(description, intent_id=intent_id)
         else:
             with self.lock:
                 self.risk_block = self.last_error = description
                 self.stop_event.set()
             self.risk.record_failure('ledger')
-        observability.event('ledger.failure', level='error', description=description, intent_id=intent_id, mode=self.mode)
+        observability.event('ledger.failure', level='error', description=description, intent_id=intent_id, mode=mode)
 
     CONFIRM_DELAYS = (.25, .5, 1., 2., 3.)
 
@@ -1110,11 +1146,12 @@ class TradingEngine:
                     self.risk_block = f'{side} {symbol} ended without a fill: {exc}'
                 storage.audit('warning', self.risk_block)
                 self.risk.record_failure('unfilled')
-                observability.event('execution.unfilled', level='warning', symbol=symbol, side=side)
+                observability.event('execution.unfilled', level='warning', symbol=symbol, side=side, intent_id=intent)
                 return None, None
             except Exception:
                 pass
-            self._ledger_failure(f'{side} {symbol}: unfilled order could not be journaled; review required')
+            self._ledger_failure(f'{side} {symbol}: unfilled order could not be journaled; review required',
+                                 intent_id=intent)
             return None, None
         except Exception as exc:
             # A documented exchange rejection confirms no order was accepted.
@@ -1136,11 +1173,16 @@ class TradingEngine:
                     storage.update_order_intent(intent, 'uncertain', note=type(exc).__name__)
                 except Exception:
                     pass
-            self._ledger_failure(f'{side} {symbol}: {type(exc).__name__}; order or journal outcome requires review')
+            self._ledger_failure(f'{side} {symbol}: {type(exc).__name__}; order or journal outcome requires review',
+                                 intent_id=intent)
             return None, None
 
-    def _fill_details(self, order: dict, symbol: str) -> tuple[float, float, float, float, float, float]:
-        """Return filled quantity, price, gross, quote/base fees, fee value in USDT."""
+    def _fill_details(self, order: dict, symbol: str) -> tuple[float, float, float, float, float, float, float]:
+        """Return filled quantity, price, gross, quote/base fees, fee value in USDT, and its estimated part.
+
+        The last value is the estimate booked for a fee billed in a third
+        asset; it is already inside the fee value and is 0 otherwise.
+        """
         filled, gross = finite_positive(order.get('filled')), finite_positive(order.get('cost'))
         if not filled or not gross:
             raise ValueError('Confirmed order lacks finite executed quantity/cost')
@@ -1155,7 +1197,7 @@ class TradingEngine:
         if not fees:
             fees = [order['fee']] if isinstance(order.get('fee'), dict) else []
         if not fees:
-            return filled, price, gross, gross * self.cfg['fee_pct'] / 100, 0.0, gross * self.cfg['fee_pct'] / 100
+            return filled, price, gross, gross * self.cfg['fee_pct'] / 100, 0.0, gross * self.cfg['fee_pct'] / 100, 0.0
         if not isinstance(fees, list):
             raise ValueError('Unrecognized exchange fee response')
         quote_fee = base_fee = 0.0
@@ -1175,19 +1217,22 @@ class TradingEngine:
                 base_fee += amount
             else:
                 other[str(fee.get('currency'))] = other.get(str(fee.get('currency')), 0.0) + float(amount)
-        value = quote_fee + base_fee * price
+        value, estimate = quote_fee + base_fee * price, 0.0
         if other:
             # A fee billed in a third asset (MEXC's MX deduction) touches neither the
-            # quote cash nor the base quantity of this fill, so the position is booked
-            # exactly; only its reported fee value is an estimate. Dropping a confirmed
-            # fill from the ledger would leave a real holding unprotected.
-            estimate = gross * self.cfg['fee_pct'] / 100
+            # quote cash nor the base quantity of this fill, so cash and quantity are
+            # booked exactly; only the fee's value is an estimate, and it enters the
+            # cost basis and realised P/L. Dropping a confirmed fill from the ledger
+            # would leave a real holding unprotected. When part of the fee was billed
+            # in the quote or base asset, only the remainder of the configured rate
+            # is estimated, so a mixed fee is not counted twice.
+            estimate = max(0.0, gross * self.cfg['fee_pct'] / 100 - value)
             value += estimate
             charged = ', '.join(f'{amount:.8g} {currency}' for currency, amount in sorted(other.items()))
             storage.audit('warning', f'{symbol}: fee charged in another asset ({charged}); its value is booked as the '
                                      f'configured estimate {estimate:.4f} USDT. Check the exchange fee ledger.')
             observability.event('execution.fee_unvalued', level='warning', symbol=symbol, fees=other, estimate=estimate)
-        return filled, price, gross, quote_fee, base_fee, value
+        return filled, price, gross, quote_fee, base_fee, value, estimate
 
     @staticmethod
     def _is_dust(position: dict, market: dict | None, price: float) -> bool:
@@ -1275,14 +1320,15 @@ class TradingEngine:
             if order is None:
                 return False
             try:
-                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol)
                 qty = filled - base_fee
                 # A cost-bounded simulated buy spends exactly its budget; a
                 # partial simulated fill (failure injection) spends what filled.
                 cost = budget if abs(gross + quote_fee - budget) <= budget * 1e-9 else gross + quote_fee
                 order_id = self._order_id(order)
             except Exception as exc:
-                self._ledger_failure(f'PAPER BUY {symbol}: {type(exc).__name__}; simulated fill accounting requires review')
+                self._ledger_failure(f'PAPER BUY {symbol}: {type(exc).__name__}; simulated fill accounting requires review',
+                                     intent_id=intent)
                 return False
         else:
             if self.live_halted or self._durable_live_block():
@@ -1320,13 +1366,14 @@ class TradingEngine:
             if order is None:
                 return False
             try:
-                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol)
                 qty, cost = filled - base_fee, gross + quote_fee
                 if qty <= 0 or cost > budget * 1.03:
                     raise ValueError('Executed quantity/cost differs from the reserved budget')
                 order_id = self._order_id(order)
             except Exception as exc:
-                self._halt_uncertain(f'BUY {symbol}: {type(exc).__name__}; fill/fee accounting requires review')
+                self._ledger_failure(f'BUY {symbol}: {type(exc).__name__}; fill/fee accounting requires review',
+                                     intent_id=intent, mode='live')
                 return False
         try:
             with storage.connection() as db:
@@ -1345,7 +1392,7 @@ class TradingEngine:
                     if (not current or float(current['qty']) != float(existing['qty'])
                             or float(current['cost']) != float(existing['cost'])):
                         raise ValueError('Tracked remainder changed before consolidation')
-                    total_qty, total_cost = qty + float(existing['qty']), cost + float(existing['cost'])
+                    total_qty, total_cost = qty + float(existing['qty']), cost + estimated + float(existing['cost'])
                     average = (qty * fill_price + float(existing['qty']) * float(existing['entry_price'])) / total_qty
                     db.execute('''UPDATE positions SET qty=?,entry_price=?,cost=?,highest=?,stop=?,target=?,opened_at=?
                                   WHERE exchange=? AND mode=? AND symbol=?''',
@@ -1354,7 +1401,7 @@ class TradingEngine:
                 else:
                     db.execute('''INSERT INTO positions(exchange,mode,symbol,qty,entry_price,cost,highest,stop,target,opened_at)
                                   VALUES (?,?,?,?,?,?,?,?,?,?)''',
-                               (exchange, mode, symbol, qty, fill_price, cost, fill_price,
+                               (exchange, mode, symbol, qty, fill_price, cost + estimated, fill_price,
                                 fill_price * (1 - fraction), fill_price * (1 + 2.75 * fraction), now()))
                 db.execute('''INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,reason,order_id)
                               VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
@@ -1401,7 +1448,7 @@ class TradingEngine:
             if order is None:
                 return False
             try:
-                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol)
                 consumed = filled + base_fee
                 if consumed > tracked * (1 + 1e-10):
                     raise ValueError('Simulated fill would consume untracked holdings')
@@ -1452,17 +1499,19 @@ class TradingEngine:
             if order is None:
                 return False
             try:
-                filled, fill_price, gross, quote_fee, base_fee, fee = self._fill_details(order, symbol)
+                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol)
                 consumed = filled + base_fee
                 if consumed > tracked * (1 + 1e-10) or filled > amount * (1 + 1e-10):
                     raise ValueError('Fill or base fee would consume untracked holdings')
                 order_id = self._order_id(order)
             except Exception as exc:
-                self._halt_uncertain(f'SELL {symbol}: {type(exc).__name__}; fill/fee accounting requires review')
+                self._ledger_failure(f'SELL {symbol}: {type(exc).__name__}; fill/fee accounting requires review',
+                                     intent_id=intent, mode='live')
                 return False
         ratio = min(1.0, consumed / tracked)
         basis = float(position['cost']) * ratio
-        proceeds, pnl = gross - quote_fee, gross - quote_fee - basis
+        # Cash receives the exact proceeds; P/L also bears a third-asset fee estimate.
+        proceeds, pnl = gross - quote_fee, gross - quote_fee - estimated - basis
         remaining = max(0.0, tracked - consumed)
         if remaining <= tracked * 1e-12:
             remaining = 0.0
@@ -1518,7 +1567,7 @@ class TradingEngine:
                     self._sell(position, price, verdict['reason'], decision_id=exit_id)
 
     def _mark_positions(self, symbol: str, price: float, atr: float, trend_broken: bool, *,
-                        stored_checked_at: float | None = None):
+                        stored_checked_at: float | None = None, source: str = 'scan'):
         """Ratchet and persist the trailing levels, then exit on the trailing stop or a trend break.
 
         ``stored_checked_at`` is the bid :meth:`_protect_positions` already
@@ -1546,7 +1595,8 @@ class TradingEngine:
             if verdict['action'] == 'exit' and not already_tried and self._orders_allowed():
                 exit_id = observability.new_id('exit')
                 observability.event('decision.exit', decision_id=exit_id, symbol=symbol, reason=verdict['reason'],
-                                    price=price, stop=stop, target=float(position['target']), highest=highest, source='scan')
+                                    price=price, stop=stop, target=float(position['target']), highest=highest, source=source,
+                                    trigger=verdict['trigger'])
                 self._sell(position, price, verdict['reason'], decision_id=exit_id)
 
     def scan_once(self, allow_orders: bool = False, exited_symbols=None):
@@ -1592,7 +1642,7 @@ class TradingEngine:
                 storage.audit('warning', f'Market catalogue refresh unavailable: {type(exc).__name__}.')
             current = self.feed
             if current is not None:
-                current.set_symbols(symbols)
+                current.set_symbols(self._feed_symbols(symbols))
             try:
                 tickers = self.data.tickers(symbols)
             except Exception:
@@ -1666,18 +1716,30 @@ class TradingEngine:
                         symbol=symbol, last=last, regime_ok=regime_ok, market_ok=market_ok, rapid=horizon == 'rapid',
                         filters=filters, price=price, volume=volume, spread_pct=spread, quote_age_s=self._price_age(symbol),
                         quote_ts=quote_ts, cfg=self.cfg, now=decided_at, held=held_now,
-                        exited_this_candle=symbol in exited_symbols, higher_candle_ts=higher_candle_ts,
+                        exited_this_candle=(symbol in exited_symbols
+                                            or self._same_candle_blocked(symbol, primary_tf, int(last['timestamp']))),
+                        higher_candle_ts=higher_candle_ts,
                         higher_error=higher_error, signal_fn=entry_signal, price_ok_fn=entry_price_ok,
                         quality_fn=setup_quality)
                     self.decisions.add(verdict)
                     self.metrics.incr(f'decision.{verdict.action}')
                     if quote_ts is not None:
                         self.metrics.observe('decision.quote_to_decision_ms', max(0.0, (decided_at - quote_ts) * 1000))
-                    observability.event('decision.entry', decision_id=verdict.decision_id, symbol=symbol,
-                                        action=verdict.action, status=verdict.status, score=verdict.score,
-                                        confidence=verdict.confidence, reasons=list(verdict.reasons),
-                                        signal_candle_ts_ms=verdict.inputs['signal_candle_ts_ms'],
-                                        quote_age_s=verdict.inputs['quote_age_s'], record=verdict.as_dict())
+                    # Every entry and every change of a symbol's action, status or
+                    # reasons is written in full; an unchanged repeat is only
+                    # counted (the in-memory decision log keeps every record), so a
+                    # fast scan cannot rotate the order trail out of the event log.
+                    trail_key = (self.exchange_name, self.mode, symbol)
+                    summary = (verdict.action, verdict.status, verdict.reasons)
+                    if verdict.action == 'enter' or self._entry_trail.get(trail_key) != summary:
+                        self._entry_trail[trail_key] = summary
+                        observability.event('decision.entry', decision_id=verdict.decision_id, symbol=symbol,
+                                            action=verdict.action, status=verdict.status, score=verdict.score,
+                                            confidence=verdict.confidence, reasons=list(verdict.reasons),
+                                            signal_candle_ts_ms=verdict.inputs['signal_candle_ts_ms'],
+                                            quote_age_s=verdict.inputs['quote_age_s'], record=verdict.as_dict())
+                    else:
+                        self.metrics.incr('decision.entry_unchanged')
                     reason, score, candidate = verdict.status, verdict.score, verdict.action == 'enter'
                     signal_close = float(last['close'])
                     if candidate:
@@ -1907,8 +1969,6 @@ class TradingEngine:
                                 status=completed['result'].get('status') if isinstance(completed.get('result'), dict) else None)
             return dict(completed['result'])
         except Exception as exc:
-            observability.event('manual_order.failed', level='warning', request_id=request_id, symbol=symbol, side=side,
-                                mode=self.mode, error=type(exc).__name__)
             try:
                 with storage.connection() as db:
                     saved = db.execute('SELECT value FROM meta WHERE key=?', (scope,)).fetchone()
@@ -1916,25 +1976,40 @@ class TradingEngine:
                     # Post-commit reporting/logging errors cannot turn a known
                     # fill into a failed request or permit another submission.
                     if completed.get('status') == 'filled' and completed.get('fingerprint') == fingerprint:
+                        observability.event('manual_order.completed', request_id=request_id, symbol=symbol, side=side,
+                                            mode=self.mode, status='filled',
+                                            note=f'filled and booked; a later step raised {type(exc).__name__}')
                         return dict(completed['result'])
                     record['status'] = 'failed'
                     db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (scope, json.dumps(record)))
             except Exception:
                 pass
+            observability.event('manual_order.failed', level='warning', request_id=request_id, symbol=symbol, side=side,
+                                mode=self.mode, error=type(exc).__name__)
             raise
         finally:
             with self.lock:
                 self._manual_order_active = self.control_busy = False
                 self.scan_lock.release()
 
+    def _withhold(self, candidates, reason: str) -> None:
+        """Record why 'enter' decisions did not become orders (one event per candidate)."""
+        for candidate in candidates:
+            decision_id = candidate[7] if len(candidate) > 7 else None
+            self.metrics.incr(f'decision.withheld.{reason}')
+            observability.event('decision.withheld', decision_id=decision_id, symbol=candidate[2], reason=reason)
+
     def _enter_candidates(self, candidates):
+        candidates = list(candidates)
         if self.mode == 'live' and storage.settings_health()['review_required']:
             self.risk_block = 'Recovered settings require an explicit review and save; new live entries blocked'
+            self._withhold(candidates, 'settings_review')
             return
         positions = self._active_positions(self.mode)
         if not self._marks_fresh(positions):
             with self.lock:
                 self.risk_block = 'A held asset has a stale or missing price; new entries blocked'
+            self._withhold(candidates, 'stale_marks')
             return
         with self.lock:
             catalogue = self._catalogue()
@@ -1943,46 +2018,52 @@ class TradingEngine:
                                      or self.last_prices[p['symbol']] >= p['target'] for p in tradable)
             if protective_pending:
                 self.risk_block = 'A held position is awaiting a protective exit; new entries blocked'
-                return
+        if protective_pending:
+            self._withhold(candidates, 'protective_exit_pending')
+            return
         cash = self._cash(self.mode)
         equity = self._equity(self.mode, cash, positions)
         permitted, loss_today = self._daily_allowed(self.mode, equity)
         if not permitted:
             storage.audit('warning', f'Daily loss guard latched: {loss_today:.2f}%; protective exits remain active.')
+            self._withhold(candidates, 'daily_loss_guard')
             return
         with self.lock:
             self.risk_block = None
         count = 0
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
             _score, _volume, symbol, observed_price, atr, candle = candidate[:6]
             signal_close = candidate[6] if len(candidate) > 6 else observed_price
             decision_id = candidate[7] if len(candidate) > 7 else None
             if count >= 2 or not self._orders_allowed():
+                self._withhold(candidates[index:], 'per_scan_cap' if count >= 2 else 'orders_not_allowed')
                 break
             positions = self._active_positions(self.mode)
             tradable = [p for p in positions if not self._is_dust(p, catalogue.get(p['symbol']), self.last_prices[p['symbol']])]
             if len(tradable) >= self.cfg['max_positions'] or any(p['symbol'] == symbol for p in positions):
+                self._withhold([candidate], 'max_positions' if len(tradable) >= self.cfg['max_positions'] else 'held')
                 continue
             if not self._marks_fresh(positions):
                 # Held assets value the equity every candidate is sized from.
                 with self.lock:
                     self.risk_block = 'A held asset has a stale or missing price; new entries blocked'
+                self._withhold(candidates[index:], 'stale_marks')
                 break
-            key = self._key(f'last_entry.{self.mode}.{symbol}')
-            if storage.get_meta(key) == str(candle):
-                continue
-            primary_tf = HORIZONS[self.cfg['time_horizon']][0]
-            if self._exited_since(symbol, primary_tf, candle):
+            if self._same_candle_blocked(symbol, HORIZONS[self.cfg['time_horizon']][0], candle):
+                self._withhold([candidate], 'same_candle')
                 continue
             # Re-read a candidate immediately before reserving funds. A scan of
             # many coins can otherwise place an entry using an old quote.
             try:
                 price, volume, spread = self._observe_ticker(symbol, self.data.ticker(symbol), for_buy=True)
             except ValueError:
+                self._withhold([candidate], 'requote_unavailable')
                 continue  # One unquotable candidate must not end the pass.
-            if (volume < self.cfg['min_quote_volume'] or spread is None
-                    or spread > self.cfg['max_spread_pct']
-                    or not entry_price_ok(price, signal_close, atr, observed_price=observed_price)):
+            if volume < self.cfg['min_quote_volume'] or spread is None or spread > self.cfg['max_spread_pct']:
+                self._withhold([candidate], 'requote_liquidity')
+                continue
+            if not entry_price_ok(price, signal_close, atr, observed_price=observed_price):
+                self._withhold([candidate], 'requote_moved')
                 continue
             cash = self._cash(self.mode)
             equity = self._equity(self.mode, cash, positions)
@@ -1992,6 +2073,7 @@ class TradingEngine:
                 if available_risk < 12 * loss_fraction:
                     with self.lock:
                         self.risk_block = 'Aggregate protective-stop risk cap reached'
+                self._withhold([candidate], 'budget')
                 continue
             try:
                 filled = self._buy(symbol, budget, price, fraction, entry_candle=candle, kind='entry',
@@ -2013,6 +2095,11 @@ class TradingEngine:
                 count += 1
             if self.mode == 'live' and self.live_halted:
                 break
+
+    def _same_candle_blocked(self, symbol: str, primary_tf: str, candle) -> bool:
+        """The durable no-reentry rule _enter_candidates applies: entered or exited on this candle."""
+        return (storage.get_meta(self._key(f'last_entry.{self.mode}.{symbol}')) == str(candle)
+                or self._exited_since(symbol, primary_tf, candle))
 
     def _exited_since(self, symbol: str, primary_tf: str, candle) -> bool:
         """True when a software exit happened on or after the signal candle."""

@@ -37,6 +37,10 @@ ENTRY_KINDS = ('entry', 'manual_entry')
 EXIT_KINDS = ('exit', 'manual_exit')
 
 
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='milliseconds')
 
@@ -179,12 +183,56 @@ class RiskGate:
         self.metrics.incr('risk.realized_stop_latched')
 
     def clear_realized_stop(self, mode: str, confirmation: str) -> None:
+        """Lift the latch. For the rest of this UTC day it latches again only on a further loss.
+
+        The day's realised total at the moment of clearing is recorded, so the
+        next entry does not re-latch on the loss the operator just reviewed.
+        """
         if confirmation != RELEASE_PHRASE:
             raise storage.ConfigValidationError(f'Type {RELEASE_PHRASE} to clear the realised-loss stop.')
+        realized = self._realized_today(mode)
+        cleared = json.dumps({'date': _today(), 'realized': round(realized, 8)})
         with storage.connection() as db:
             db.execute('DELETE FROM meta WHERE key=?', (self._key('realized_stop', mode),))
-        storage.audit('warning', f'{mode.upper()} daily realised-loss stop cleared after explicit confirmation.')
-        observability.event('risk.realized_stop_cleared', level='warning', mode=mode)
+            db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',
+                       (self._key('realized_stop_cleared', mode), cleared))
+        storage.audit('warning', f'{mode.upper()} daily realised-loss stop cleared after explicit confirmation at '
+                                 f'{realized:.2f} USDT realised today; a further loss today latches it again.')
+        observability.event('risk.realized_stop_cleared', level='warning', mode=mode, realized=realized)
+
+    def _cleared_floor(self, mode: str) -> float | None:
+        """Today's realised total when the operator last cleared the latch, or None."""
+        try:
+            record = json.loads(storage.get_meta(self._key('realized_stop_cleared', mode)) or 'null')
+        except ValueError:
+            return None
+        if not isinstance(record, dict) or record.get('date') != _today():
+            return None
+        return _finite(record.get('realized'))
+
+    def observe_realized(self, mode: str, equity: float) -> str | None:
+        """Latch the realised-loss stop as soon as today's realised loss crosses the limit.
+
+        Called with every fresh valuation (each monitor poll and scan) as well
+        as from :meth:`authorize`, so a loss booked by an exit latches at once
+        instead of waiting for the next entry attempt, after which a profit or
+        the UTC rollover could have hidden it. Returns the latch time.
+        """
+        value = _finite(equity)
+        latched = self.realized_stop(mode)
+        if latched or value is None or value <= 0:
+            return latched
+        realized = self._realized_today(mode)
+        limit = value * float(self.engine.cfg.get('daily_realized_loss_limit_pct',
+                                                  storage.DEFAULTS['daily_realized_loss_limit_pct'])) / 100
+        floor = self._cleared_floor(mode)
+        crossed = realized <= -limit and (floor is None or realized < floor - 0.005)
+        if crossed:
+            # A durable latch: a later profit, a new UTC day or a settings
+            # save does not lift it; only the release phrase does.
+            self._latch_realized_stop(mode, realized, limit)
+            return self.realized_stop(mode)
+        return None
 
     def observe_equity(self, mode: str, equity: float) -> dict:
         """Track the durable equity peak and latch the drawdown stop.
@@ -337,12 +385,7 @@ class RiskGate:
             check('daily_equity_loss', daily_allowed, 'Daily loss limit reached; entries blocked until the next UTC day',
                   loss_pct=loss_today)
             realized = self._realized_today(mode)
-            realized_limit = eq * cfg['daily_realized_loss_limit_pct'] / 100
-            if eq > 0 and realized <= -realized_limit and not self.realized_stop(mode):
-                # A durable latch: a later profit, a new UTC day or a settings
-                # save does not lift it; only the release phrase does.
-                self._latch_realized_stop(mode, realized, realized_limit)
-            latched_at = self.realized_stop(mode)
+            latched_at = self.observe_realized(mode, eq)
             check('daily_realized_loss', not latched_at,
                   f'Realised-loss stop latched at {latched_at}; entries blocked until cleared with {RELEASE_PHRASE}'
                   if latched_at else '', realized=round(realized, 2))

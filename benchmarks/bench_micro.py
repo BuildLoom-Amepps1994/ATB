@@ -187,7 +187,7 @@ class SlowExchange(fx.FixtureExchange):
         return self.markets
 
 
-def build_engine(symbols: list[str], rtt: float, *, mechanics: str | None = None):
+def build_engine(symbols: list[str], rtt: float, *, mechanics: str | None = None, settings: dict | None = None):
     data = Path(tempfile.mkdtemp(prefix='cryptopilot-bench-micro-'))
     storage.DATA_DIR, storage.DB_PATH, storage.CONFIG_PATH = data, data / 'portfolio.sqlite3', data / 'settings.json'
     credentials.load = lambda _: None
@@ -206,7 +206,7 @@ def build_engine(symbols: list[str], rtt: float, *, mechanics: str | None = None
     cfg = dict(storage.settings())
     cfg.pop('paper_start_usdt', None)
     cfg.update(time_horizon='micro', watchlist=symbols, auto_discovery=False, streaming_quotes=False,
-               max_orders_per_minute=60)
+               max_orders_per_minute=60, **(settings or {}))
     engine.update_config(cfg)
     engine.data.clock, engine.data.monotonic = clock.time, clock.monotonic
     engine.running = True
@@ -218,7 +218,9 @@ def tick_rows(pairs: int, rtt: float, repeat: int, *, holding: bool) -> dict:
     symbols = [f'C{i:02d}/USDT' for i in range(pairs)]
     if holding:
         symbols[0] = 'ETH/USDT'
-    engine, exchange, clock = build_engine(symbols, rtt, mechanics='ETH/USDT' if holding else None)
+    # A 240-minute maximum hold keeps the holding rows' position open through every timed tick.
+    engine, exchange, clock = build_engine(symbols, rtt, mechanics='ETH/USDT' if holding else None,
+                                           settings={'micro_max_hold_minutes': 240})
     if holding:
         for _ in range(400):
             clock.advance(15)
@@ -298,6 +300,8 @@ def main() -> int:
     parser.add_argument('--repeat', type=int, default=100)
     parser.add_argument('--tick-repeat', type=int, default=30)
     parser.add_argument('--warmup', type=int, default=WARMUP)
+    parser.add_argument('--no-cycles', action='store_true',
+                        help='skip the rows that need an open or completed cycle (for a tree that cannot open one)')
     args = parser.parse_args()
     WARMUP = max(0, args.warmup)
     revision = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT, capture_output=True, text=True,
@@ -305,9 +309,10 @@ def main() -> int:
     results = {'revision': revision, 'python': platform.python_version(), 'platform': platform.platform(),
                'repeat': args.repeat, 'tick_repeat': args.tick_repeat, 'warmup': WARMUP,
                'cpu': cpu_rows(args.repeat)}
+    holdings = (False,) if args.no_cycles else (False, True)
     results['tick'] = [tick_rows(pairs, rtt, args.tick_repeat, holding=holding)
-                       for rtt in (0.0, 0.15) for pairs in (1, 4, 8) for holding in (False, True)]
-    results['cycle'] = cycle_rows(240)
+                       for rtt in (0.0, 0.15) for pairs in (1, 4, 8) for holding in holdings]
+    results['cycle'] = 'skipped (--no-cycles)' if args.no_cycles else cycle_rows(240)
     text = json.dumps(results, indent=2, default=str)
     print(text)
     if args.json:

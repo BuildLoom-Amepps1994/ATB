@@ -346,7 +346,10 @@ after each change; they are not added to the totals above.
   these documents and are corrected here: two wall-clock runs were left out
   (now under *Wall-clock smoke*, *Two runs not counted above*), and the
   performance document's heading called `483d204` "before the reviews",
-  though it already has the module-review fixes. The rest were corrected in
+  though it already has the module-review fixes. One, the report's
+  statement that the source archive is attached to the thread, needed no
+  change in wording: it holds once the message that publishes the report
+  attaches the archive, its manifest and `SHA256SUMS`. The rest were corrected in
   the report and the description: an incomplete list of open gates; "Windows-only"
   for the no-caller failure, whose cause, a virtual environment inside the
   checkout, would fail on any system; "no test was skipped" (no pre-existing
@@ -358,6 +361,22 @@ after each change; they are not added to the totals above.
   two engine-wide changes legacy paths also get (a 300 s retry after a failed
   catalogue refresh, and a submit-time check that the mode has not changed);
   and the top-of-book size limit on safety exits without a depth book.
+* **Check of those corrections** (two checkers on the changed text, each
+  finding then checked by a separate verifier): 6 confirmed, 1 rejected. One
+  showed that the legacy-path and safety-exit wording corrected in the
+  description also stood in `CHANGELOG.md` (*Unchanged*: legacy strategies
+  and live mode "as before") and `README.md` (safety exits that need no
+  buy-side depth); both are corrected there. Three concerned the archive
+  statement: it is not true until the files are attached, the description
+  called all 18 findings corrected, and the entry above, as first committed
+  in `014a647`, left it out of its list (now stated there). The other two were in
+  the report: it said every review's findings were checked by a separate
+  verifier, but the module reviews had none (the agent fixing each module's
+  findings first checked them, reproducing 29 and confirming 3 missing
+  tests, and fixed all 32), and it said no
+  research cycle reaches the target, which holds for ETH (the strategy and
+  the always-enter baseline) but not for the always-enter baseline on ADA
+  and BTC, which closed some cycles by take profit.
 
 ## Brief test matrix (items 1 to 30)
 

@@ -116,7 +116,12 @@ Changed
 Unchanged
 
 * Every non-micro order path keeps the local 12 USDT floor, its sizing and
-  its exits. Legacy strategies, live mode and its confirmations are as before.
+  its exits, and live mode keeps its confirmations; LIVE is newly refused
+  only for the Micro profile. Two engine-wide changes also reach the legacy
+  strategies in both modes: the 300 s retry after a failed catalogue refresh
+  (above), and a submit-time refusal of an order whose trading mode changed
+  after it was authorized, which no existing path can trigger because the
+  mode changes only while the engine is idle.
 
 Known limits: see `docs/ATB_MICRO_RELEASE_GATES.md` (no real-market
 evaluation, no wall-clock soak on Windows, no funded or account-fee evidence).

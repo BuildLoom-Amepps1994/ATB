@@ -107,17 +107,40 @@ def test_name_and_address_lookups_are_refused_but_localhost_resolves():
     assert socket.gethostbyname('localhost').startswith('127.')
 
 
-@pytest.mark.parametrize('name', ['ip6-localhost', 'localhost.localdomain', 'localhost.'])
+@pytest.mark.parametrize('name', ['ip6-localhost', 'localhost.localdomain', 'localhost.', '[localhost]',
+                                  'localhost%lo'])
 def test_a_local_looking_name_the_guard_does_not_answer_is_refused(name):
     # Most hosts files lack these, so the resolver would ask a DNS server for them.
     with pytest.raises(offline_net.RemoteNetworkRefused):
         socket.getaddrinfo(name, 443)
+    with pytest.raises(offline_net.RemoteNetworkRefused):
+        socket.gethostbyaddr(name)
+
+
+def test_binding_to_a_remote_name_is_refused_and_localhost_binds_to_loopback():
+    with socket.socket() as sock:
+        with pytest.raises(offline_net.RemoteNetworkRefused):
+            sock.bind(('api.mexc.com', 0))                      # bind resolves a name, so DNS would be asked
+        with pytest.raises(offline_net.RemoteNetworkRefused):
+            sock.bind(('203.0.113.10', 0))
+        sock.bind(('localhost', 0))
+        assert sock.getsockname()[0] == '127.0.0.1'
+
+
+def test_a_reverse_lookup_answers_only_a_plain_local_literal():
+    assert socket.gethostbyaddr(b'127.0.0.1') == ('localhost', [], ['127.0.0.1'])
+    assert socket.gethostbyaddr('0:0:0:0:0:0:0:1') == ('localhost', [], ['::1'])
+    for spelling in ('[::1]', '::1%lo', '[127.0.0.1]'):
+        with pytest.raises(socket.gaierror):
+            socket.gethostbyaddr(spelling)                     # the real function has no answer for these either
+        with pytest.raises(socket.gaierror):
+            socket.gethostbyname(spelling)
 
 
 def test_local_lookups_are_answered_without_the_resolver():
     """In a fresh process whose resolver only records what it is asked, every local lookup is numeric or none."""
     code = r'''
-import importlib.util, json, socket, sys
+import importlib.util, ipaddress, json, socket, sys
 real_getaddrinfo, real_getnameinfo, asked = socket.getaddrinfo, socket.getnameinfo, []
 
 def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -128,6 +151,19 @@ def getnameinfo(sockaddr, flags):
     asked.append(['getnameinfo', sockaddr[0], bool(flags & socket.NI_NUMERICHOST)])
     return real_getnameinfo(sockaddr, flags | socket.NI_NUMERICHOST)
 
+def literal(host):
+    try:
+        return bool(ipaddress.ip_address(host))
+    except ValueError:
+        return False
+
+def method(name):                         # a socket method resolves a host name in C, so it must get a literal
+    real = getattr(socket.socket, name)
+    def call(self, *args):
+        asked.append([name, args[-1][0], literal(args[-1][0])])
+        return real(self, *args)
+    setattr(socket.socket, name, call)
+
 def resolver(function):
     def lookup(host):
         asked.append([function, host, False])
@@ -135,6 +171,8 @@ def resolver(function):
     return lookup
 
 socket.getaddrinfo, socket.getnameinfo = getaddrinfo, getnameinfo
+for name in ('bind', 'connect', 'connect_ex', 'sendto'):
+    method(name)
 socket.gethostbyname, socket.gethostbyname_ex, socket.gethostbyaddr = (
     resolver(f) for f in ('gethostbyname', 'gethostbyname_ex', 'gethostbyaddr'))
 spec = importlib.util.spec_from_file_location('offline_net', sys.argv[1])
@@ -142,7 +180,18 @@ guard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guard)
 guard.install()
 serv = socket.NI_NUMERICSERV
+with socket.socket() as server:
+    server.bind(('localhost', 0))
+    server.listen()
+    bound, port = server.getsockname()
+    with socket.socket() as client:
+        client.connect(('LOCALHOST', port))
+    with socket.socket() as client:
+        connected = client.connect_ex(('localhost', port))
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
+    datagram.sendto(b'local', ('localhost', 9))
 print(json.dumps({'answers': {
+    'bound': bound, 'connect_ex': connected,
     'ipv6': socket.getaddrinfo('localhost', 443, socket.AF_INET6, socket.SOCK_STREAM)[0][4][0],
     'ipv4': socket.getaddrinfo('LOCALHOST', 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0],
     'canonical': socket.getaddrinfo('localhost', 443, 0, socket.SOCK_STREAM, 0, socket.AI_CANONNAME)[0][3],
@@ -158,6 +207,7 @@ print(json.dumps({'answers': {
     assert done.returncode == 0, done.stderr
     report = json.loads(done.stdout)
     assert report['answers'] == {
+        'bound': '127.0.0.1', 'connect_ex': 0,
         'ipv6': '::1', 'ipv4': '127.0.0.1', 'canonical': 'localhost',
         'name': '127.0.0.1', 'name_ex': ['localhost', [], ['127.0.0.1']],
         'reverse': [['localhost', [], ['127.0.0.2']], ['localhost', [], ['::1']],
@@ -166,6 +216,7 @@ print(json.dumps({'answers': {
         'name_required': ['localhost', '443'],
     }
     assert report['asked'] and all(numeric for _, _, numeric in report['asked']), report['asked']
+    assert {'bind', 'connect', 'connect_ex', 'sendto'} <= {function for function, _, _ in report['asked']}
 
 
 @pytest.mark.parametrize('module', ['uvloop', 'winloop'])
@@ -187,6 +238,12 @@ def test_uvicorns_default_loop_is_asyncio_under_the_guard():
 def test_active_says_whether_the_replacements_are_still_in_place(monkeypatch):
     assert offline_net.active()
     monkeypatch.setattr(socket, 'getnameinfo', lambda sockaddr, flags: ('remote', '443'))
+    assert not offline_net.active()
+
+
+def test_active_says_whether_the_libuv_loops_are_still_blocked(monkeypatch):
+    assert offline_net.active()
+    monkeypatch.delitem(sys.modules, 'uvloop')                 # uvloop could be imported again
     assert not offline_net.active()
 
 

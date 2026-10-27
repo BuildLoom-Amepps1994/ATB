@@ -1,18 +1,21 @@
 """Refuse remote networking in this process: used by the offline tests and the fixture soak.
 
 ``install()`` replaces the socket entry points that can reach another host
-(connect, connect_ex, sendto, sendmsg, the name and address lookups including
-``getnameinfo``'s reverse lookup, and on
+(connect, connect_ex, sendto, sendmsg, bind, which resolves a host name, the
+name and address lookups including ``getnameinfo``'s reverse lookup, and on
 Windows the proactor connect and sendto that asyncio uses in place of
 ``socket.connect``) with versions that allow only loopback addresses and local
 sockets. Anything else raises ``RemoteNetworkRefused`` before a packet leaves.
 
 A lookup that stays local is answered here, not by the resolver: ``localhost``
-is 127.0.0.1 (``::1`` when IPv6 is asked for), and a loopback or unspecified
-address is named ``localhost``. The resolver reads the hosts file first and
-asks a DNS server only for what that file lacks, which on many machines
-includes ``localhost`` over IPv6 and every loopback address but 127.0.0.1.
-Other names (``localhost.localdomain``, ``ip6-localhost``) are refused.
+is 127.0.0.1 (``::1`` when IPv6 is asked for), a loopback or unspecified
+address is named ``localhost``, a local literal is parsed numerically, and
+the socket methods are given the literal in place of the name ``localhost``,
+which they would otherwise resolve in C. The resolver reads the hosts file
+first and asks a DNS server only for what that file lacks, which on many
+machines includes ``localhost`` over IPv6 and every loopback address but
+127.0.0.1. Other names (``localhost.localdomain``, ``ip6-localhost``,
+``[localhost]``) are refused.
 
 uvloop and winloop are blocked from import, so uvicorn's default loop is
 asyncio's. Their libuv loops resolve and connect in C, where these checks do
@@ -43,19 +46,37 @@ _LOCAL_NAME = 'localhost'
 _LIBUV_LOOPS = ('uvloop', 'winloop')
 
 
+def _text(host) -> str:
+    return host.decode('ascii', 'replace') if isinstance(host, bytes) else str(host)
+
+
+def _literal(text: str):
+    """The address an IP literal names, ``[brackets]`` and a ``%zone`` allowed; None for anything else."""
+    if text.startswith('[') and text.endswith(']'):
+        text = text[1:-1]
+    try:
+        return ipaddress.ip_address(text.split('%')[0])
+    except ValueError:
+        return None
+
+
 def local_host(host) -> bool:
     if host is None:
         return True        # getaddrinfo(None, port) means a local wildcard
-    if isinstance(host, bytes):
-        host = host.decode('ascii', 'replace')
-    host = str(host).strip('[]').split('%')[0]
-    if host == '' or host.lower() == _LOCAL_NAME:
+    text = _text(host)
+    if text == '' or text.lower() == _LOCAL_NAME:
         return True
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return address.is_loopback or address.is_unspecified
+    address = _literal(text)
+    return address is not None and (address.is_loopback or address.is_unspecified)
+
+
+def _plain(text: str) -> bool:
+    """A literal written as the socket functions take it, without brackets or a zone."""
+    return not (text.startswith('[') or '%' in text)
+
+
+def _no_name(text: str) -> None:
+    raise socket.gaierror(socket.EAI_NONAME, f'Offline run gives no name for {text!r}')
 
 
 def allowed(address) -> bool:
@@ -82,15 +103,22 @@ _replaced: list = []        # (owner, attribute, replacement) for active()
 
 
 def active() -> bool:
-    """True when install() ran in this process and every function it replaced is still its replacement."""
-    return _installed and bool(_replaced) and all(getattr(owner, name, None) is new
-                                                    for owner, name, new in _replaced)
+    """True when install() ran here, every function it replaced is still its replacement and uvloop and
+    winloop are still blocked."""
+    return (_installed and bool(_replaced)
+            and all(getattr(owner, name, None) is new for owner, name, new in _replaced)
+            and all(name in sys.modules and sys.modules[name] is None for name in _LIBUV_LOOPS))
 
 
 def _is_name(host) -> bool:
-    if isinstance(host, bytes):
-        host = host.decode('ascii', 'replace')
-    return isinstance(host, str) and host.lower() == _LOCAL_NAME
+    return isinstance(host, (str, bytes)) and _text(host).lower() == _LOCAL_NAME
+
+
+def _numeric(address, family):
+    """``address`` with the name localhost replaced by the loopback literal, so the C library never resolves it."""
+    if isinstance(address, tuple) and address and _is_name(address[0]):
+        return ('::1' if family == socket.AF_INET6 else '127.0.0.1', *address[1:])
+    return address
 
 
 def install() -> None:
@@ -105,58 +133,84 @@ def install() -> None:
         sys.modules[name] = None        # import now raises ImportError; uvicorn's auto loop falls back to asyncio
     _installed = True
     real_connect, real_connect_ex = socket.socket.connect, socket.socket.connect_ex
-    real_sendto = socket.socket.sendto
+    real_sendto, real_bind = socket.socket.sendto, socket.socket.bind
     real_sendmsg = getattr(socket.socket, 'sendmsg', None)        # not on Windows
     real_getaddrinfo, real_gethostbyname = socket.getaddrinfo, socket.gethostbyname
     real_gethostbyname_ex, real_gethostbyaddr = socket.gethostbyname_ex, socket.gethostbyaddr
     real_getnameinfo = socket.getnameinfo
 
+    # The socket methods resolve a host name in C, so they get the name localhost as its literal.
     def connect(self, address):
         if not allowed(address):
             _refuse('a connection to', address)
-        return real_connect(self, address)
+        return real_connect(self, _numeric(address, self.family))
 
     def connect_ex(self, address):
         if not allowed(address):
             _refuse('a connection to', address)
-        return real_connect_ex(self, address)
+        return real_connect_ex(self, _numeric(address, self.family))
 
     def sendto(self, data, *args):
         if args and not allowed(args[-1]):        # sendto(data, address) or sendto(data, flags, address)
             _refuse('a datagram to', args[-1])
+        if args:
+            args = (*args[:-1], _numeric(args[-1], self.family))
         return real_sendto(self, data, *args)
 
     def sendmsg(self, buffers, *args):
         if len(args) >= 3 and args[2] is not None and not allowed(args[2]):
             _refuse('a message to', args[2])
+        if len(args) >= 3:
+            args = (*args[:2], _numeric(args[2], self.family), *args[3:])
         return real_sendmsg(self, buffers, *args)
+
+    def bind(self, address):
+        # Binding to a host name resolves it, so a remote name would reach a DNS server.
+        if self.family in (socket.AF_INET, socket.AF_INET6) and not allowed(address):
+            _refuse('a bind to', address)
+        return real_bind(self, _numeric(address, self.family))
 
     def getaddrinfo(host, port=None, family=0, type=0, proto=0, flags=0):
         if not local_host(host):
             _refuse('a name lookup for', host)
-        if not _is_name(host):
-            return real_getaddrinfo(host, port, family, type, proto, flags)    # an address or the wildcard
+        if host is None or _text(host) == '':                      # the wildcard or this host's own addresses
+            return real_getaddrinfo(host, port, family, type, proto, flags)
+        if not _is_name(host):                                     # a local literal: parsed, never resolved
+            return real_getaddrinfo(host, port, family, type, proto, flags | socket.AI_NUMERICHOST)
         address = '::1' if family == socket.AF_INET6 else '127.0.0.1'
         found = real_getaddrinfo(address, port, family, type, proto, flags | socket.AI_NUMERICHOST)
         named = bool(flags & socket.AI_CANONNAME)            # the canonical name goes on the first entry only
         return [(f, t, p, _LOCAL_NAME if named and i == 0 else '', a) for i, (f, t, p, _, a) in enumerate(found)]
 
+    # A plain literal is parsed, not resolved, by the real functions; any other spelling gets no answer.
     def gethostbyname(host):
         if not local_host(host):
             _refuse('a name lookup for', host)
-        return '127.0.0.1' if _is_name(host) else real_gethostbyname(host)
+        if _is_name(host):
+            return '127.0.0.1'
+        if not _plain(_text(host)):
+            _no_name(_text(host))
+        return real_gethostbyname(host)
 
     def gethostbyname_ex(host):
         if not local_host(host):
             _refuse('a name lookup for', host)
-        return (_LOCAL_NAME, [], ['127.0.0.1']) if _is_name(host) else real_gethostbyname_ex(host)
+        if _is_name(host):
+            return _LOCAL_NAME, [], ['127.0.0.1']
+        if not _plain(_text(host)):
+            _no_name(_text(host))
+        return real_gethostbyname_ex(host)
 
     def gethostbyaddr(host):
         if not local_host(host):
             _refuse('an address lookup for', host)
-        if host is None or host == '':
+        if host is None or _text(host) == '':
             return real_gethostbyaddr(host)        # refused by the socket module itself, before any lookup
-        return (_LOCAL_NAME, [], ['127.0.0.1' if _is_name(host) else str(host).strip('[]')])
+        if _is_name(host):
+            return _LOCAL_NAME, [], ['127.0.0.1']
+        if not _plain(_text(host)):
+            _no_name(_text(host))
+        return _LOCAL_NAME, [], [str(_literal(_text(host)))]
 
     def getnameinfo(sockaddr, flags):
         if flags & socket.NI_NUMERICHOST:
@@ -168,14 +222,15 @@ def install() -> None:
         return _LOCAL_NAME, service
 
     socket.socket.connect, socket.socket.connect_ex = connect, connect_ex
-    socket.socket.sendto = sendto
+    socket.socket.sendto, socket.socket.bind = sendto, bind
     if real_sendmsg is not None:
         socket.socket.sendmsg = sendmsg
     socket.getaddrinfo, socket.gethostbyname = getaddrinfo, gethostbyname
     socket.gethostbyname_ex, socket.gethostbyaddr = gethostbyname_ex, gethostbyaddr
     socket.getnameinfo = getnameinfo
     _replaced.extend([(socket.socket, 'connect', connect), (socket.socket, 'connect_ex', connect_ex),
-                      (socket.socket, 'sendto', sendto), (socket, 'getaddrinfo', getaddrinfo),
+                      (socket.socket, 'sendto', sendto), (socket.socket, 'bind', bind),
+                      (socket, 'getaddrinfo', getaddrinfo),
                       (socket, 'gethostbyname', gethostbyname), (socket, 'gethostbyname_ex', gethostbyname_ex),
                       (socket, 'gethostbyaddr', gethostbyaddr), (socket, 'getnameinfo', getnameinfo)])
     if real_sendmsg is not None:

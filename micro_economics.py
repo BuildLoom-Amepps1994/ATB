@@ -405,8 +405,8 @@ class SizingResult:
     sellable_base: Decimal | None     # owned after a base fee, rounded DOWN to amount_step
     predicted_residual_base: Decimal | None
     entry_vwap: Decimal | None
-    break_even_bid: Decimal | None    # exit bid where estimated net = 0 (basis = max_debit), up to the tick
-    target_bid: Decimal | None        # exit bid where estimated net = target_net, up to the tick
+    break_even_bid: Decimal | None    # best bid where selling into the bids nets 0 (basis = max_debit), up to the tick
+    target_bid: Decimal | None        # best bid where selling into the bids nets target_net, up to the tick
     required_move_bps: Decimal | None  # (target_bid / best_ask - 1) * 10000
     minimum_feasible_budget: Decimal | None   # separately calculated, display only, never used to size
     minimum_feasible_detail: str
@@ -723,14 +723,22 @@ def size_entry(*, rules, book, cost: CostModel, budget_cap: Decimal, cash_availa
         if gate('max_debit', 10, max_debit <= target <= cap <= cap_limit, BUDGET_INVALID,
                 f'Sizing defect: max debit {_show(max_debit)} exceeds target {_show(target)} or cap {_show(cap)}',
                 max_debit=max_debit, target_budget=target, budget_cap=cap):
-            keep = money.mul(plan.sellable, money.sub(ONE, money.bps(cost.latency_bps)), money.sub(ONE, cost.taker_fee))
+            # Net proceeds per unit of the best bid: selling everything at the best bid, or the step-9 walk of
+            # the bids (which moves with the book as a whole), whichever keeps less. On a book whose best bid
+            # absorbs the sale the two agree; a thin best bid with depth far below it makes the walk the cost.
+            fee_keep = money.sub(ONE, cost.taker_fee)
+            top_keep = money.mul(plan.sellable, money.sub(ONE, money.bps(cost.latency_bps)), fee_keep)
+            walk_keep = money.div(money.mul(plan.bid.quote, fee_keep), validated.best_bid)
+            keep = min(top_keep, walk_keep)
             break_even = _tick_up(money.div(max_debit, keep), rules.price_tick)
             target_bid = _tick_up(money.div(money.add(max_debit, target_net), keep), rules.price_tick)
             required = money.mul(money.sub(money.div(target_bid, validated.best_ask), ONE), BPS)
             record('break_even', 11, True, None, '', break_even_bid=break_even, target_bid=target_bid,
                    target_net=target_net, required_move_bps=required, best_bid=validated.best_bid,
                    best_ask=validated.best_ask, price_tick=rules.price_tick,
-                   sell_fee_currency=cost.sell_fee_currency)
+                   sell_fee_currency=cost.sell_fee_currency, exit_vwap=plan.bid.vwap,
+                   exit_now_net=money.sub(money.mul(plan.bid.quote, fee_keep), max_debit),
+                   priced_by='bid walk' if walk_keep < top_keep else 'best bid')
             values = dict(gross_quote=plan.gross, fee_reserve=plan.fee_reserve, max_debit=max_debit,
                           expected_base=plan.ask.base, expected_fee_base=plan.fee_base,
                           sellable_base=plan.sellable, predicted_residual_base=plan.residual,

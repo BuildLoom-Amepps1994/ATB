@@ -178,8 +178,8 @@ class SizingResult:
     sellable_base: Decimal | None # owned after a base fee, rounded DOWN to amount_step
     predicted_residual_base: Decimal | None
     entry_vwap: Decimal | None
-    break_even_bid: Decimal | None   # exit bid where estimated net = 0 (basis = max_debit)
-    target_bid: Decimal | None       # exit bid where estimated net = target_net
+    break_even_bid: Decimal | None   # best bid where selling into the bids nets 0 (basis = max_debit)
+    target_bid: Decimal | None       # best bid where selling into the bids nets target_net
     required_move_bps: Decimal | None  # (target_bid / best_ask - 1) * 10000
     minimum_feasible_budget: Decimal | None   # separately calculated, display only, never used to size
     minimum_feasible_detail: str
@@ -219,9 +219,13 @@ Sizing algorithm (each step is a named check):
    `EXIT_BELOW_VENUE_MINIMUM` (or the depth code): a buy that predictably
    creates unsellable dust is ineligible.
 10. `max_debit = gross + fee_reserve`. Invariant: `max_debit <= target_budget <= budget_cap`.
-11. Break-even and target bids from the sell leg at the top of the bid book:
-    `net(X) = sellable * X * (1 - latency) * (1 - sell_fee) - max_debit`
-    (sell fee in quote; a base-billed sell fee reduces the quantity instead).
+11. Break-even and target bids from the sell leg, with `X` the best bid:
+    `net(X) = keep * X - max_debit`, where `keep` is the smaller of
+    `sellable * (1 - latency) * (1 - sell_fee)` (everything sold at the best
+    bid) and `walk_quote * (1 - sell_fee) / best_bid` (the step-9 bid walk,
+    with the whole book moved by `X / best_bid`), so a small best bid with the
+    depth far below it is priced as the exit estimate will price it (sell fee
+    in quote; a base-billed sell fee reduces the quantity instead).
 12. `minimum_feasible_budget`: the smallest budget (to 0.01 USDT) for which
     steps 3-9 pass on this book, found by search over the sizing function
     itself with an upper search bound of `max(100, 20 * market_min_cost)`.
@@ -417,7 +421,7 @@ def stop_net_bps(features: Features, params: MicroParams, entry_cost_bps: float 
     # Revised after review: the original clamp(2 ATR, 25, max_loss) ignored the round-trip cost
     # the position carries from the moment it is bought, so a stop inside that cost fired on the
     # first exit check with the book unchanged. entry_cost_bps = max_debit * (1 - best_bid /
-    # break_even_bid) as bps of the budget cap (entry_cost_bps()).
+    # break_even_bid) as bps of the budget cap (entry_cost_bps()), from the walk-priced bid of step 11.
 
 @dataclass(frozen=True)
 class MicroDecision:
@@ -461,7 +465,8 @@ Economic gate (a heuristic feasibility test, never called an expected value):
 `expected_range_bps = atr_bps * sqrt(max_hold_s / 60)`; require
 `required_move_bps <= edge_ratio * expected_range_bps` (else `NO_ECONOMIC_EDGE`)
 and `spread_bps <= 0.35 * required_move_bps` (else `FEES`), and
-`max(2 ATR, 25) <= max_loss_bps` (else `VOLATILITY`) and
+`max(2 ATR, 25) <= max_loss_bps` (else `VOLATILITY`, or `NO_ECONOMIC_EDGE` when
+2 ATR fits and only the 25 bps floor exceeds the cap) and
 `stop_net_bps(features, params, entry_cost_bps)` not None (else `NO_ECONOMIC_EDGE`). The opportunity key is
 `f'{symbol}|{candidate}|{bar_ts_ms}'`.
 
@@ -478,16 +483,20 @@ class ExitDecision:
 
 def evaluate_exit(*, estimate: dict | None, depth_model: str, target_net: Decimal, stop_net: Decimal,
                   peak_est_net: Decimal | None, opened_wall: float, max_hold_s: float,
-                  regime: str | None, now: float) -> ExitDecision
+                  regime: str | None, now: float, realized_net: Decimal | None = None) -> ExitDecision
 ```
 
 `estimate` is `ExitEstimate.as_dict()` or None (no fresh data). Order:
-no estimate -> `cannot_evaluate`; `est_net <= -stop_net` -> `stop_loss`;
+no estimate -> `cannot_evaluate`; `est_net + min(realized_net, 0) <= -stop_net`
+-> `stop_loss` (`realized_net` is what the cycle's partial exits already
+realized: a loss counts against the stop, a gain never loosens it);
 `now - opened_wall >= max_hold_s` -> `max_hold`; regime `excessively_volatile`
 or `trending_down` with `est_net < 0` -> `regime_shift`; with
 `depth_model == 'book'` only: `est_net - uncertainty >= target_net` ->
-`take_profit`; `peak >= 0.75 * target_net` and `est_net - uncertainty <=
-0.25 * target_net` and `est_net - uncertainty > 0` -> `profit_protection`;
+`take_profit`; `peak >= 0.75 * target_net` and `peak - uncertainty > 0.25 *
+target_net` (the band is entered by falling into it, never on the way up) and
+`est_net - uncertainty <= 0.25 * target_net` and `est_net - uncertainty > 0` ->
+`profit_protection`;
 else hold. Safety exits (stop, max hold, regime) never need a profit, an entry
 signal or depth; profit exits need a depth-based estimate.
 

@@ -426,6 +426,40 @@ def test_latency_margin_is_applied_once_per_leg():
     assert exit_estimate(owned, result.max_debit, at_target, cost_=model).est_net_pnl >= D('0.05')
 
 
+# A small top bid, then levels 40 and 70 bps lower, then the real depth about 160 bps lower: the walk is not
+# exhausted, so the pair is eligible, but selling the position into these bids costs far more than the best bid says.
+THIN_TOP_BIDS = ((D('99.99'), D('0.02')), (D('99.59'), D('0.03')), (D('99.29'), D('0.05')), (D('98.39'), D('4')),
+                 (D('98.29'), D('4')))
+
+
+def test_break_even_and_target_bids_walk_the_bids_so_a_thin_top_cannot_hide_the_exit_cost():
+    thin = Book(bids=THIN_TOP_BIDS, asks=((D('100.01'), D('1000')),))
+    result = size(book_=thin)
+    assert result.eligible                                    # the bid walk absorbs the sale: not a depth refusal
+    owned = money.add(result.sellable_base, result.predicted_residual_base)
+    # What the exit estimate says the moment the position is bought, on the same book.
+    now = exit_estimate(owned, result.max_debit, thin)
+    assert now.depth_model == 'book' and now.est_net_pnl < 0
+    carried = money.mul(result.max_debit, money.sub(D('1'), money.div(thin.best_bid, result.break_even_bid)))
+    assert money.add(now.est_net_pnl, carried) >= 0, (now.est_net_pnl, carried)   # the loss carried is not understated
+
+    def shifted(best):
+        """The same book with every level moved by the same factor, so its best bid is ``best``."""
+        factor = money.div(best, thin.best_bid)
+        return Book(bids=tuple((money.mul(price, factor), quantity) for price, quantity in thin.bids),
+                    asks=((money.mul(D('100.01'), factor, D('1.01')), D('1000')),))
+    assert exit_estimate(owned, result.max_debit, shifted(result.break_even_bid)).est_net_pnl >= 0
+    assert exit_estimate(owned, result.max_debit, shifted(result.target_bid)).est_net_pnl >= D('0.05')
+    assert result.required_move_bps == money.mul(money.sub(money.div(result.target_bid, D('100.01')), D('1')),
+                                                 D('10000'))
+    # On a deep book the walk sells everything at the best bid: the figures are the single-price ones, unchanged.
+    deep = size()
+    keep = money.mul(deep.sellable_base, D('0.9997'), D('0.999'))
+    assert deep.break_even_bid == money.q_up(money.div(deep.max_debit, keep), D('0.01'))
+    assert deep.target_bid == money.q_up(money.div(money.add(deep.max_debit, D('0.05')), keep), D('0.01'))
+    assert result.sellable_base == deep.sellable_base and result.break_even_bid > deep.break_even_bid
+
+
 # ------------------------------------------------ 10. partial-close conservation
 def test_partial_closes_conserve_ownership_basis_and_cash_exactly():
     entry = me.account_entry(filled_base=D('0.24958519'), gross_quote=D('24.97'), quote_fee=D('0.02497'),

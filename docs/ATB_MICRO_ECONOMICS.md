@@ -247,7 +247,7 @@ checks that the sold and kept parts add back to the original exactly.
 
 ## Stops and the loss cap
 
-The moment a position is bought, selling it at the best bid already loses the
+The moment a position is bought, selling it into the bids already loses the
 round trip: both fees, both latency margins and the spread. With the default
 modeled costs (0.10% fee per side, 3 bps latency per leg, a 2 bps spread) that
 is about 40 bps of the budget. The exit compares the estimated net of selling
@@ -261,7 +261,11 @@ entry_cost_bps = max_debit x (1 - best_bid / break_even_bid), in bps of the budg
 A cycle is entered only if `stop_net_bps <= micro_max_loss_bps`. The first
 design used `clamp(2 ATR, 25, max_loss)` without the entry cost; a review
 showed that such a stop sits inside the cost and fires on the first exit check
-with the book unchanged.
+with the book unchanged. The break-even bid (and the target bid behind the
+required move) walks the bids the position would be sold into, as the exit
+estimate does, so a small best bid with the depth far below it shows its real
+cost and is not entered. The stop is an amount for the whole cycle: after a
+partial sale, the loss already realized counts against it.
 
 The economic gate also needs a market that moves enough: the required move
 (costs plus target, about 58 bps at the defaults; the spread and the exit's
@@ -279,7 +283,8 @@ The default was therefore raised from 80 to 120 bps, a loss of at most about
 0.30 USDT of a 25 USDT cycle on an orderly exit. A gap or an outage can lose
 more: a software stop cannot guarantee its price. The daily micro loss stop
 (1 USDT) and the consecutive-loss stop (4) still bound the day. A lower cap is
-allowed and simply makes the mode wait more; with a cheaper fee schedule the
+allowed and simply makes the mode wait more (below the 25 bps floor no stop
+fits, and each decision says so); with a cheaper fee schedule the
 entry cost falls and the window widens. Nothing here shows that entering in
 that window is profitable.
 

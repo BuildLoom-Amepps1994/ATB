@@ -80,13 +80,17 @@ Entry checks beyond the contract's list, each failing closed:
   MICRO_MAX_ALL_IN_USDT`` (else ERROR): the proposal is scaled from that cap.
 * the spread used is the larger of the reported one and the one the best bid
   and ask imply.
-* ``stop_beyond_entry_cost``: selling at the best bid the moment the position
+* ``stop_beyond_entry_cost``: selling into the bids the moment the position
   is bought already loses the round-trip cost (``max_debit * (1 - best_bid /
-  break_even_bid)``), so the stop is that cost plus an adverse move of
-  ``max(2 ATR, 25)`` bps (:func:`stop_net_bps`), and it fires on a real move,
-  never on the unchanged book. The sum must fit ``max_loss_bps`` (else
-  NO_ECONOMIC_EDGE; an unmeasurable cost is ERROR). The contract's original
-  ``clamp(2 ATR, 25, max_loss)`` ignored the cost and is superseded.
+  break_even_bid)``; the sizing's break-even bid walks the bids, as the exit
+  estimate does, so a thin best bid cannot hide that cost), so the stop is
+  that cost plus an adverse move of ``max(2 ATR, 25)`` bps
+  (:func:`stop_net_bps`), and it fires on a real move, never on the
+  unchanged book. The sum must fit ``max_loss_bps`` (else NO_ECONOMIC_EDGE;
+  an unmeasurable cost is ERROR). The contract's original ``clamp(2 ATR, 25,
+  max_loss)`` ignored the cost and is superseded. A loss cap below the 25 bps
+  floor fits no stop on any market: ``stop_within_loss_cap`` then says so as
+  NO_ECONOMIC_EDGE, and VOLATILITY only when 2 ATR alone exceeds the cap.
 
 Exit (``evaluate_exit``): safety exits (stop loss, maximum hold, regime shift)
 need no profit, no entry signal and no depth; profit exits (take profit,
@@ -536,10 +540,12 @@ def stop_net_bps(features: Features, params: MicroParams, entry_cost_bps=0.0) ->
 def entry_cost_bps(*, budget_cap, max_debit, break_even_bid, best_bid) -> float | None:
     """The loss carried at entry, in bps of ``budget_cap``, or None when it cannot be measured.
 
-    The estimated net of selling ``sellable`` at exit bid ``X`` is linear in
-    ``X`` and zero at the break-even bid, so selling at the current best bid
-    the moment the position is bought nets ``-max_debit * (1 - best_bid /
-    break_even_bid)``.
+    The sizing's break-even bid is the best bid at which selling ``sellable``
+    nets zero, priced by the walk of the bids (the book moved as a whole) or
+    at the best bid, whichever keeps less. That net is linear in the best bid,
+    so selling into the current book the moment the position is bought nets
+    ``-max_debit * (1 - best_bid / break_even_bid)``: at least the loss an exit
+    estimate on the same book shows.
     """
     cap, debit = _decimal(budget_cap), _decimal(max_debit)
     even, bid = _decimal(break_even_bid), _decimal(best_bid)
@@ -842,10 +848,20 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
     if features is not None:
         move = stop_move_bps(features)
         fits = move is not None and move <= params.max_loss_bps
-        check('stop_within_loss_cap', fits, VOLATILITY,
-              f'a {move:.1f} bps adverse-move stop fits the {params.max_loss_bps:g} bps loss cap' if fits else
-              f'a {STOP_ATR_MULTIPLE:g} ATR stop ({STOP_ATR_MULTIPLE * features.atr_bps:.1f} bps) exceeds the '
-              f'{params.max_loss_bps:g} bps loss cap before any entry cost', move_bps=move)
+        atr_move, loss_cap = STOP_ATR_MULTIPLE * features.atr_bps, params.max_loss_bps
+        if fits:
+            code, detail = VOLATILITY, f'a {move:.1f} bps adverse-move stop fits the {loss_cap:g} bps loss cap'
+        elif move is not None and atr_move <= loss_cap:
+            # Only the floor is beyond the cap: a setting no market can meet, so not a volatile market.
+            code = NO_ECONOMIC_EDGE
+            detail = (f'the {STOP_FLOOR_BPS:g} bps minimum stop exceeds the {loss_cap:g} bps loss cap '
+                      f'({STOP_ATR_MULTIPLE:g} ATR is {atr_move:.1f} bps): no stop fits this loss cap')
+        else:
+            code = VOLATILITY
+            detail = (f'a {move if move is not None else atr_move:.1f} bps adverse-move stop '
+                      f'({STOP_ATR_MULTIPLE:g} ATR = {atr_move:.1f} bps, at least {STOP_FLOOR_BPS:g}) exceeds the '
+                      f'{loss_cap:g} bps loss cap before any entry cost')
+        check('stop_within_loss_cap', fits, code, detail, move_bps=move)
         expected_range = features.atr_bps * math.sqrt(params.max_hold_s / 60)
         if fits and budget_cap is not None and quote_ok:
             stop_bps = _stop_with_cost(check, features, params, budget_cap=budget_cap, max_debit=max_debit,
@@ -925,18 +941,21 @@ class ExitDecision:
 
 def evaluate_exit(*, estimate: dict | None, depth_model: str, target_net: Decimal, stop_net: Decimal,
                   peak_est_net: Decimal | None, opened_wall: float, max_hold_s: float,
-                  regime: str | None, now: float) -> ExitDecision:
+                  regime: str | None, now: float, realized_net: Decimal | None = None) -> ExitDecision:
     """Exit policy for one held cycle from a fresh exit estimate (``ExitEstimate.as_dict()``).
 
-    Order: no estimate -> ``cannot_evaluate``; ``est_net <= -stop_net`` ->
-    ``stop_loss``; held ``>= max_hold_s`` -> ``max_hold``; regime
-    ``excessively_volatile`` or ``trending_down`` with ``est_net < 0`` ->
-    ``regime_shift``; then, only when both ``depth_model`` and the estimate
+    Order: no estimate -> ``cannot_evaluate``; ``est_net + min(realized_net,
+    0) <= -stop_net`` -> ``stop_loss`` (the stop is an amount for the whole
+    cycle: a loss already realized by a partial exit counts against it, a
+    realized gain never loosens it); held ``>= max_hold_s`` -> ``max_hold``;
+    regime ``excessively_volatile`` or ``trending_down`` with ``est_net < 0``
+    -> ``regime_shift``; then, only when both ``depth_model`` and the estimate
     say ``'book'`` and the estimate says the walk was not exhausted
     (``depth_exhausted is False``; a missing flag is no evidence):
     ``est_net - uncertainty >= target_net`` -> ``take_profit``; ``peak >= 0.75
-    target``, ``0 < est_net - uncertainty <= 0.25 target`` ->
-    ``profit_protection``; else ``hold``.
+    target``, ``peak - uncertainty > 0.25 target`` (the band below is entered
+    by falling into it, never on the way up) and ``0 < est_net - uncertainty
+    <= 0.25 target`` -> ``profit_protection``; else ``hold``.
 
     Safer readings, all on the side of exiting or of not claiming a profit:
     ``est_net`` is the smaller of the estimate's ``est_net_pnl`` and
@@ -987,10 +1006,13 @@ def evaluate_exit(*, estimate: dict | None, depth_model: str, target_net: Decima
     if book_based and est_net is not None:
         new_peak = est_net if peak is None else max(peak, est_net)
 
-    stop_fired = est_net is not None and stop is not None and est_net <= -stop
+    realized = _decimal(realized_net)
+    cycle_net = money.add(est_net, min(realized, money.ZERO)) if est_net is not None and realized is not None \
+        else est_net
+    stop_fired = cycle_net is not None and stop is not None and cycle_net <= -stop
     record('stop_loss', stop_fired, 'estimated net at or below the stop' if stop_fired else (
-        'stop not reached' if est_net is not None and stop is not None else 'est_net or stop unknown'),
-        est_net=est_net, stop_net=stop)
+        'stop not reached' if cycle_net is not None and stop is not None else 'est_net or stop unknown'),
+        est_net=est_net, realized_net=realized, cycle_net=cycle_net, stop_net=stop)
     record('max_hold', timed_out, hold_detail, held_s=held, max_hold_s=limit)
     hostile = regime in ('excessively_volatile', 'trending_down')
     regime_fired = hostile and est_net is not None and est_net < 0
@@ -1001,8 +1023,11 @@ def evaluate_exit(*, estimate: dict | None, depth_model: str, target_net: Decima
     if book_based and est_net is not None and uncertainty is not None and target is not None:
         margin = money.sub(est_net, uncertainty)
         take = margin >= target
+        floor = money.mul(PROTECT_FLOOR_SHARE, target)
+        # The peak includes this check's estimate, so a peak still inside the band (net of the same
+        # uncertainty) is a rise into it, not a give-back.
         protect = (not take and new_peak is not None and new_peak >= money.mul(PROTECT_PEAK_SHARE, target)
-                   and margin > money.ZERO and margin <= money.mul(PROTECT_FLOOR_SHARE, target))
+                   and money.sub(new_peak, uncertainty) > floor and money.ZERO < margin <= floor)
         profit_detail = f'net after uncertainty {money.text(margin)} against target {money.text(target)}'
     elif not book_based:
         profit_detail = f'profit exits need a book-depth estimate (depth model {depth_model})'

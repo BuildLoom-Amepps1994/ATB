@@ -122,8 +122,9 @@ Invariants:
   links to the cycle through `decision_id = cycle_id`.
 * **Partial exits keep the rest.** A partial sale moves basis pro rata to the
   base that left; `allocated + residual = basis` exactly. A sellable rest stays
-  `HOLDING`; an unsellable rest closes the cycle and stays in the ledger as
-  residual, carried by the next cycle on that pair.
+  `HOLDING`, and its stop counts the loss the partial sale already realized; an
+  unsellable rest closes the cycle and stays in the ledger as residual, carried
+  by the next cycle on that pair.
 * **Fresh opportunity for a rebuy.** After a close the pair waits a cooldown
   (doubling with consecutive losses) and needs a completed bar newer than the
   exit.

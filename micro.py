@@ -1307,10 +1307,11 @@ class MicroManager:
             regime, _ = strat.classify_regime(features, spread_bps=float(book.spread_bps), depth_ok=True,
                                               data_fresh=True, params=params)
         peak = _dec(cycle.get('peak_est_net'))
+        # stop_net is an amount for the whole cycle: what a partial exit already lost counts against it.
         verdict = strat.evaluate_exit(estimate=estimate, depth_model=depth_model, target_net=target_net,
                                       stop_net=stop_net, peak_est_net=peak, opened_wall=float(cycle['opened_wall'] or 0),
                                       max_hold_s=float(cycle['max_hold_s'] or params.max_hold_s), regime=regime,
-                                      now=time.time())
+                                      now=time.time(), realized_net=_dec(cycle.get('realized_net'), money.ZERO))
         self.metrics.observe('micro.exit_decision_ms', (time.monotonic() - started) * 1000)
         with self.lock:
             row = self.pairs.setdefault(symbol, {'symbol': symbol})
@@ -1745,7 +1746,7 @@ class MicroManager:
                     continue
             rules = self.rules(symbol)
             cost = self.cost(rules)
-            sizing = None
+            sizing = sizing_failure = None
             if book is not None:
                 reserved, basis = self._committed()
                 try:
@@ -1758,7 +1759,8 @@ class MicroManager:
                                              exit_stress_bps=money.parse(params.max_loss_bps),
                                              now_wall=now, max_rules_age_s=CATALOGUE_MAX_AGE_S)
                 except Exception as exc:
-                    self._note_error(symbol, f'sizing failed: {type(exc).__name__}')
+                    sizing_failure = f'sizing failed: {type(exc).__name__}'
+                    self._note_error(symbol, sizing_failure)
             fresh_book = book if book is not None and book.age_seconds(time.monotonic()) <= max_age else None
             # Read again after the book: the bar may have closed while the book was read.
             features_current = features is None or (bool(context.get('current'))
@@ -1778,8 +1780,15 @@ class MicroManager:
                      'fresh_after_exit': fresh_after_exit, 'review_block': bool(blockers) or bool(conflicts),
                      'risk_block': engine.risk_block if engine.risk.kill_switch()['engaged'] else None,
                      'latched': latch.get('reason') if latch else None}
-            sizing_dict = sizing.as_dict() if sizing is not None else {'eligible': False, 'code': 'DEPTH_UNKNOWN',
-                                                                        'detail': 'No fresh order book'}
+            # A stand-in names its pair and its own cause: no book, or a sizing that raised on one (an
+            # unmapped code, so the strategy reports it as ERROR with this detail).
+            if sizing is not None:
+                sizing_dict = sizing.as_dict()
+            elif sizing_failure is not None:
+                sizing_dict = {'symbol': symbol, 'eligible': False, 'code': 'SIZING_FAILED', 'detail': sizing_failure}
+            else:
+                sizing_dict = {'symbol': symbol, 'eligible': False, 'code': 'DEPTH_UNKNOWN',
+                               'detail': 'No fresh order book'}
             started = time.monotonic()
             verdict = strat.evaluate_entry(symbol=symbol, features=features, regime=regime,
                                            regime_reasons=regime_reasons, sizing=sizing_dict, book_summary=book_summary,

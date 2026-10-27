@@ -18,6 +18,7 @@ Nothing here stubs the strategy or the risk gate. Where a test needs a fault
 raises at a named point, and the rest of the path is the production code.
 """
 import json
+import math
 import sqlite3
 import sys
 import threading
@@ -32,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import credentials
 import micro
+import money
 import observability
 import storage
 import trader
@@ -598,6 +600,76 @@ def test_a_short_maximum_hold_leaves_no_room_for_the_target_so_nothing_enters(wo
     assert w.cycles() == []
     codes = [d['code'] for d in w.engine.micro.recent_decisions(300) if d['symbol'] == 'ETH/USDT']
     assert 'NO_ECONOMIC_EDGE' in codes
+
+
+class ThinBids(SeriesMarket):
+    """A market whose best bid holds about 2 USDT, with its real bid depth 160 bps and more below (while ``thin``)."""
+    thin = True
+
+    def book_at(self, mid, *, now_ms, sequence, depth_scale=1.0, spread_scale=1.0):
+        book = super().book_at(mid, now_ms=now_ms, sequence=sequence, depth_scale=depth_scale,
+                               spread_scale=spread_scale)
+        if not self.thin:
+            return book
+        top = book['bids'][0][0]
+
+        def below(bps):
+            return round(math.floor(top * (1 - bps / 1e4) / self.tick) * self.tick, 2)
+        bids = [[top, round(2.0 / top, 6)], [below(40), round(3.0 / top, 6)], [below(70), round(5.0 / top, 6)]]
+        book['bids'] = bids + [[below(bps), round(400.0 / top, 6)] for bps in (160, 170, 180, 190, 200, 210)]
+        return book
+
+
+def test_a_thin_top_bid_is_not_entered_because_selling_into_the_bids_would_pass_the_loss_cap(world):
+    def markets(minute):
+        return [ThinBids('ETH/USDT', minute - 300, mechanics(), market=fine_market('ETH/USDT')),
+                SeriesMarket('BTC/USDT', minute - 300, flat(900, base=60000.0), market=fine_market('BTC/USDT'))]
+    w = world(markets)
+    refused = {}
+
+    def watch():
+        decision = (w.engine.micro.pairs.get('ETH/USDT') or {}).get('decision') or {}
+        stop = next((c for c in decision.get('checks') or () if c['check'] == 'stop_beyond_entry_cost'), None)
+        if decision.get('candidate') and stop is not None and not stop['passed']:
+            refused[decision['decision_id']] = (decision['code'], stop['entry_cost_bps'])
+        return bool(w.cycles())
+    assert not w.run(60, until=watch)
+    assert w.cycles() == [] and w.intents() == []
+    assert 'NO_ECONOMIC_EDGE' in {code for code, _ in refused.values()}   # a setup that the stop alone refused
+    assert min(cost for _, cost in refused.values()) > 120 - 25    # the walk's cost, not the best bid's 40 bps
+    # The same market with its depth back at the touch is entered.
+    w.exchange.series['ETH/USDT'].thin = False
+    assert w.run_until_state('HOLDING', minutes=60)['symbol'] == 'ETH/USDT'
+
+
+def _noisy_decline(w: World, held: dict, *, pattern=(-40, 30), bars=40) -> None:
+    """From now on ETH falls 40 bps, then recovers 30 bps, bar after bar: a decline that is not a hostile regime."""
+    series = w.exchange.series['ETH/USDT']
+    start = series.index(w.clock.minute() - 1)
+    price, closes = float(Decimal(held['entry_price'])), []
+    for k in range(len(series.closes) - start):
+        if k < bars:
+            price *= math.exp((pattern[0] if k % 2 == 0 else pattern[1]) / 1e4)
+        closes.append(price)
+    series.closes[start:] = closes
+
+
+def test_after_a_partial_stop_sale_the_stop_counts_the_realized_loss_and_sells_the_rest(world):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    cycle_id = held['cycle_id']
+    _noisy_decline(w, held)
+    w.venue().partial_next = Decimal('0.5')                 # the stop sale fills only half
+    assert w.run(40, until=lambda: int(micro.load_cycle(cycle_id)['exit_count'] or 0) >= 1)
+    first = micro.load_cycle(cycle_id)
+    assert (first['state'], first['last_exit_trigger']) == ('HOLDING', 'stop_loss')
+    # The stop is an amount for the whole cycle: with half of it lost already, the rest goes within a bar or two.
+    assert w.run(3, until=lambda: micro.load_cycle(cycle_id)['state'] == 'CLOSED')
+    closed = micro.load_cycle(cycle_id)
+    assert closed['last_exit_trigger'] == 'stop_loss' and int(closed['exit_count']) == 2
+    cap = money.mul(Decimal(closed['budget_cap']), money.bps(Decimal(str(w.engine.cfg['micro_max_loss_bps']))))
+    assert Decimal(closed['realized_net']) > -cap
+    assert_ledger_consistent(w)
 
 
 # ===================================================================== item 21
@@ -1464,3 +1536,35 @@ def test_owned_symbols_are_open_cycles_and_closed_residuals_still_in_the_ledger_
                    "opened_at) VALUES (?, 'paper', 'SOL/USDT', 1, 1, 1, 1, 0.9, 1.1, '2026-10-26T00:00:00+00:00')",
                    (w.engine.exchange_name,))
     assert w.engine.micro.owned_symbols() == {'SOL/USDT'}                 # unreadable cycles: every paper position
+
+
+def test_a_sizing_failure_or_a_missing_book_reports_its_own_cause_not_an_unnamed_sizing_result(world, monkeypatch):
+    w = world(watchlist=['ETH/USDT'])
+    real_size_entry = micro.econ.size_entry
+
+    def broken(**kwargs):
+        raise money.MoneyError('injected rules defect')
+    monkeypatch.setattr(micro.econ, 'size_entry', broken)
+    seen = []
+
+    def watch():
+        row = w.engine.micro.pairs.get('ETH/USDT') or {}
+        waiting = row.get('waiting') or {}
+        seen.append((waiting.get('code'), waiting.get('status'), tuple(waiting.get('reasons') or ()),
+                     bool(row.get('book'))))
+        return False
+    w.run(40, until=watch)
+    assert w.cycles() == []
+    assert not any('does not name its symbol' in reason for _, _, reasons, _ in seen for reason in reasons)
+    # A fresh book was read and only the sizing failed: the pair says so.
+    assert any(status == 'Cannot evaluate: sizing failed: MoneyError' for _, status, _, book in seen if book)
+    # No book at all: the data is stale, and the sizing reason says there was no book to size on.
+    monkeypatch.setattr(micro.econ, 'size_entry', real_size_entry)
+    monkeypatch.setattr(type(w.engine.micro), '_book', lambda self, *args, **kwargs: None)
+    seen.clear()
+    w.run(10, until=watch)
+    stale = [entry for entry in seen if not entry[3] and entry[0]]
+    assert stale and {code for code, _, _, _ in stale} == {'STALE_DATA'}
+    assert all('No fresh order book' in reasons for _, _, reasons, _ in stale)
+    assert not any('does not name its symbol' in reason for _, _, reasons, _ in seen for reason in reasons)
+    assert w.cycles() == []

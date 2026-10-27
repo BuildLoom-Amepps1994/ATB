@@ -48,7 +48,7 @@ mode.
 | The budget is below the pair's venue minimum | Never trades that pair at a larger size. The pair shows `BUDGET_BELOW_VENUE_MINIMUM` and the smallest workable budget. |
 | A buy would leave unsellable dust | Not bought (`EXIT_BELOW_VENUE_MINIMUM`). |
 | Profit target reached after all estimated costs | Sells. A gross gain below costs is not a profit exit. |
-| Estimated loss reaches the cycle's stop (the round-trip cost carried at entry plus the ATR move, never above the loss cap), the hold time runs out, or the market turns volatile or down while the cycle is under water | Sells without needing a profit, an entry signal or buy-side depth. |
+| Estimated loss reaches the cycle's stop (the round-trip cost carried at entry plus the ATR move, never above the loss cap; after a partial sale the loss already realized counts too), the hold time runs out, or the market turns volatile or down while the cycle is under water | Sells without needing a profit, an entry signal or buy-side depth. |
 | A sell leaves a remainder below the venue minimum | The cycle closes and the remainder stays recorded as residual (never deleted); the next cycle on that pair carries it. |
 | A cycle closes | Cooldown for the pair (longer after consecutive losses), then a new cycle needs a newer completed bar than the exit, so the same signal can never be bought twice. |
 | A pair is removed from the list while held | Its exits keep running until it is sold; no new entry. |

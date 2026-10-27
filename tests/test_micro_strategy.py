@@ -514,6 +514,63 @@ def test_the_stop_is_the_loss_carried_at_entry_plus_an_adverse_move(momentum):
     assert [c['check'] for c in hidden.checks if not c['passed']] == ['stop_beyond_entry_cost']
 
 
+def test_a_thin_top_bid_cannot_hide_the_exit_cost_from_the_stop_or_the_economic_gate(momentum):
+    """The loss carried at entry is what selling into the bids returns, not what the best bid alone suggests."""
+    import micro_economics as me
+    import venue_rules
+    rules = venue_rules.VenueRules(
+        exchange='mexc', symbol='ETH/USDT', base='ETH', quote='USDT', active=True, spot=True, status='online',
+        side_permission='all', market_orders=True, market_buy_by_cost=True, amount_step=D('0.0001'),
+        price_tick=D('0.01'), cost_step=D('0.01'), min_amount=D('0.0001'), max_amount=None, min_cost_market=D('1'),
+        min_cost_limit=D('5'), max_cost_market=D('100000'), max_cost_limit=D('2000000'), taker_fee=D('0.0005'),
+        maker_fee=D('0'), fee_source='fixture', buy_fee_currency='quote', sell_fee_currency='quote',
+        loaded_at=1000.0, source='fixture')
+    cost = me.CostModel(taker_fee=D('0.001'), fee_source='test', latency_bps=D('3'), fallback_slippage_bps=D('20'),
+                        buy_fee_currency='quote', sell_fee_currency='quote')
+
+    def sized(bids):
+        book = types.SimpleNamespace(bids=bids, asks=((D('100.01'), D('1000')),), depth_known=True,
+                                     best_bid=bids[0][0], best_ask=D('100.01'), symbol='ETH/USDT', exchange='mexc')
+        result = me.size_entry(rules=rules, book=book, cost=cost, budget_cap=D('25'), cash_available=D('1000'),
+                               allocation_remaining=D('1000'), target_net=D('0.05'), exit_stress_bps=D('120'),
+                               now_wall=2000.0)
+        assert result.eligible, result.detail
+        owned = money.add(result.sellable_base, result.predicted_residual_base)
+        now = me.estimate_exit(owned_base=owned, basis_quote=result.max_debit, rules=rules, book=book, cost=cost,
+                               target_net=D('0.05'), uncertainty_bps=D('5'))
+        return result.as_dict(), now
+    params = dataclasses.replace(PARAMS, max_loss_bps=120.0)
+    lively = dataclasses.replace(momentum, atr_bps=20.0)           # a 40 bps adverse move
+    deep, _ = sized(((D('99.99'), D('1000')),))
+    assert decide(lively, params=params, sizing_record=deep).action == 'enter'
+    thin, now = sized(((D('99.99'), D('0.02')), (D('99.59'), D('0.03')), (D('99.29'), D('0.05')),
+                       (D('98.39'), D('4')), (D('98.29'), D('4'))))
+    loss_now_bps = -float(now.est_net_pnl) / 25 * 1e4               # what the first exit check would see
+    assert loss_now_bps > 120 - 40                                  # entered, the stop would fire at once
+    decision = decide(lively, params=params, sizing_record=thin)
+    assert_abstains(decision, ms.NO_ECONOMIC_EDGE)
+    stop = next(c for c in decision.checks if c['check'] == 'stop_beyond_entry_cost')
+    assert not stop['passed'] and stop['entry_cost_bps'] >= loss_now_bps - 1e-6
+    edge = next(c for c in decision.checks if c['check'] == 'economic_edge')
+    assert not edge['passed']                                        # the required move counts the walk too
+
+
+def test_a_loss_cap_below_the_stop_floor_is_reported_as_the_floor_not_as_volatility(momentum):
+    """A cap under the 25 bps minimum stop never fits a stop; the market is not to blame and the figures say so."""
+    calm = dataclasses.replace(momentum, atr_bps=5.0)               # 2 ATR = 10 bps, well inside a 22 bps cap
+    decision = decide(calm, params=dataclasses.replace(PARAMS, max_loss_bps=22.0))
+    check = next(c for c in decision.checks if c['check'] == 'stop_within_loss_cap')
+    assert not check['passed'] and check['code'] == ms.NO_ECONOMIC_EDGE and ms.VOLATILITY not in decision.codes
+    assert check['move_bps'] == 25.0
+    assert 'the 25 bps minimum stop exceeds the 22 bps loss cap' in check['detail'], check['detail']
+    assert '2 ATR is 10.0 bps' in check['detail'] and 'Too volatile' not in decision.status
+    # When two ATR alone passes the cap, the market is too volatile, and the stop figure stated is the stop used.
+    for atr, cap, figure in ((11.0, 20.0, '25.0 bps adverse-move stop (2 ATR = 22.0 bps'), (40.5, 80.0, '81.0 bps')):
+        wild = decide(dataclasses.replace(momentum, atr_bps=atr), params=dataclasses.replace(PARAMS, max_loss_bps=cap))
+        check = next(c for c in wild.checks if c['check'] == 'stop_within_loss_cap')
+        assert not check['passed'] and check['code'] == ms.VOLATILITY and figure in check['detail'], check['detail']
+
+
 def test_entry_cost_is_measured_from_the_break_even_bid_or_not_at_all():
     assert ms.entry_cost_bps(budget_cap='25', max_debit='25', break_even_bid='100', best_bid='100') == 0.0
     assert ms.entry_cost_bps(budget_cap='25', max_debit='25', break_even_bid='100', best_bid='101') == 0.0
@@ -847,10 +904,11 @@ def estimate(est_net, *, uncertainty='0.004', depth_model='book', basis='25.00',
 
 
 def exit_for(est, *, depth_model=None, peak=None, regime='ranging', now=NOW, opened=OPENED, max_hold_s=1800.0,
-             target=TARGET, stop=STOP):
+             target=TARGET, stop=STOP, realized=None):
     model = depth_model if depth_model is not None else (est or {}).get('depth_model', 'book')
+    extra = {} if realized is None else {'realized_net': realized}
     return ms.evaluate_exit(estimate=est, depth_model=model, target_net=target, stop_net=stop, peak_est_net=peak,
-                            opened_wall=opened, max_hold_s=max_hold_s, regime=regime, now=now)
+                            opened_wall=opened, max_hold_s=max_hold_s, regime=regime, now=now, **extra)
 
 
 @pytest.mark.parametrize('model', ['flat_fallback', 'book'])
@@ -921,6 +979,38 @@ def test_profit_protection_gives_back_at_most_three_quarters_of_a_reached_target
     assert exit_for(estimate('0.005'), peak=D('0.03')).new_peak == D('0.03')
     assert exit_for(estimate('0.045', depth_model='flat_fallback'), peak=D('0.01')).new_peak == D('0.01')
     assert exit_for(estimate('0.03'), peak=None).new_peak == D('0.03')
+
+
+def test_profit_protection_needs_a_give_back_even_when_the_uncertainty_exceeds_half_the_target():
+    """A steady rise through the protection band is not a give-back: it goes on to take profit."""
+    for target, uncertainty in ((D('0.05'), D('0.0375')), (D('0.02'), D('0.0125')), (D('0.05'), D('0.0125'))):
+        peak, verdict, est = None, None, D('0')
+        while verdict is None or verdict.action != 'exit':
+            est += D('0.0025')
+            verdict = exit_for(estimate(str(est), uncertainty=str(uncertainty)), peak=peak, target=target)
+            peak = verdict.new_peak
+        assert verdict.trigger == 'take_profit', (target, uncertainty, est, verdict.reason)
+        assert est - uncertainty >= target
+    # Once the net after uncertainty has been above the band, falling back into it is protected.
+    fell = exit_for(estimate('0.045', uncertainty='0.0375'), peak=D('0.07'))
+    assert (fell.trigger, fell.new_peak) == ('profit_protection', D('0.07'))
+    # A peak whose net after uncertainty never left the band protects nothing yet.
+    assert exit_for(estimate('0.045', uncertainty='0.0375'), peak=D('0.05')).action == 'hold'
+
+
+def test_a_stop_counts_the_loss_already_realized_by_a_partial_exit():
+    """The stop is an amount for the whole cycle, so the rest of a partial sale carries what was already lost."""
+    assert exit_for(estimate('-0.09')).action == 'hold'
+    rest = exit_for(estimate('-0.09'), realized=D('-0.12'))       # -0.21 for the cycle against a 0.20 stop
+    assert (rest.action, rest.trigger) == ('exit', 'stop_loss')
+    stop = next(c for c in rest.checks if c['check'] == 'stop_loss')
+    assert stop['realized_net'] == '-0.12' and stop['cycle_net'] == '-0.21'
+    assert exit_for(estimate('-0.07'), realized=D('-0.12')).action == 'hold'
+    # A cycle that has already lost its whole stop sells the rest at once, even at a small estimated gain.
+    assert exit_for(estimate('0.01'), realized=D('-0.25')).trigger == 'stop_loss'
+    # A realized gain never loosens the stop on the rest.
+    assert exit_for(estimate('-0.20'), realized=D('0.05')).trigger == 'stop_loss'
+    assert exit_for(estimate('-0.19'), realized=D('0.05')).action == 'hold'
 
 
 def test_without_an_estimate_the_exit_cannot_be_evaluated():

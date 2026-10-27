@@ -108,12 +108,21 @@ class BookTracker:
         #     or (no sequences) venue_timestamp_ms is older than the stored one by > 1 s;
         #     the stored snapshot is kept. Lower ids, none below the first of them, that keep
         #     arriving for longer than max_age_s with none accepted in between are a venue
-        #     counter restart: the next read whose id is above every id of that run, after an
-        #     earlier read that also rose so, is accepted, the id evidence starts over from it, and
-        #     it is counted in sequence_resets. A lagging replica's lower id keeps that wait but is
-        #     never the read accepted, a repeated id (a stuck replica) is never accepted, and while
-        #     an id of the run stays above every later one (a replica frozen before the restart)
-        #     nothing is accepted.
+        #     counter restart: a read whose id rises above the run's highest for the second time
+        #     since the count last started over is accepted, the id evidence starts over from it,
+        #     and it is counted in sequence_resets. An id below the run's highest (a lagging
+        #     replica) or stamped > 1 s older than the run's newest never counts, and the highest
+        #     id received again right after a lower one (a stuck replica) starts the count over.
+        #     An id that stays the run's highest (a replica frozen before the restart) keeps the
+        #     restart refused while it is received again within max_age_s; the first lower read
+        #     more than max_age_s after its last receipt becomes the run's highest, so the restart
+        #     is accepted on the second rise after it, a little more than max_age_s after the old
+        #     id's last answer. Ids the run set aside so, or saw above the read accepted, are
+        #     refused even above the new counter's ids until an accepted id passes them (the
+        #     highest 8 are kept; invalidate clears them).
+        #     Not detected, since ids alone cannot tell: stuck replicas whose ids first answer in
+        #     rising order back to back, a frozen replica that first answers after the restart
+        #     was accepted, and a replica stuck on the newest accepted id (an equal id is accepted).
         #   CLOCK_ROLLBACK when received_wall is more than 1 s earlier than the previous
         #     accepted received_wall while received_mono advanced; every symbol's snapshot
         #     is invalidated (derived state must be rebuilt from new snapshots).

@@ -711,6 +711,162 @@ def test_a_rising_id_that_would_show_a_restart_is_still_refused_when_the_venue_c
     assert tracker.sequence_resets == 1
 
 
+def handed(tracker, snapshots):
+    """Hand each snapshot to ``tracker`` in turn: the (receipt, id) of each one accepted, the id served after each."""
+    accepted, served = [], []
+    for snapshot in snapshots:
+        try:
+            stored = tracker.accept(snapshot)
+            accepted.append((stored.received_mono, stored.venue_sequence))
+        except BookError as exc:
+            assert exc.code == micro_book.BOOK_OUT_OF_ORDER, (exc.code, str(exc))
+        now = tracker.latest(snapshot.symbol, now_mono=snapshot.received_mono)
+        served.append(None if now is None else now.venue_sequence)
+    return accepted, served
+
+
+def test_one_old_counter_read_inside_a_restart_run_stops_holding_it_once_it_is_not_received_again():
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(7_000_000_023, mono=100.0))
+    # the venue restarted its lastUpdateId counter. Once, right after the first live read, a replica a few seconds
+    # behind answers with an id from the old counter: below the last accepted one, above every new one
+    reads = [seq(264, mono=101.0), seq(7_000_000_018, mono=102.0)]
+    reads += [seq(264 + 3 * i, mono=102.0 + i) for i in range(1, 30)]
+    accepted, served = handed(tracker, reads)
+    # it is not received again for longer than the age limit (at 108.0): the run stops counting it, and the restart
+    # is accepted on the second live read that rises after that
+    assert accepted == [(102.0 + i, 264 + 3 * i) for i in range(8, 30)]
+    assert 7_000_000_018 not in served
+    row = tracker.status(131.0)['ETH/USDT']
+    assert row['sequence_resets'] == 1 and row['sequence'] == 264 + 3 * 29 and row['state'] == 'fresh'
+    # the old-counter id is above the new counter's, and is still refused when it comes again
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(7_000_000_018, mono=132.0))
+    assert tracker.latest('ETH/USDT', now_mono=132.1).venue_sequence == 264 + 3 * 29
+
+
+def test_a_replica_frozen_on_a_pre_restart_id_that_stops_answering_lets_the_live_book_return():
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(7_000_000_023, mono=100.0))
+    frozen, live, reads = 7_000_000_010, 264, []
+    # the venue restarted its lastUpdateId counter; a replica frozen before the restart answers every other read
+    # with its old id and old prices for 20 s, then it is gone
+    for i in range(50):
+        if i % 2 and i < 20:
+            reads.append(seq(frozen, mono=101.0 + i, bid='1500.00'))
+        else:
+            live += 3
+            reads.append(seq(live, mono=101.0 + i))
+    accepted, served = handed(tracker, reads)
+    assert frozen not in served and frozen not in [n for _, n in accepted]
+    # its last answer came at 120.0: after the age limit (at 126.0) the run stops counting it, and the restart is
+    # accepted on the second live read that rises after that
+    assert [mono for mono, _ in accepted] == [101.0 + i for i in range(27, 50)]
+    row = tracker.status(151.0)['ETH/USDT']
+    assert row['sequence_resets'] == 1 and row['sequence'] == live and tracker.sequence_resets == 1
+    # a later answer from the frozen replica is still refused: its id is above the new counter's
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(frozen, mono=151.0, bid='1500.00'))
+    assert tracker.latest('ETH/USDT', now_mono=151.1).venue_sequence == live
+
+
+def test_a_replica_frozen_on_a_pre_restart_id_that_answers_less_often_than_the_age_limit_is_never_served():
+    tracker = BookTracker(max_age_s=30)
+    tracker.accept(seq(7_000_000_023, mono=100.0))
+    frozen, live, reads = 7_000_000_010, 264, []
+    # the venue restarted its lastUpdateId counter. A replica frozen before the restart first answers right after
+    # the first live read, then once every 40 s, with its old id and old prices
+    for i in range(400):
+        if i % 40 == 1:
+            reads.append(seq(frozen, mono=101.0 + i, bid='1500.00'))
+        else:
+            live += 3
+            reads.append(seq(live, mono=101.0 + i))
+    accepted, served = handed(tracker, reads)
+    assert frozen not in served and frozen not in [n for _, n in accepted]
+    # the run stops counting the frozen id 30 s after its answer (at 133.0), and the live counter is accepted on its
+    # second rise after that; every later live read is accepted, every later frozen answer refused
+    assert accepted == [(s.received_mono, s.venue_sequence) for s in reads
+                        if s.received_mono >= 135.0 and s.venue_sequence != frozen]
+    row = tracker.status(501.0)['ETH/USDT']
+    assert row['sequence_resets'] == 1 and row['sequence'] == live and tracker.sequence_resets == 1
+
+
+def test_a_frozen_replica_seen_before_the_restart_run_started_over_is_still_never_served():
+    tracker = BookTracker(max_age_s=30)
+    tracker.accept(seq(7_000_000_023, mono=100.0))
+    # the venue restarted its lastUpdateId counter; a replica frozen before the restart answers once, then a lagging
+    # replica's id below the run's first starts the run over, and the frozen replica next answers 40 s later
+    frozen, live = 7_000_000_010, 262
+    reads = [seq(264, mono=101.0), seq(frozen, mono=102.0, bid='1500.00'), seq(live, mono=103.0)]
+    for i in range(4, 64):
+        if i == 42:
+            reads.append(seq(frozen, mono=100.0 + i, bid='1500.00'))
+        else:
+            live += 3
+            reads.append(seq(live, mono=100.0 + i))
+    accepted, served = handed(tracker, reads)
+    assert frozen not in served and frozen not in [n for _, n in accepted]
+    # the run that started over at 103.0 is accepted after the age limit; the frozen id it carried stays refused
+    assert accepted == [(s.received_mono, s.venue_sequence) for s in reads
+                        if s.received_mono >= 134.0 and s.venue_sequence != frozen]
+    assert tracker.status(164.0)['ETH/USDT']['sequence_resets'] == 1
+
+
+def test_a_replica_frozen_before_a_restart_whose_venue_clock_places_it_earlier_does_not_hold_the_run():
+    def eth(n, mono, *, age_s=0.2, bid='2000.10'):
+        wall = WALL + (mono - 100.0)
+        return book(depth([[bid, '1']], [['2000.20', '1']], nonce=n, timestamp=int((wall - age_s) * 1000)),
+                    wall=wall, mono=mono)
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(eth(7_000_000_023, 100.0))
+    frozen, live, reads = 7_000_000_010, 264, []
+    # the venue restarted its lastUpdateId counter; every other read comes from a replica frozen before the restart,
+    # whose venue timestamp is 120 s older than the live reads'
+    for i in range(20):
+        if i % 2:
+            reads.append(eth(frozen, 101.0 + i, age_s=120.0, bid='1500.00'))
+        else:
+            live += 3
+            reads.append(eth(live, 101.0 + i))
+    accepted, served = handed(tracker, reads)
+    assert frozen not in served and frozen not in [n for _, n in accepted]
+    # the venue's clock shows the frozen id is not the live counter's newest: the live ids rise past the age limit
+    assert accepted == [(s.received_mono, s.venue_sequence) for s in reads
+                        if s.received_mono >= 107.0 and s.venue_sequence != frozen]
+    row = tracker.status(121.0)['ETH/USDT']
+    assert row['sequence_resets'] == 1 and row['sequence'] == live and tracker.sequence_resets == 1
+
+
+def test_a_venue_counter_restart_is_accepted_while_a_replica_repeats_the_previous_reads_id():
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(7_000_000_023, mono=100.0))
+    # the venue restarted its lastUpdateId counter. Reads are 0.5 s apart and every other one comes from a replica
+    # (or a cache) one read behind: it answers the previous read's id, so the counter's every id is read twice in a row
+    reads, live = [], 264
+    for i in range(30):
+        live += 3 * (i % 2 == 0)
+        reads.append(seq(live, mono=101.0 + 0.5 * i))
+    accepted, _ = handed(tracker, reads)
+    # an id read again right after itself is not a source stuck on it: the restart is accepted after the age limit
+    assert accepted == [(s.received_mono, s.venue_sequence) for s in reads if s.received_mono >= 107.0]
+    assert tracker.status(116.0)['ETH/USDT']['sequence_resets'] == 1
+
+
+def test_three_replicas_stuck_on_lower_ids_never_count_as_a_venue_counter_restart():
+    # no restart: after 1000 the leading replica stops answering, replicas stuck on 990 and 995 take turns, and a
+    # third stuck on 998 with older prices first answers after the age limit, then on every third read
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(1000, mono=100.0))
+    for i in range(1, 41):
+        if i > 10 and i % 3 == 0:
+            snapshot = seq(998, mono=100.0 + i, bid='1500.00')
+        else:
+            snapshot = seq(990 if i % 2 else 995, mono=100.0 + i)
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, snapshot)
+    row = tracker.status(141.0)['ETH/USDT']
+    assert row['sequence'] == 1000 and row['sequence_resets'] == 0 and row['accepted'] == 1
+    assert tracker.sequence_resets == 0
+
+
 def test_generation_is_a_local_count_of_accepted_snapshots_never_venue_evidence():
     tracker = BookTracker(max_age_s=5)
     forged = dataclasses.replace(seq(500_000, mono=100.0), generation=999)

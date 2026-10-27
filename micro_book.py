@@ -93,6 +93,7 @@ MIXED_CLOCKS_S = 10 * 365 * 86400.0
 MAX_RAW_LEVELS = 5000               # MEXC's maximum depth; a longer side is not a venue response
 MAX_LEVELS = MAX_RAW_LEVELS
 MAX_VENUE_INT = 2 ** 63             # venue sequences and millisecond timestamps are 64-bit
+RUN_IDS = 8                         # ids a venue id restart run remembers, and ids a symbol keeps set aside after one
 
 DEPTH_SOURCES = ('rest_depth', 'fixture')
 TICKER_SOURCES = ('ticker', 'stream_ticker', 'fixture')
@@ -403,6 +404,25 @@ def from_ticker(ticker: dict, *, exchange: str, symbol: str, received_wall: floa
 
 # --------------------------------------------------------------- tracker
 @dataclass
+class _Run:
+    """The venue ids lower than the newest accepted, refused since the stored book (see ``_counter_restarted``)."""
+    start: float                    # receipt of the run's first id
+    first: int                      # the run's first id
+    highest: int                    # the highest id that counts
+    highest_mono: float             # when that highest id was last received
+    last_mono: float                # receipt of the run's latest id
+    last_id: int                    # the run's latest id
+    rises: int = 0                  # reads that rose above the highest since the count last started over
+    stamp_ms: int | None = None     # the newest venue timestamp among the run's ids
+    seen: tuple[int, ...] = ()      # the run's highest distinct ids (see _highest)
+
+
+def _highest(ids: tuple[int, ...], more) -> tuple[int, ...]:
+    """The RUN_IDS highest distinct ids of ``ids`` and ``more``, ascending."""
+    return tuple(sorted(set(ids).union(more))[-RUN_IDS:])
+
+
+@dataclass
 class _Track:
     """Per-symbol state, guarded by the tracker's lock."""
     snapshot: BookSnapshot | None = None
@@ -414,9 +434,10 @@ class _Track:
     last_error: str | None = None
     accepted: int = 0
     refused: int = 0
-    # (first receipt, first id, highest id, last receipt, rises) of the lower venue ids refused since the stored
-    # book; rises counts the reads whose id was above every id before it in the run
-    lower_run: tuple[float, int, int, float, int] | None = None
+    lower_run: _Run | None = None
+    # ids a venue id restart run set aside (a replica frozen above the live ids): refused, even above
+    # max_sequence, until an accepted id passes them; the highest RUN_IDS are kept
+    quarantine: tuple[int, ...] = ()
     sequence_resets: int = 0          # venue counter restarts accepted (see BookTracker)
 
 
@@ -443,21 +464,48 @@ class BookTracker:
     venue's update ids or the venue's own clock.
 
     A venue that restarted its update-id counter sends only ids lower than
-    the newest accepted. When such lower ids keep arriving, none below the
-    first of them, for longer than ``max_age_s`` with no snapshot accepted in
-    between (and each received after the stored book), the stored book has
-    expired and nothing else is coming. The restart is then accepted on the
-    next read whose id is above every id the run has seen, provided an
-    earlier read in the run also rose so: that symbol's id evidence starts
-    over from it, and it is counted in ``sequence_resets``. A lagging
-    replica's id below the previous one keeps the run but is never the one
-    accepted; an id below the run's first starts it over. One lower id, a
-    repeated id (a replica stuck on one id, or several stuck ones taking
-    turns) and a venue timestamp older than the newest accepted are still
-    refused. While an id the run has seen stays above every later one (a
-    replica frozen on an id from before the restart), nothing is accepted. A
-    frozen replica that first answers after the restart was accepted is not
-    detected: its old id is above the new counter's.
+    the newest accepted. Such ids, each received after the stored book, form
+    a run; an id below the run's first starts the run over (it could be a
+    second restart). Once the run is older than ``max_age_s`` with no
+    snapshot accepted in between, the stored book has expired and nothing
+    else is coming: the restart is accepted on a read whose id rises above
+    the run's highest for the second time since the count of rises last
+    started over. That symbol's id evidence starts over from that read, and
+    it is counted in ``sequence_resets``. These do not count: an id below the
+    run's highest (a lagging replica, or a live id below an id frozen before
+    the restart); an id whose venue timestamp is more than
+    ``TIMESTAMP_REGRESSION_S`` older than the run's newest (the venue's clock
+    shows a frozen replica); and the highest id received again right after a
+    lower one (a source stuck on it), which starts the count over. So one
+    lower id, a replica stuck on one id and several stuck ones taking turns
+    are refused, and a lagging replica keeps the run but is never the read
+    accepted. On a counter that rises less often than it is read, a lagging
+    read between two reads of one id also starts the count over, which
+    delays the restart until two rises come without one.
+
+    The first lower read received more than ``max_age_s`` after the run's
+    highest id was last received becomes the run's highest; the count starts
+    over, and the run's ids above that read are set aside. So after a one-off
+    old-counter read, or once a frozen replica stops answering, the restart
+    is accepted on the second rising read after that, a little more than
+    ``max_age_s`` after the old id's last answer. A replica frozen on an id
+    from before the restart that answers again before that (about every
+    ``max_age_s`` or more often), without venue timestamps, keeps the restart
+    refused for as long as it answers. The ids set aside, and the run's ids
+    (kept when the run starts over) above the read a restart is accepted on,
+    are refused even above the new counter's ids until an accepted id passes
+    them (the highest ``RUN_IDS`` are kept; ``invalidate`` clears them), so a
+    frozen replica whose id the run has seen is not served after the
+    restart, however rarely it answers.
+
+    Ids alone cannot tell a frozen replica from a moving counter, so these
+    are not detected: stuck replicas whose ids first answer in rising order
+    back to back once the run is older than ``max_age_s`` are accepted as a
+    restart; a frozen replica that first answers after a restart was
+    accepted is served, since its old id is above the new counter's and a
+    higher id is accepted whatever its venue timestamp; and a replica stuck
+    on the newest accepted id is served as fresh, since an equal id received
+    later is accepted.
 
     ``invalidate`` (a stream reconnect) clears the served snapshot and the
     venue evidence, so a venue that restarted its counters cannot lock a
@@ -507,6 +555,9 @@ class BookTracker:
                 track.last_error = f'{exc.code}: {exc}'
                 raise
             if restarted:
+                # the run's ids above the one accepted did not count: they stay refused on the new counter
+                track.quarantine = _highest(track.quarantine,
+                                            [n for n in track.lower_run.seen if n > snapshot.venue_sequence])
                 track.max_sequence = None
                 track.sequence_resets += 1
                 self.sequence_resets += 1
@@ -515,6 +566,7 @@ class BookTracker:
             track.snapshot, track.invalidated, track.lower_run = stored, None, None
             if stored.venue_sequence is not None:
                 track.max_sequence = max(stored.venue_sequence, track.max_sequence or 0)
+                track.quarantine = tuple(n for n in track.quarantine if n > track.max_sequence)
             if stored.venue_timestamp_ms is not None:
                 track.max_timestamp_ms = max(stored.venue_timestamp_ms, track.max_timestamp_ms or 0)
             track.accepted += 1
@@ -557,6 +609,9 @@ class BookTracker:
             raise BookError(BOOK_OUT_OF_ORDER, f'{snapshot.symbol} book was received before the book was '
                                                f'invalidated ({track.invalidated or "invalidated"})')
         sequence, timestamp = snapshot.venue_sequence, snapshot.venue_timestamp_ms
+        if sequence is not None and sequence in track.quarantine:
+            raise BookError(BOOK_OUT_OF_ORDER, f'{snapshot.symbol} venue sequence {sequence} was set aside while the '
+                                               'venue restarted its ids (a replica frozen above the live ids)')
         restarted = False
         if sequence is not None and track.max_sequence is not None:
             if sequence < track.max_sequence:
@@ -592,25 +647,56 @@ class BookTracker:
         """Record a venue id lower than the newest accepted; True once the run of them shows a counter restart.
 
         A run starts at the first lower id received after the stored book and
-        ends with the next accepted snapshot; it keeps its highest id and how
-        many reads rose above it. A lower id received before the run's last
+        ends with the next accepted snapshot; it keeps its highest id, when
+        that id was last received, and how many reads rose above it since the
+        count last started over. A lower id received before the run's last
         one (handed over late) adds nothing. One below the run's first starts
-        a new run, since it could be a second restart. Any other id keeps the
-        run, but only a read that rises above the run's highest, for at least
-        the second time, can show the restart: an id the run has seen (a stuck
-        replica) or one below its highest (a lagging replica, or a live one
-        below an id frozen before the restart) never does.
+        a new run, since it could be a second restart; the new run keeps the
+        ids seen before. Any other id keeps the run, but only a read that
+        rises above the run's highest, after another rise that nothing has
+        started over since, can show the restart:
+        - an id below the highest (a lagging replica, or a live one below an
+          id frozen before the restart) adds nothing;
+        - the highest id received again right after a lower one (a source
+          stuck on it, taking turns with another) starts the count of rises
+          over; read again right after itself, it changes nothing;
+        - one whose venue timestamp is more than ``TIMESTAMP_REGRESSION_S``
+          older than the run's newest is not the live counter's: it does not
+          count, and stays refused once the restart is accepted;
+        - once the highest has not been received again for longer than
+          ``max_age_s``, the next lower read becomes the run's highest, the
+          count starts over, and the ids of the run above it are set aside
+          (refused until ``max_sequence`` passes them).
         """
-        mono, sequence = snapshot.received_mono, snapshot.venue_sequence
+        mono, sequence, stamp = snapshot.received_mono, snapshot.venue_sequence, snapshot.venue_timestamp_ms
         stored, run = track.snapshot, track.lower_run
-        if (stored is not None and mono <= stored.received_mono) or (run is not None and mono < run[3]):
+        if (stored is not None and mono <= stored.received_mono) or (run is not None and mono < run.last_mono):
             return False
-        if run is None or sequence < run[1]:
-            track.lower_run = (mono, sequence, sequence, mono, 0)
+        if run is None or sequence < run.first:
+            # a run started over keeps the ids seen before, so one frozen above the live ids is still set aside
+            track.lower_run = _Run(start=mono, first=sequence, highest=sequence, highest_mono=mono, last_mono=mono,
+                                   last_id=sequence, stamp_ms=stamp,
+                                   seen=_highest(run.seen if run is not None else (), [sequence]))
             return False
-        rises = sequence > run[2]
-        track.lower_run = (run[0], run[1], max(run[2], sequence), mono, run[4] + rises)
-        return rises and run[4] >= 1 and mono - run[0] > self.max_age_s
+        previous, run.last_mono, run.last_id = run.last_id, mono, sequence
+        run.seen = _highest(run.seen, [sequence])
+        if stamp is not None:
+            if run.stamp_ms is not None and (run.stamp_ms - stamp) / 1000 > TIMESTAMP_REGRESSION_S:
+                return False
+            run.stamp_ms = stamp if run.stamp_ms is None else max(stamp, run.stamp_ms)
+        if sequence > run.highest:
+            shows = run.rises >= 1 and mono - run.start > self.max_age_s
+            run.highest, run.highest_mono, run.rises = sequence, mono, run.rises + 1
+            return shows
+        if sequence == run.highest:
+            run.highest_mono = mono
+            if previous < sequence:
+                run.rises = 0
+        elif mono - run.highest_mono > self.max_age_s:
+            track.quarantine = _highest(track.quarantine, [n for n in run.seen if n > sequence])
+            run.seen = tuple(n for n in run.seen if n <= sequence)
+            run.highest, run.highest_mono, run.rises = sequence, mono, 0
+        return False
 
     def latest(self, symbol: str, *, now_mono: float, max_age_s: float | None = None) -> BookSnapshot | None:
         """The stored snapshot when it is valid and no older than the limit, else None.
@@ -669,7 +755,7 @@ class BookTracker:
             tracks = [self._tracks.setdefault(symbol, _Track())]
         for track in tracks:
             track.snapshot, track.invalidated, track.lower_run = None, reason, None
-            track.max_sequence, track.max_timestamp_ms = None, None
+            track.max_sequence, track.max_timestamp_ms, track.quarantine = None, None, ()
             if fence is not None:
                 track.fence_mono = fence if track.fence_mono is None else max(fence, track.fence_mono)
 

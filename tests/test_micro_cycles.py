@@ -2172,6 +2172,38 @@ def test_a_venue_id_restart_while_held_recovers_the_profit_exit_under_a_lagging_
     assert_ledger_consistent(w)
 
 
+def test_a_venue_id_restart_while_held_recovers_after_one_read_from_a_replica_behind_the_restart(world):
+    w = world()
+    offset = {'ids': 7_000_000_000}
+    offset_depth_ids(w, 'ETH/USDT', offset)
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    books = w.engine.micro.books
+    last = books.status(w.clock.monotonic())['ETH/USDT']['sequence']
+    served, leading = [], w.exchange.fetch_order_book
+
+    def replicas(name, limit=None, params=None):
+        book = leading(name, limit, params)
+        if name == 'ETH/USDT' and offset['ids'] == 0:
+            if len(served) == 1:
+                # once, right after the first live read, a replica a few seconds behind answers with an id from
+                # the old counter: below the last accepted one, above every new one (prices and stamp are live)
+                book['nonce'] = last - 5
+            served.append(book['nonce'])
+        return book
+    w.exchange.fetch_order_book = replicas
+    offset['ids'] = 0                                    # the venue restarted its lastUpdateId counter
+    assert w.run(120, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    closed = micro.load_cycle(held['cycle_id'])
+    assert closed['last_exit_trigger'] == 'take_profit', closed['last_exit_trigger']   # depth came back
+    assert last - 5 in served
+    row = books.status(w.clock.monotonic())['ETH/USDT']
+    assert row['sequence_resets'] == 1 and row['sequence'] < 7_000_000_000 and row['state'] == 'fresh'
+    # the pair enters again without a process restart
+    assert w.run(120, until=lambda: any(c['state'] in micro.OWNING_STATES and c['cycle_id'] != held['cycle_id']
+                                        for c in w.cycles(symbol='ETH/USDT')))
+    assert_ledger_consistent(w)
+
+
 @pytest.mark.parametrize('stamped', [False, True])
 def test_a_replica_frozen_before_a_venue_id_restart_never_prices_a_held_cycle(world, stamped):
     w = world()
@@ -2217,7 +2249,14 @@ def test_a_replica_frozen_before_a_venue_id_restart_never_prices_a_held_cycle(wo
     assert all(t['price'] > (frozen['bids'][0][0] + live_bid) / 2 for t in sales), (sales, frozen['bids'][0])
     assert w.engine.micro.latch() is None                  # no false loss latch
     row = books.status(w.clock.monotonic())['ETH/USDT']
-    assert row['sequence_resets'] == 0 and row['sequence'] == last
+    if stamped:
+        # the venue's clock places the frozen book 120 s before the live ones, so it is not the live counter's
+        # newest: the restart is accepted on the live reads, depth prices the exit, and the frozen id stays refused
+        assert row['sequence_resets'] == 1 and row['sequence'] < 7_000_000_000
+        assert cycle['last_exit_trigger'] == 'take_profit', cycle['last_exit_trigger']
+    else:
+        # ids alone cannot show the frozen replica is not the live counter while it answers this often
+        assert row['sequence_resets'] == 0 and row['sequence'] == last
     assert_ledger_consistent(w)
 
 

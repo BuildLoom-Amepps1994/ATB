@@ -9,7 +9,7 @@ overlap the full suite and are never added to it.
 | Item | Value |
 |---|---|
 | Branch | `claude/project-thread-vqle7r`, from main `b1e0217` |
-| Code commit tested | `82913ca` (the commits after it change documentation and recorded results only; `git diff 82913ca HEAD -- '*.py' '*.js' '*.html' '*.cjs' '*.yml' '*.iss' '*.txt'` is empty) |
+| Code commit tested | `0194483` (the commits after it change documentation, recorded results and the docstring of `benchmarks/bench_storage.py` only; `git diff 0194483 HEAD -- '*.py' '*.js' '*.html' '*.cjs' '*.yml' '*.iss' '*.txt'` shows only that docstring) |
 | Host | Linux cloud container, 4 CPUs, Python 3.13.17, Node 22.22.0 |
 | Dependencies | `requirements-lock.txt` as on main (ccxt 4.5.90, pandas 3.1.0) |
 | Isolation | `tests/conftest.py` sets a new temporary `CRYPTOPILOT_DATA_DIR` and `LOCALAPPDATA`, the null keyring backend and no update checks before any application module is imported, removes every proxy variable, refuses every connection, datagram, bind and name lookup that is not local (loopback, `localhost` or the wildcard address), answers local lookups itself so none reaches a DNS server, and blocks uvloop and winloop, in child Python processes too (`scripts/offline_net.py`). Every pytest and benchmark command below also exported a new `CRYPTOPILOT_DATA_DIR` under `/tmp` and `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring` first; the soak sets both itself for its `--data-dir` folder |
@@ -20,33 +20,52 @@ overlap the full suite and are never added to it.
 
 ```
 export CRYPTOPILOT_DATA_DIR=$(mktemp -d /tmp/claude-0/cp-XXXX) PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring
-python -m pytest tests -p no:cacheprovider --durations=15 -rfEs
+unshare -n sh -c "python -I <scratch>/lo_up.py && exec python -m pytest tests -p no:cacheprovider --durations=15 -rfEs"
 node --test tests/test_dashboard.js
 ```
 
+The suite ran in a clean `git worktree` of `0194483` inside an empty network
+namespace (`unshare -n`), so nothing in it could reach any network even past
+the test guard. A new namespace has its loopback interface down, so a short
+script (`lo_up.py`, not in the repository: it reads the interface flags of
+`lo` and sets `IFF_UP` with one `SIOCSIFFLAGS` call) brought it up first;
+three tests need loopback (see *Focused runs*).
+
 | Suite | Passed | Failed | Skipped | Errors | Duration |
 |---|---|---|---|---|---|
-| `pytest tests` (Python 3.13.17), on `82913ca` (a clean `git worktree` of it) | 1542 | 0 | 0 | 0 | 389.9 s, alongside the research rerun |
-| `node --test tests/test_dashboard.js` (Node 22.22.0), on `82913ca` | 19 | 0 | 0 | 0 | 0.2 s |
+| `pytest tests` (Python 3.13.17), on `0194483` | 1629 | 0 | 0 | 0 | 384.5 s, with nothing else on the host but the agent's own file reads and edits and a short 25 USDT feasibility recompute (see *Focused runs*) |
+| `node --test tests/test_dashboard.js` (Node 22.22.0), on `0194483` | 24 | 0 | 0 | 0 | 0.2 s |
 
 The two pytest warnings are aiohttp's `enable_cleanup_closed` deprecation
 notice from the websocket tests, unrelated to this change.
 
 **Intermittents.** None seen in the final runs or in the focused runs before
-them. No test was retried to get a pass, and no timeout was raised. The cycle
-tests run on a fixture clock (`FixtureClock`) that adds each tick's real
-duration to its fixed step, so a slow host can still change them: review
-round 3 found one such test and it was fixed, and every cycle test passed with
-each tick slowed by 15 ms (see *Focused runs*).
+them. No test was retried to get a pass, and no timeout was raised. The
+suite recorded above is the second full Linux run on `0194483` (the Windows
+CI run of `0194483` under *Focused runs* is separate, and it passed): the
+first attempt ran in a namespace whose loopback interface was still down and failed the
+three tests that need loopback (see *Focused runs*), and the suite was run
+again only after `lo_up.py` brought loopback up, with no test or timeout
+changed. The cycle tests run on a fixture clock (`FixtureClock`) that adds
+each tick's real duration to its fixed step, so a slow host can still change
+them: review round 3 found one such test and it was fixed, and every cycle
+test of `9535a55` (58; the file now has 108, 116 cases) passed with each tick
+slowed by 15 ms (see *Focused runs*); the cycle tests added since were not
+run that way.
 
-**Changed expectations.** Three pre-existing test files changed. In
+**Changed expectations.** Four pre-existing test files changed. In
 `tests/test_recovery.py` the expected database schema version moved from 3 to
 4, for the new micro tables. In `tests/test_launcher.py`,
 `test_browser_readiness_uses_loopback_http_without_tls_or_proxies` now
 removes `NO_PROXY` and `no_proxy` before it runs, because the suite's
 `NO_PROXY=*` would otherwise hide a launcher that used a proxy; its
-assertions are unchanged. `tests/test_dashboard.js` gained three micro panel
-tests and imports two more helpers; its existing tests are unchanged.
+assertions are unchanged. `tests/test_dashboard.js` gained eight micro panel
+tests (16 on main, 24 now) and imports four more helpers (`microAmount` and
+`microView` at the top, `microRecoveryPrompt` and `microDuration` inside
+their tests); its existing tests are unchanged. `tests/test_quote_feed.py`
+gained one test (`test_a_stream_quote_keeps_only_the_sizes_sent_with_its_prices`,
+`2ade2b0`: stream quotes keep only the sizes sent with their prices); its
+existing tests are unchanged.
 No pre-existing test was deleted, skipped or marked.
 
 ## Focused runs during development
@@ -85,6 +104,14 @@ after each change; they are not added to the totals above.
 | Windows CI on `6aeeb01` | the full suite on `windows-latest`, Python 3.14.9 | 1530 passed, 1 failed, 8 skipped and 2 errors, 823.4 s, all in the new `tests/test_micro_commission.py`: one parametrized case's id was its 200,000-character argument, which pytest puts in `PYTEST_CURRENT_TEST` and Windows refuses above 32767 characters (an error at setup and at teardown), and the static no-caller test walked the runner's build venv inside the checkout (`.build-venv`) and stopped at CCXT's `ccxt/abstract/kucoin.py`, whose KuCoin endpoint name `privateGetTradeFees` contains the forbidden spelling `gettradefee` (the message of `82913ca` names `fetch_trading_fee` instead, in error). Both fixed in `82913ca`, each with a test that fails without its fix (the longest collected id is now 490 characters) |
 | Windows CI on `82913ca` | the full suite on `windows-latest`, Python 3.14.9, then the installer build and its smoke tests | 1534 passed, 0 failed, 8 skipped, 698.2 s; the installer built and both smoke tests passed. 1534 plus 8 is the Linux count of 1542. Eight is the number of tests that skip on Windows: the seven cases of the pre-existing `tests/test_updater.py::test_publish_job_never_replaces_or_outranks_a_release` (marked to skip on win32) and this branch's netlink test in `tests/test_offline_guard.py` (no `AF_NETLINK` on Windows); the log, from `pytest -q`, does not name them |
 | Check of the fourth wall-clock run's STALE_DATA samples | `scripts/micro_soak.py --minutes 5 --fixture --sample-seconds 1`, side by side on `fb52624` (exported with `git archive`) and `ec3c59f` | Both completed with no fault. Over 5 bar closes each, every pair not holding a cycle showed STALE_DATA starting 0 to 2 s after every close and lasting 5 to 7 s on `fb52624` and 5 to 6 s on `ec3c59f` (13 spells in each run): the documented wait for the new bar's candles |
+| Full suite at `82913ca` (a clean `git worktree` of it; the final run of the earlier candidate) | `tests`; `node --test tests/test_dashboard.js` | 1542 passed, 0 failed, 0 skipped, 389.9 s, alongside the research rerun; dashboard 19 passed |
+| After each fix of the reviews of 27 October (`f2b8f9a` to `7d7e8af`), before its commit | the test files the fix touched, and the cycle, strategy, economics, venue and book tests (from the second round on also the research tests) | All passed every time (for example 581 tests at `290f0d5`, 666 at `dc3c5f6` and 675 at `7d7e8af`). Each new test was first run against the code before its fix and failed there |
+| Full suite at `5d82c36` (a clean `git worktree`), after the first round of those fixes | `tests`; `node --test tests/test_dashboard.js` | 1580 passed, 0 failed, 0 skipped, 319.7 s; dashboard 23 passed |
+| Windows CI on `0194483` | the full suite on `windows-latest`, Python 3.14.9, then the installer build and its smoke tests ([run 40547916253](https://github.com/BuildLoom-Amepps1994/ATB/actions/runs/40547916253)) | 1621 passed, 0 failed, 8 skipped (eight, as on `82913ca`; the log does not name them), 1112.3 s; the installer built and both smoke tests passed. 1621 plus 8 is the Linux count of 1629. The test step took 1112 s against 698 s on `82913ca`; the part of the run where `tests/test_micro_cycles.py` runs (about 30 to 37.5 % of the tests, between the log's 30 % and 39 % marks; it has 108 test functions, 116 collected cases, now against 58) took about 12.6 minutes. Not diagnosed further; no timeout was raised or needed |
+| Full suite at `0194483` in an empty network namespace with loopback down (the first attempt of the final run, alongside the research rerun) | `tests` | 1626 passed and 3 failed, 430.1 s: `tests/test_offline_guard.py::test_local_lookups_are_answered_without_the_resolver` and `::test_a_datagram_to_a_remote_address_is_refused_and_one_to_loopback_is_sent` with "Network is unreachable" on loopback, and `tests/test_launcher.py::test_browser_readiness_uses_loopback_http_without_tls_or_proxies` because its readiness probe never reached the local server in its 30 s ("The dashboard did not open automatically"; the launcher drops the connection error). A new namespace leaves loopback down. With loopback up all three passed (*Final runs*); no test or timeout was changed |
+| Storage calls and reads per micro tick, after the micro benchmarks | two scratch scripts (not in the repository) that build the benchmark's tick on `483d204`, `9535a55` and `0194483` and record the fixture's reads, over 30 ticks between bars: the first wraps `storage.connection` (8 pairs, 0 ms, and with one holding at 150 ms); the second counts every SQLite connection and profiles the tick (1 pair with and without a holding and 8 pairs with one, 0 ms, `9535a55` and `0194483`, twice each) | 52, 67 and 110 storage calls per 8-pair tick with no holding (62 and 106 with a holding on the last two); the wrapper of `storage.connection` misses the paper venue's 8, or 7, order reads, which bind it as a default argument. Of the final code's extra 43, 42 are the entry gates read again before every pair after the first (six calls for each of the seven later pairs, `290f0d5`) and one is the legacy monitor's check of positions the micro cycles do not own (`4873e5b`; two calls with a holding). A 1-pair tick with a holding made 15 calls against 13, the monitor's two. Reads per tick were the same at 0 ms; with a holding at 150 ms both `9535a55` and `0194483` read the holding's book twice per tick under the profiler (29 and 30 of 30 ticks). `docs/ATB_MICRO_PERFORMANCE.md`, *Micro paths* |
+| 25 USDT feasibility table, recomputed | the production sizing on each research fixture at its middle bar, as in `docs/ATB_MICRO_ECONOMICS.md`, on `82913ca` and on `0194483` (a scratch script, not in the repository) | Every figure equal on both commits and to the table in `docs/ATB_MICRO_ECONOMICS.md`: the fixes of 27 October changed how a thin bid side prices the entry, and these fixture books are deep |
+| Book age at the smoke's entry decision, after the fifth wall-clock run | two 4-minute `scripts/micro_soak.py --fixture` runs side by side, on copies of `ec3c59f` and `5d82c36` that log every order-book read and its caller | The one entry's book was 3002.6 ms old on `ec3c59f` and 3.98 ms on `5d82c36`, the reverse of the fourth and fifth runs (5.97 and 2062.4 ms). A pair whose setup is plausible reads its book every 3 s (`ENTRY_BOOK_SECONDS`) and the entry decision uses the latest, so the age is where that cadence falls against the retry after a bar close, not a code change |
 
 ## Reviews
 
@@ -381,6 +408,133 @@ after each change; they are not added to the totals above.
   research cycle reaches the target, which holds for ETH (the strategy and
   the always-enter baseline) but not for the always-enter baseline on ADA
   and BTC, which closed some cycles by take profit.
+* **Review of the changes that had no review of their own** (27 October):
+  seven reviewers, each finding then checked by a separate verifier that
+  reproduced it. The commits: the paper venue's review fixes (`8d7c77b`,
+  `4798b79`, `0fc0a9f`), the economics and order-book review fixes
+  (`d1e2f76`, `ea17eb2`), the strategy review fix and the stop redesign
+  (`483d204`, `3fa738b`), the integration fixes in `micro.py` and in
+  `trader.py` and `market_data.py` (`e952857`), the legacy monitor's query
+  (`d51ca7f`), the dashboard panel and the micro API (`45928fd`, `app.py`),
+  and the last guard and test fixes (`ec3c59f`, `82913ca`, `6a99295`,
+  `3c0c45d`). 20 findings were confirmed (2 high, 6 medium, 12 low) and 1
+  rejected. All 20 were fixed in `f2b8f9a`, `290f0d5`, `4873e5b`, `2ade2b0`,
+  `51852de` and `5d82c36`, each with a test that failed before its fix:
+  * High: the entry cost was priced at the best bid while the exit estimate
+    walks the bids, so on a thin bid side the stop fired on the first check
+    and the cycle lost more than the loss cap. The entry cost, break-even and
+    required move now come from selling the whole holding into the bids (the
+    larger of that and the best-bid figure), and such a book is not entered.
+  * High: the entry gates were read once per pass, so after a contained
+    booking failure, an unknown outcome or a latch engaged during the pass,
+    the next pair could still enter in the same pass. They are read again
+    before every pair and checked again inside the reservation.
+  * Medium: with streaming on, a safety exit with no depth book could never
+    fill, because stream quotes carried no size (stream quotes now keep the
+    sizes sent with their prices, and a sale without one reads the REST book
+    ticker); after a venue restarted its order-book update ids, the pair's
+    depth was refused until the app restarted (see the later rounds); after
+    a partial stop sale the rest kept the whole position's stop amount, so
+    the cycle's loss could pass the cap (the stop now counts the loss
+    already realized); a late fill on a closed cycle treated the whole
+    ledger position as micro inventory and could adopt a manually bought
+    position; a remainder that a later cycle carried and sold stayed
+    recorded on its closed cycle, so the legacy monitor skipped a later
+    non-micro position on that pair; and non-micro positions held while the
+    micro strategy ran had their stored stop checked only once per micro
+    tick.
+  * Low: profit protection could fire on the way up when the uncertainty
+    exceeded half the target; a loss cap between 20 and 25 bps was reported
+    as "too volatile" with a wrong figure; a sizing failure was reported as
+    an unnamed sizing result; the book invalidation fence could let in a
+    snapshot received before it; a booking failure during a stopped *Exit
+    all* left the cycle with no recovery; a catalogue loaded outside the
+    micro pass was not adopted; the delay one held-cycle catalogue attempt
+    can cause was understated three-fold; the recovery panel did not show
+    the venue record it books; a closed cycle's last estimate showed on the
+    next cycle of the pair; book and estimate ages were frozen at decision
+    time; an unknown duration showed as "0 s"; and the test network guard
+    passed an empty host name to the system resolver.
+  * Rejected: a mis-stamped first receipt becoming the mixed-clock
+    reference; no code path can produce one, and it fails closed.
+* **Review of those six fix commits**: six reviewers and their verifiers. 13
+  findings were confirmed (2 medium, 11 low) and none rejected. The medium
+  ones: the micro-owned pair query of `4873e5b` grew with the square of the
+  micro cycle rows (about 1 s at 2000 rows and 7 s at 5000, holding the
+  storage lock on every protective tick, micro tick and legacy dashboard
+  poll), and a venue record that could not be read was still taken for "no
+  late fill" by the review and closed-cycle recoveries, which could clear a
+  block without booking the fill. The low ones: held-cycle break-even and
+  target bids priced as one sale at the best bid; a stop reason that did not
+  name the realized loss; a late sale refused with advice to sell an outside
+  position, which could not help; an interrupted cycle booked by one
+  confirmation without its venue record shown; the legacy monitor running
+  ahead of the held cycles' own checks; the catalogue bound still stated as
+  18 s in two documents; a venue id restart that a lagging replica could keep
+  from recovering; the recovery row and panel disagreeing after a restart;
+  recovery notes that were never pruned; and two statements in these
+  documents (the research and smoke runs described as the final code's, and
+  a stale test count). Fixed in `31549d9`, `4f084ac`, `c8b8eea`, `499406f`
+  and `45593a8`, each with a test that failed before its fix; the two
+  statements are corrected here.
+* **Review of those five commits**: 3 confirmed. Medium: the lagging-replica
+  change let a replica stuck on one id count as a rising run, so after a
+  counter restart a frozen pre-restart book could be served and the live
+  books refused. Low: the owned-pair query still walked the whole history
+  once for each position outside the cycles (a partial index now makes each
+  lookup one seek), and on an exhausted book near the best bid the held-cycle
+  bids used the single-price figure. Fixed in `5e152e4`, `5961564` and
+  `9b12677`.
+* **Review of those three commits**: 3 confirmed. Medium: one old-counter id
+  received once inside a restart run blocked the pair's depth until the app
+  restarted. Low: stuck ids could still supply the rise that shows a
+  restart, and register item 14 still gave the old schema size. Fixed in
+  `4cfc166` and here.
+* **Review of `4cfc166`**: 3 confirmed. Medium: a frozen id that the run had
+  seen before it started over could itself be the read the restart was
+  accepted on. Low (two): the stated limits of the restart check were
+  incomplete. Fixed in `dc3c5f6`, which also states the limits that ids
+  alone cannot remove (register item 18).
+* **Review of `dc3c5f6`**: no finding. The reviewer reverted the fix in a copy
+  (its new tests then fail), and a fuzz of 3000 seeds at each of four read
+  cadences found no frozen id the run had received being accepted or served,
+  and no pair left without depth.
+* **The remainder of a partial exit** (a note by the verifier of one finding
+  in the first review above, handled after the rounds): after a partial
+  sale, `_book_exit` kept the cycle HOLDING when its rest passed the minimum
+  amount but not the venue's minimum order value, so the cycle kept its
+  pair's slot until an exit trigger (at the latest the maximum hold, 30
+  minutes by default) before
+  `_sell` closed it as a residual. Fixed in `c41b7d1` with a test that failed
+  before it. Its review (one reviewer, and a verifier for each finding) confirmed 2 low
+  findings: the rest was judged at the fill price, below the best bid at
+  which `_sell` and the paper venue judge a sale, so a rest that could still
+  be sold was closed as a residual and, on a market whose limit and market
+  minimums are equal, kept new micro entries off the pair while the bid held;
+  and no test reached `_sell`'s own close of an unsellable remainder any
+  more. Both were fixed in `7d7e8af`, each with a test that failed before
+  it: the rest of a sale is judged at the best bid of the book the sale was
+  priced on (an exit recovery, which has no book, judges only the amount step
+  and the minimum amount), and the exit check now closes at once, with no
+  order sent, a holding that no sale could be sent for at the current best
+  bid, through `_sell`'s own close, which two tests now reach. The review of
+  `c41b7d1` and `7d7e8af` together confirmed 1 low finding: the architecture,
+  contract and operations pages said a rest is always judged at the sale's
+  best bid, which an exit recovery does not do; corrected in `2fc1a49`.
+* **Fact-check of the final runs' documents** (27 October, after the final
+  runs): six checkers, each finding checked by a separate verifier, on the
+  changes to these documents and the changelog against the logs and result
+  files, and a review of `benchmarks/bench_storage.py`. 27 findings confirmed
+  (1 rejected), all corrected. Among them: storage calls per micro tick that
+  a wrapper of `storage.connection` had undercounted (the paper venue binds
+  it as a default argument), the legacy monitor's check counted as a gate
+  read, an untraced slowdown of the 1-pair tick with a holding (since traced
+  in part, *Focused runs*), and the docstring of `bench_storage.py` naming
+  the wrong statement as the one that parses the schema. The benchmark itself
+  was found sound: its counts match the real connection count on both trees,
+  and it runs unchanged on main. A check of those corrections (four checkers
+  and their verifiers) confirmed 11 more, all small (rounding, scope and
+  wording), all corrected.
 
 ## Brief test matrix (items 1 to 30)
 
@@ -399,7 +553,7 @@ real exchange.
 | 7 | Flat executable prices lose with positive costs | `test_micro_economics.py::test_flat_executable_prices_lose_with_positive_costs`, `::test_flat_net_matches_an_independent_round_trip_at_an_unchanged_price`; `test_micro_cycles.py::test_the_maximum_hold_closes_a_flat_position_at_a_labeled_loss` |
 | 8 | A gross gain below costs is not a net-profit exit | `test_micro_economics.py::test_a_gross_gain_below_costs_is_not_a_net_profit`; `test_micro_strategy.py::test_a_gross_gain_below_costs_never_takes_profit` |
 | 9 | Break-even and target math in every unit, no double counting | `test_micro_economics.py::test_simple_break_even_and_target_ratios_match_the_brief_in_every_unit`, `::test_sensitivity_rows_are_exact_strings_in_percent_bps_and_ratio`, `::test_a_depth_walk_adds_no_flat_slippage_and_bids_are_not_charged_the_spread_again`, `::test_latency_margin_is_applied_once_per_leg` |
-| 10 | Partial-close P/L plus residual basis conserves ownership and cash | `test_micro_economics.py::test_partial_closes_conserve_ownership_basis_and_cash_exactly`, `::test_an_exit_estimate_keeps_the_residual_and_its_share_of_the_basis`; `test_micro_cycles.py::test_a_partial_entry_owns_exactly_what_filled_and_the_exit_sells_exactly_that` |
+| 10 | Partial-close P/L plus residual basis conserves ownership and cash | `test_micro_economics.py::test_partial_closes_conserve_ownership_basis_and_cash_exactly`, `::test_an_exit_estimate_keeps_the_residual_and_its_share_of_the_basis`; `test_micro_cycles.py::test_a_partial_entry_owns_exactly_what_filled_and_the_exit_sells_exactly_that`, `::test_a_partial_exit_whose_rest_is_below_the_minimum_order_cost_closes_at_once_and_keeps_it_as_residual`, `::test_a_partial_exit_whose_rest_meets_the_minimum_at_the_sales_best_bid_stays_managed_and_is_sold`, `::test_a_held_rest_that_falls_below_the_minimum_at_the_bid_closes_at_the_next_exit_check_without_a_trigger` |
 | 11 | Bounded Decimal parsing, adversarial inputs | `test_money_and_venue_rules.py::test_parse_refuses_bool_missing_nonfinite_huge_and_malformed`, `::test_error_messages_never_echo_the_value`; `test_micro_book.py::test_nonfinite_negative_zero_bool_and_garbage_levels_are_refused`; `test_micro_economics.py::test_adversarial_book_levels_are_refused` |
 | Budget revision | 25 is a cap, not a floor; budgets scale; no research change to the cap | `test_micro_economics.py::test_the_cap_is_not_a_venue_floor_and_a_smaller_budget_stays_bounded`, `::test_metadata_can_show_a_minimum_below_or_above_the_cap`, `::test_proportional_break_even_is_budget_independent_and_absolute_losses_scale`, `::test_minimum_fee_rounding_and_depth_impact_make_small_and_large_budgets_differ`, `::test_no_research_comparison_can_raise_the_cap`, `::test_no_compounding_and_no_upsizing_from_cash_or_allocation` |
 | 12 | Favorable fixture completes buy, hold, sell and a distinct rebuy through the real path (mechanics fixture) | `test_micro_cycles.py::test_mechanics_fixture_runs_buy_hold_sell_and_a_distinct_rebuy`, `::test_one_start_runs_cycles_with_no_further_input` |
@@ -413,7 +567,7 @@ real exchange.
 | 20 | Loss exits need no profit, entry signal or buy depth | `test_micro_cycles.py::test_a_stop_loss_exit_needs_no_profit_no_entry_signal_and_no_depth_book`; `test_micro_strategy.py::test_safety_exits_fire_without_depth_and_without_any_profit`; `test_micro_economics.py::test_exhausted_bid_depth_in_a_crash_still_gives_safety_exits_a_conservative_loss`, `::test_unknown_depth_blocks_entries_but_exits_use_the_flat_fallback` |
 | 21 | A removed pair's holding stays monitored | `test_micro_cycles.py::test_a_pair_removed_from_the_selection_keeps_its_holding_managed`, `::test_a_residual_on_a_pair_that_left_the_selection_keeps_a_fresh_mark`, `::test_a_residual_on_a_selected_pair_with_no_setup_keeps_its_mark_inside_the_age_limit`, `::test_a_residual_on_a_plausible_pair_leaves_its_3_s_book_cadence_alone` |
 | 22 | Kill, loss, drawdown, reject and order-rate stops cannot self-clear | `test_micro_cycles.py::test_consecutive_losses_latch_and_only_the_phrase_clears_it`, `::test_the_kill_switch_blocks_micro_entries_until_released`, `::test_the_daily_micro_loss_limit_latches`, `::test_a_loss_limit_reached_just_before_a_crash_latches_at_the_next_start`, `::test_a_loss_limit_check_that_failed_after_a_close_runs_before_the_next_entry`, `::test_the_micro_stop_is_carried_to_another_exchange`; `test_risk_gate.py::test_order_rate_limit_blocks_entries_and_only_runaway_exits` and the rest of that file |
-| 23 | Stale, crossed, empty books; clock rollback; future timestamps; out of order; reconnect reset | `test_micro_book.py` (46 tests), for example `::test_crossed_and_locked_books_are_refused`, `::test_future_venue_timestamps_are_refused_after_the_clock_offset`, `::test_wall_clock_rollback_while_monotonic_advances_invalidates_every_symbol`, `::test_lower_update_id_is_out_of_order_and_the_stored_book_is_kept`, `::test_invalidate_on_reconnect_stops_serving_and_starts_the_evidence_over`; `test_micro_cycles.py::test_a_pair_with_no_possible_setup_reads_its_book_for_each_new_decision_and_otherwise_every_30_s`, `::test_a_forced_read_reuses_only_a_book_under_half_its_age_limit`, `::test_after_a_memory_reset_an_idle_pair_reads_its_book_for_its_next_decision`. A real sequence-gap check is not implemented: depth comes from REST snapshots (register item 7) |
+| 23 | Stale, crossed, empty books; clock rollback; future timestamps; out of order; reconnect reset | `test_micro_book.py` (63 test functions, 189 cases), for example `::test_crossed_and_locked_books_are_refused`, `::test_future_venue_timestamps_are_refused_after_the_clock_offset`, `::test_wall_clock_rollback_while_monotonic_advances_invalidates_every_symbol`, `::test_lower_update_id_is_out_of_order_and_the_stored_book_is_kept`, `::test_invalidate_on_reconnect_stops_serving_and_starts_the_evidence_over`; `test_micro_cycles.py::test_a_pair_with_no_possible_setup_reads_its_book_for_each_new_decision_and_otherwise_every_30_s`, `::test_a_forced_read_reuses_only_a_book_under_half_its_age_limit`, `::test_after_a_memory_reset_an_idle_pair_reads_its_book_for_its_next_decision`. A real sequence-gap check is not implemented: depth comes from REST snapshots (register item 7) |
 | 24 | Backpressure, feed loss, REST fallback, rate limits, safe-read retries; Stop keeps confirming an accepted order | `test_quote_feed.py` (for example `::test_unread_quotes_are_coalesced_not_queued`, `::test_feed_is_unhealthy_after_a_heartbeat_lapse_and_refuses_old_quotes`, `::test_feed_start_failure_leaves_rest_polling_in_charge`); `test_market_data.py::test_rate_limit_enters_cooldown_without_retry_burst`; `test_micro_cycles.py::test_stop_during_an_accepted_order_still_books_its_fill`, `::test_a_venue_that_publishes_the_bar_late_is_retried_at_a_bounded_rate` |
 | 25 | Slow chart, backtest or catalogue work cannot starve protection | `test_micro_cycles.py::test_slow_candle_downloads_do_not_starve_the_exit_checks`, `::test_a_held_cycle_defers_the_catalogue_refresh_then_makes_one_attempt_after_its_exit_check`, `::test_without_a_holding_a_failing_catalogue_refresh_keeps_its_retries_and_waits_before_the_next`; `test_engine_integrity.py` (chart and backtest reads refused while the worker runs). Residual: one catalogue attempt can take three sequential requests on MEXC (about 54 s) and two on Kraken (about 36 s, plus up to 1 s of pacing before the first request) (register item 12) |
 | 26 | No maker fill on touch; takers never charged maker fees; explicit adverse assumptions | `test_micro_venue.py::test_liquidity_is_always_taker_and_a_lower_maker_rate_is_never_charged`, `::test_adverse_bps_moves_every_level_against_the_order`, `::test_adverse_bps_also_moves_the_deeper_levels_an_order_walks_into`. The micro mode never simulates maker orders |
@@ -436,12 +590,45 @@ These are synthetic markets: the runs prove the engine runs unattended
 through bars, cycles and exits, not anything about a market. Twenty minutes
 is a smoke run, not a soak.
 
-**Fourth run, on `ec3c59f`** (whose engine paths are the final code's but
-for `money.parse`: the final code adds, in `6aeeb01`, the account-fee parser, a
-`cost_model` argument no engine path passes, and in `money.parse` a float
-read through `float`'s own repr and an exact magnitude bound, which give the
-same result for every plain float and in-range value; the working tree held only uncommitted edits to these
-documents and the research result file, so the summary records it as dirty), 01:14 to 01:34 UTC on 27 October: completed,
+**Sixth run, on `0194483`, the final code**, 17:53 to 18:13 UTC on 27
+October, in a clean `git worktree` of it, with nothing else running on the
+host but the agent's own file reads and edits (it followed the benchmarks):
+completed, 1200.0 s, 40 samples, no
+faults, PAPER throughout, worker alive in every sample, no risk block, no
+latch, no review block, no error, no STALE_DATA and no refused book. The same
+cycle closed on the mechanics fixture by take profit after 653 s, net
++0.0723 USDT, fees 0.0501 USDT, as in every earlier run. Book reads per
+minute: BTC 14.26, ETH 31.44, SOL 10.00. Two threads in every sample;
+maximum resident memory 127.0 MB at the first sample and 132.6 MB at the
+last. The summary records the source as `0194483`, clean, 37 files with
+SHA-256 `ff4e43b0...b8f926bf`, unchanged during the run, and
+`remote_network_refused` true. Its one entry decision used a book 4.1 ms
+old.
+
+**Fifth run, on `5d82c36`** (after the first round of the fixes of 27
+October; the later rounds changed `micro.py`, `micro_book.py`,
+`micro_economics.py`, `micro_strategy.py` and the dashboard, so it does not
+measure the final code), 09:41 to 10:01 UTC on 27 October: completed, 1200.0
+s, 40 samples, no faults, PAPER throughout, worker alive in every sample, no
+risk block, no latch, no review block, no error, no STALE_DATA and no refused
+book. The same cycle closed by take profit after 654 s, net +0.0723 USDT,
+fees 0.0501 USDT. Book reads per minute: BTC 14.31, ETH 31.64, SOL 11.49.
+Two threads in every sample; maximum resident memory 127.1 MB at the first
+sample and 132.9 MB at the last. The summary records the source as
+`5d82c36`, clean, 37 files with SHA-256 `fd2beecc...0cfb0725`, unchanged
+during the run, and `remote_network_refused` true. A review workflow ran
+alongside all of it, two agents at a time (four reviewers in turn, then a
+verifier for its last 27 s), reading files, running focused tests and short
+probe scripts. Its one
+entry decision used a book 2062.4 ms old, which is where the 3 s entry-book
+cadence fell, not a code change (see the book-age check under *Focused
+runs*).
+
+**Fourth run, on `ec3c59f`** (before the account-fee parser of `6aeeb01`
+and the engine, book, economics, strategy and dashboard fixes from `f2b8f9a`
+to `7d7e8af`, so it does not measure the final code; the working tree held
+only uncommitted edits to these documents and the research result file, so
+the summary records it as dirty), 01:14 to 01:34 UTC on 27 October: completed,
 1200.1 s, 40 samples, no faults, PAPER throughout, worker alive in every
 sample, no risk block, no latch, no review block, no error and no refused
 book. The same cycle closed on the mechanics fixture by take profit after
@@ -516,22 +703,24 @@ STALE_DATA in them) and wrote no summary; the third run above is its rerun.
 ## Research run
 
 `python -m research.micro_research --out <scratch folder>/micro_fixtures.json`
-in a clean `git worktree` of `6aeeb01` (protocol `micro-research-v3`; the
-result file records the commit, that the decision and research files were
-unmodified, and their hash, `4d8beb5b...7ab3297`, which `82913ca` keeps since
-it changes only a test file), run inside an empty network namespace
-(`unshare -n`), so it could not reach any network: exit 0, 03:01 to 03:30 UTC
-on 27 October, 28 min 38 s wall clock (the report records 1716.9 s); the
-file was then copied to `research/results/micro_fixtures.json`. Two full test
-suites ran alongside it, so its run time says nothing about the code.
-Compared field by field with the first version 3 run, on `cb7d082` (00:13 to
-00:41 UTC, 1704.2 s), every figure is equal; only the code identity and the
-run times differ. That run in turn equalled version 2's run on `20c7067` in
-every figure. At 25 USDT on the untouched holdout with baseline costs it
-closed 21 cycles on the ETH mechanics fixture, each by profit protection at
-about 0.0126 USDT, and none on the other four fixtures. Results and their
-meaning are in `docs/ATB_MICRO_RESEARCH.md`, including why every earlier
-fixture run is superseded. Real data: **NOT RUN**.
+in a clean `git worktree` of `0194483`, the final code (protocol
+`micro-research-v3`; the result file records the commit, that the decision
+and research files were unmodified, and their hash, `319c141a...4923971c`),
+run inside an empty network namespace (`unshare -n`), so it could not reach
+any network: exit 0, 17:09 to 17:24 UTC on 27 October, 15 min 12 s wall
+clock (the report records 911.3 s); the file was then copied to
+`research/results/micro_fixtures.json`. The full test suite ran alongside its
+first seven minutes, so its run time says nothing about the code. Compared
+field by field with the version 3 runs on `6aeeb01` (03:01 to 03:30 UTC,
+1716.9 s) and `5d82c36` (09:26 to 09:41 UTC, 881.5 s), every figure is equal;
+only the code identity and the run times, overall and per series, differ.
+The `6aeeb01` run equalled the first version 3 run, on `cb7d082`, and that run
+equalled version 2's run on `20c7067`, in every figure. At 25 USDT on the
+untouched holdout with baseline costs it closed 21 cycles on the ETH
+mechanics fixture, each by profit protection at about 0.0126 USDT, and none
+on the other four fixtures. Results and their meaning are in
+`docs/ATB_MICRO_RESEARCH.md`, including why every earlier fixture run is
+superseded. Real data: **NOT RUN**.
 
 ## Windows
 

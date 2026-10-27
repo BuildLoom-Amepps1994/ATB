@@ -82,11 +82,13 @@ version 2 said a profit exit never fills at the high, but the search does fill
 at the high when the exit first fires within 1/4096 of a step below it. It
 also adds `micro_strategy`'s numeric constants to the hash, since version 2's
 hash did not change when a stop multiple or a protection share did. The run
-reported here is the version 3 run on `6aeeb01`, whose hashed code files are
-the final code's (`82913ca` after it changes one test file). Every figure in
-its result file equals the first version 3 run, on `cb7d082`, and version 2's
-run on `20c7067`; only the protocol text and its hash (against version 2),
-the code identity and the run times differ. Every earlier fixture run is
+reported here is the version 3 run on `0194483`, the final code. Every
+figure in its result file equals the version 3 runs on `cb7d082`, `6aeeb01`
+and `5d82c36` and version 2's run on `20c7067`: the fixes after `6aeeb01`
+changed the engine, the strategy (the cycle stop, the profit-protection
+give-back rule and the loss-cap refusal code), the economics and the
+order-book checks, but none of the harness's decisions on these fixtures. Only the protocol text and its hash (against
+version 2), the code identity and the run times differ. Every earlier fixture run is
 superseded and is not evidence of anything.
 
 ## Data
@@ -142,7 +144,7 @@ The tables below are the output of
 which formats the committed result file without recomputing it. Amounts are
 USDT of simulated cash.
 
-Protocol `micro-research-v3`, SHA-256 `635c6356dd2521244c33e6917869cca854e2fe72129c80c97eb238d5f799bf34`; features `micro-features-v1`, decisions `micro-entry-v1`; run time 1716.9 s.
+Protocol `micro-research-v3`, SHA-256 `635c6356dd2521244c33e6917869cca854e2fe72129c80c97eb238d5f799bf34`; features `micro-features-v1`, decisions `micro-entry-v1`; run time 911.3 s.
 
 Real data: NOT RUN: exchange endpoints are unreachable from the build environment
 

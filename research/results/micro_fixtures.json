@@ -89,8 +89,8 @@
    "research/micro_research.py",
    "research/micro_fixtures.py"
   ],
-  "files_sha256": "4d8beb5bef99e43434a379b2ceef796b61315e2aafdf83ede50a0d0fb7ab3297",
-  "commit": "6aeeb018edfd5d7d058d6e6d906392c184e0c26e",
+  "files_sha256": "319c141a2b6dfc120fa3327b91fc90eeec00231a1d59a6e9beabed614923971c",
+  "commit": "019448306159c64137b4bd851b2db6c813cc27ec",
   "dirty": false
  },
  "series": [
@@ -119,7 +119,7 @@
     "tick": 0.01,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 9.99,
+   "feature_seconds": 5.14,
    "by_budget": {
     "10": {
      "development": {
@@ -1461,7 +1461,7 @@
     "tick": 0.0001,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 9.29,
+   "feature_seconds": 5.2,
    "by_budget": {
     "10": {
      "development": {
@@ -2806,7 +2806,7 @@
     "tick": 0.01,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 9.11,
+   "feature_seconds": 5.12,
    "by_budget": {
     "10": {
      "development": {
@@ -4157,7 +4157,7 @@
     "tick": 0.01,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 9.01,
+   "feature_seconds": 4.89,
    "by_budget": {
     "10": {
      "development": {
@@ -5495,7 +5495,7 @@
     "tick": 0.0001,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 10.11,
+   "feature_seconds": 5.29,
    "by_budget": {
     "10": {
      "development": {
@@ -7449,5 +7449,5 @@
   }
  ],
  "real_data": "NOT RUN: exchange endpoints are unreachable from the build environment",
- "runtime_seconds": 1716.9
+ "runtime_seconds": 911.3
 }

@@ -6,9 +6,9 @@ Run from the repository root:
 Like ``bench_latency.py``, the file runs unchanged in a checkout of the
 previous release, so the same command gives "before" and "after" figures.
 
-* ``schema``       the rows of ``sqlite_master`` (tables, indexes and the
-                   indexes SQLite makes for keys): the first statement on a new
-                   connection parses all of them.
+* ``schema``       the rows of ``sqlite_master`` (tables, indexes and SQLite's
+                   own rows): every new connection parses all of them, in its
+                   ``PRAGMA synchronous``.
 * ``call_ms``      the median of ``--calls`` trivial calls (default 500), each a
                    new ``storage.connection()`` and one ``SELECT 1``, after 50
                    discarded calls.

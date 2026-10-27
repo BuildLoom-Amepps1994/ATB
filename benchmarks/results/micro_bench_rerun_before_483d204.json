@@ -1,0 +1,205 @@
+{
+  "revision": "unknown",
+  "python": "3.13.17",
+  "platform": "Linux-6.18.44-fc-v165-x86_64-with-glibc2.39",
+  "repeat": 100,
+  "tick_repeat": 30,
+  "warmup": 5,
+  "cpu": {
+    "book_parse_20_levels": {
+      "count": 100,
+      "p50_ms": 0.174,
+      "p95_ms": 0.231,
+      "p99_ms": 0.246,
+      "max_ms": 0.259,
+      "tail": "p99",
+      "mean_ms": 0.183
+    },
+    "size_entry_with_minimum_search": {
+      "count": 100,
+      "p50_ms": 1.105,
+      "p95_ms": 1.232,
+      "p99_ms": 1.375,
+      "max_ms": 1.548,
+      "tail": "p99",
+      "mean_ms": 1.121
+    },
+    "estimate_exit": {
+      "count": 100,
+      "p50_ms": 0.076,
+      "p95_ms": 0.102,
+      "p99_ms": 0.106,
+      "max_ms": 0.114,
+      "tail": "p99",
+      "mean_ms": 0.08
+    },
+    "features_119x1m_59x5m": {
+      "count": 100,
+      "p50_ms": 1.584,
+      "p95_ms": 2.07,
+      "p99_ms": 2.296,
+      "max_ms": 2.515,
+      "tail": "p99",
+      "mean_ms": 1.64
+    },
+    "entry_decision_record": {
+      "count": 100,
+      "p50_ms": 0.166,
+      "p95_ms": 0.217,
+      "p99_ms": 0.269,
+      "max_ms": 0.287,
+      "tail": "p99",
+      "mean_ms": 0.176
+    },
+    "exit_decision": {
+      "count": 100,
+      "p50_ms": 0.021,
+      "p95_ms": 0.032,
+      "p99_ms": 0.051,
+      "max_ms": 0.072,
+      "tail": "p99",
+      "mean_ms": 0.023
+    }
+  },
+  "tick": [
+    {
+      "pairs": 1,
+      "holding": false,
+      "rtt_ms": 0.0,
+      "after_bar_close": {
+        "count": 30,
+        "p50_ms": 15.692,
+        "p95_ms": 23.662,
+        "max_ms": 26.17,
+        "tail": "max",
+        "mean_ms": 17.255,
+        "requests_per_tick": 2.2
+      },
+      "between_bars": {
+        "count": 30,
+        "p50_ms": 8.274,
+        "p95_ms": 12.531,
+        "max_ms": 12.941,
+        "tail": "max",
+        "mean_ms": 9.134,
+        "requests_per_tick": 1.0
+      }
+    },
+    {
+      "pairs": 4,
+      "holding": false,
+      "rtt_ms": 0.0,
+      "after_bar_close": {
+        "count": 30,
+        "p50_ms": 56.964,
+        "p95_ms": 71.485,
+        "max_ms": 72.998,
+        "tail": "max",
+        "mean_ms": 59.552,
+        "requests_per_tick": 8.8
+      },
+      "between_bars": {
+        "count": 30,
+        "p50_ms": 28.852,
+        "p95_ms": 40.364,
+        "max_ms": 54.603,
+        "tail": "max",
+        "mean_ms": 30.877,
+        "requests_per_tick": 4.0
+      }
+    },
+    {
+      "pairs": 8,
+      "holding": false,
+      "rtt_ms": 0.0,
+      "after_bar_close": {
+        "count": 30,
+        "p50_ms": 111.994,
+        "p95_ms": 149.079,
+        "max_ms": 154.866,
+        "tail": "max",
+        "mean_ms": 117.275,
+        "requests_per_tick": 17.6
+      },
+      "between_bars": {
+        "count": 30,
+        "p50_ms": 59.625,
+        "p95_ms": 75.429,
+        "max_ms": 75.478,
+        "tail": "max",
+        "mean_ms": 60.76,
+        "requests_per_tick": 8.0
+      }
+    },
+    {
+      "pairs": 1,
+      "holding": false,
+      "rtt_ms": 150.0,
+      "after_bar_close": {
+        "count": 30,
+        "p50_ms": 320.679,
+        "p95_ms": 327.174,
+        "max_ms": 328.273,
+        "tail": "max",
+        "mean_ms": 321.314,
+        "requests_per_tick": 2.2
+      },
+      "between_bars": {
+        "count": 30,
+        "p50_ms": 161.554,
+        "p95_ms": 165.45,
+        "max_ms": 170.723,
+        "tail": "max",
+        "mean_ms": 162.396,
+        "requests_per_tick": 1.0
+      }
+    },
+    {
+      "pairs": 4,
+      "holding": false,
+      "rtt_ms": 150.0,
+      "after_bar_close": {
+        "count": 30,
+        "p50_ms": 954.766,
+        "p95_ms": 1116.565,
+        "max_ms": 1117.633,
+        "tail": "max",
+        "mean_ms": 987.692,
+        "requests_per_tick": 8.8
+      },
+      "between_bars": {
+        "count": 30,
+        "p50_ms": 639.784,
+        "p95_ms": 645.715,
+        "max_ms": 648.494,
+        "tail": "max",
+        "mean_ms": 640.932,
+        "requests_per_tick": 4.0
+      }
+    },
+    {
+      "pairs": 8,
+      "holding": false,
+      "rtt_ms": 150.0,
+      "after_bar_close": {
+        "count": 30,
+        "p50_ms": 1759.957,
+        "p95_ms": 2216.606,
+        "max_ms": 2231.381,
+        "tail": "max",
+        "mean_ms": 1848.95,
+        "requests_per_tick": 17.6
+      },
+      "between_bars": {
+        "count": 30,
+        "p50_ms": 1282.423,
+        "p95_ms": 1294.417,
+        "max_ms": 1299.847,
+        "tail": "max",
+        "mean_ms": 1282.611,
+        "requests_per_tick": 8.0
+      }
+    }
+  ],
+  "cycle": "skipped (--no-cycles)"
+}

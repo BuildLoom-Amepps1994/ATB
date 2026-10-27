@@ -133,7 +133,10 @@ Invariants:
   links to the cycle through `decision_id = cycle_id`.
 * **Partial exits keep the rest.** A partial sale moves basis pro rata to the
   base that left; `allocated + residual = basis` exactly. After a partial sale
-  the rest is judged at the sale's best bid. A sellable rest stays `HOLDING`,
+  the rest is judged at the sale's best bid; after an exit recovery, which has
+  no book, only by the amount step and the minimum amount, so a rest below the
+  minimum order value stays `HOLDING` until the next exit check closes it (as
+  below). A sellable rest stays `HOLDING`,
   and its stop counts the loss the partial sale already realized; an
   unsellable rest closes the cycle and stays in the ledger as residual, carried
   by the next cycle on that pair. Once that cycle's entry is booked, the closed

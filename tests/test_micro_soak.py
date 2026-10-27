@@ -17,9 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts' / 'micro_soak.py'
 
 
-def soak(tmp_path, *args, timeout=120, inherited=None):
+def soak(tmp_path, *args, timeout=120, inherited=None, own_guard_only=False):
     env = dict(os.environ)
     env.pop('CRYPTOPILOT_DATA_DIR', None)                     # the script must set it itself
+    if own_guard_only:                                        # without tests/offline_child's sitecustomize
+        child = str(ROOT / 'tests' / 'offline_child')
+        env['PYTHONPATH'] = os.pathsep.join(p for p in env.get('PYTHONPATH', '').split(os.pathsep) if p and p != child)
     if inherited is not None:
         env['CRYPTOPILOT_DATA_DIR'] = str(inherited)           # a profile the calling shell points the app at
     env['LOCALAPPDATA'] = str(tmp_path / 'localappdata')       # where a "normal" profile would live
@@ -77,6 +80,15 @@ def test_the_source_identity_covers_the_harness_and_admits_when_git_cannot_say(t
         raise FileNotFoundError('git')
     monkeypatch.setattr(micro_soak.subprocess, 'run', no_git)
     assert {k: micro_soak.source_identity()[k] for k in ('commit', 'dirty')} == {'commit': None, 'dirty': None}
+
+
+def test_a_fixture_soak_installs_its_own_network_guard(tmp_path):
+    folder = tmp_path / 'soak-own-guard'
+    done = soak(tmp_path, '--data-dir', str(folder), '--minutes', '0.05', '--sample-seconds', '2', '--fixture',
+                own_guard_only=True)
+    assert done.returncode == 0, done.stderr[-2000:]
+    summary = json.loads((folder / 'soak' / 'summary.json').read_text(encoding='utf-8'))
+    assert summary['remote_network_refused'] is True               # read from the guard, not from the flag
 
 
 def test_a_short_fixture_soak_runs_in_paper_and_records_the_source_it_ran(tmp_path):

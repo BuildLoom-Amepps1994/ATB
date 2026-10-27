@@ -159,12 +159,12 @@ def test_step_rounding_never_crosses_its_input(value, step, down, up):
     assert money.q_up(value, step) == D(up) and money.q_up(value, step) >= value
 
 
-@pytest.mark.parametrize('rounding, value', [
-    ('q_up', '100000.00000000000000000000000000001'),
-    ('q_down', '99999.999999999999999999999999999998'),
-])
+@pytest.mark.parametrize('rounding', ['q_up', 'q_down'])
+@pytest.mark.parametrize('value', ['100000.00000000000000000000000000001', '99999.999999999999999999999999999998'])
 def test_a_step_finer_than_34_digits_of_the_value_is_refused_not_looped_on(rounding, value):
-    # 35 digits parse, and 3e-30 is a step venue_rules accepts, but adding it does not move a 34-digit result.
+    # 35 digits parse, and 3e-30 is a step venue_rules accepts, but the multiple of it next to either value
+    # needs 35 or 36 digits: rounding it would return a number that is not a multiple, and adding the step
+    # does not move a 34-digit result.
     outcome = []
 
     def attempt():
@@ -177,6 +177,24 @@ def test_a_step_finer_than_34_digits_of_the_value_is_refused_not_looped_on(round
     worker.join(timeout=10)
     assert not worker.is_alive(), f'{rounding} is still looping'
     assert isinstance(outcome[0], money.MoneyError) and 'too fine' in str(outcome[0])
+
+
+@pytest.mark.parametrize('step', ['3e-30', '7e-25', '0.0003', '0.00000001', '0.5', '1e-28', '123.456', '9.99e-15'])
+@pytest.mark.parametrize('value', ['100000.00000000000000000000000000001', '99999.999999999999999999999999999998',
+                                   '1245.454545454545454545454545454546', '25', '0.00012345', '0.1',
+                                   '987654321.0123456789012345678901234', '3e-30'])
+def test_step_rounding_returns_an_exact_multiple_on_the_right_side_or_refuses(value, step):
+    from decimal import Context
+    exact = Context(prec=400, Emax=999, Emin=-999)
+    value, step = money.parse(value), money.parse(step)
+    for rounding, keeps in (('q_down', lambda r: r <= value), ('q_up', lambda r: r >= value)):
+        try:
+            result = getattr(money, rounding)(value, step)
+        except money.MoneyError:
+            continue
+        units = exact.divide(result, step)
+        assert units == units.to_integral_value() and keeps(result), (rounding, result)
+        assert exact.abs(exact.subtract(result, value)) < step             # the nearest multiple, not one further
 
 
 def test_rules_with_an_unknowable_age_are_stale():

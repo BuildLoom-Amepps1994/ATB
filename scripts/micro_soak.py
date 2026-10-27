@@ -189,10 +189,11 @@ def main(argv=None) -> int:
     if not 1.0 <= args.sample_seconds <= 3600.0:            # also refuses NaN
         raise SystemExit('--sample-seconds must be between 1 and 3600')
     data_dir = isolate(Path(args.data_dir))
+    guard = None
     if args.fixture:
-        import offline_net                                   # beside this script
-        offline_net.clear_proxies(os.environ)
-        offline_net.install()
+        import offline_net as guard                          # beside this script
+        guard.clear_proxies(os.environ)
+        guard.install()
     # The source that runs is the source read now; a checkout that changes during the run is recorded as such.
     source_at_start = source_identity()
     sys.path.insert(0, str(ROOT))
@@ -271,7 +272,7 @@ def main(argv=None) -> int:
         'source_changed_during_run': source_identity() != source_at_start,
         'profile': str(data_dir), 'mode': engine.mode, 'exchange': engine.exchange_name, 'pairs': pairs,
         'market_data': 'synthetic fixture on the real clock' if args.fixture else 'public endpoints, no account',
-        'remote_network_refused': bool(args.fixture),
+        'remote_network_refused': guard is not None and guard.active(),      # the guard this run installed
         'streaming_quotes': bool(engine.cfg.get('streaming_quotes')),
         'samples': count, 'faults': faults,
         'results': final.get('results'), 'open_cycles': final.get('cycles'), 'latch': final.get('latch'),

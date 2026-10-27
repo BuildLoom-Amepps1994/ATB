@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from decimal import (ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Context, Decimal, DivisionByZero,
-                     InvalidOperation, Overflow)
+                     Inexact, InvalidOperation, Overflow)
 
 # 34 significant digits (IEEE decimal128) is far more than any venue precision.
 CONTEXT = Context(prec=34, rounding=ROUND_HALF_EVEN, Emax=99, Emin=-99,
@@ -103,22 +103,31 @@ _QUOTIENT = Context(prec=200, rounding=ROUND_HALF_EVEN, Emax=999, Emin=-999,
                     traps=[InvalidOperation, DivisionByZero, Overflow])
 
 
-# One step corrects a product that rounded across the value at 34 digits. A step finer than the value's last
-# 34-digit place cannot move it at all, so the correction is bounded and such a pair is refused, never looped on.
+# A multiple of the step is formed exactly or not at all: when the multiple next to the value needs more than
+# 34 digits (a step finer than the value's precision), rounding the product would return a number that is not
+# a multiple of the step, so the pair is refused. One correction covers a 200-digit quotient that rounded across
+# a boundary; the second is spare, and none can loop.
+_EXACT = Context(prec=34, rounding=ROUND_HALF_EVEN, Emax=99, Emin=-99,
+                 traps=[InvalidOperation, DivisionByZero, Overflow, Inexact])
 _MAX_CORRECTIONS = 2
+
+
+def _multiple(units: Decimal, step: Decimal) -> Decimal:
+    try:
+        return _EXACT.multiply(units, step)
+    except Inexact:
+        raise MoneyError('quantization step too fine for this value at 34 digits') from None
 
 
 def q_down(value: Decimal, step: Decimal) -> Decimal:
     """Largest multiple of ``step`` that is not above ``value``."""
     step = _check_step(step)
     units = _QUOTIENT.divide(value, step).to_integral_value(rounding=ROUND_FLOOR)
-    result = CONTEXT.multiply(units, step)
-    for _ in range(_MAX_CORRECTIONS):
+    for _ in range(_MAX_CORRECTIONS + 1):
+        result = _multiple(units, step)
         if result <= value:
             return result
-        result = CONTEXT.subtract(result, step)      # the product rounded up: never return more than was given
-    if result <= value:
-        return result
+        units = _QUOTIENT.subtract(units, ONE)        # never return more than was given
     raise MoneyError('quantization step too fine for this value at 34 digits')
 
 
@@ -126,13 +135,11 @@ def q_up(value: Decimal, step: Decimal) -> Decimal:
     """Smallest multiple of ``step`` that is not below ``value``."""
     step = _check_step(step)
     units = _QUOTIENT.divide(value, step).to_integral_value(rounding=ROUND_CEILING)
-    result = CONTEXT.multiply(units, step)
-    for _ in range(_MAX_CORRECTIONS):
+    for _ in range(_MAX_CORRECTIONS + 1):
+        result = _multiple(units, step)
         if result >= value:
             return result
-        result = CONTEXT.add(result, step)           # the product rounded down: never return less than was asked
-    if result >= value:
-        return result
+        units = _QUOTIENT.add(units, ONE)             # never return less than was asked
     raise MoneyError('quantization step too fine for this value at 34 digits')
 
 

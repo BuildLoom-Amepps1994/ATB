@@ -294,6 +294,12 @@ def test_the_protocol_hash_covers_the_decision_parameters_and_results_name_their
     frozen = r.protocol_hash()
     monkeypatch.setattr(micro, 'EDGE_RATIO', micro.EDGE_RATIO / 2)
     assert r.protocol_hash() != frozen
+    import micro_strategy as strat
+    seen = {r.protocol_hash()}
+    for name, value in (('PROTECT_FLOOR_SHARE', Decimal('0.40')), ('STOP_ATR_MULTIPLE', 3.0), ('RANGE_MAX_ZSCORE', -1.0)):
+        monkeypatch.setattr(strat, name, value)              # module constants the decisions read, not MicroParams
+        seen.add(r.protocol_hash())
+    assert len(seen) == 4 and frozen not in seen
     identity = r.code_identity()
     assert len(identity['files_sha256']) == 64 and 'micro_strategy.py' in identity['files']
     assert identity['commit'] is None or len(identity['commit']) == 40

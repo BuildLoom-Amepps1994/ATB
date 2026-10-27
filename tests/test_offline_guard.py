@@ -4,6 +4,9 @@ Each case aims at 203.0.113.10 (TEST-NET-3, never routed) or a public name, so a
 guard that let one through would fail the test without reaching a real service.
 """
 import asyncio
+import importlib
+import importlib.util
+import json
 import os
 import socket
 import subprocess
@@ -102,6 +105,98 @@ def test_name_and_address_lookups_are_refused_but_localhost_resolves():
         asyncio.run(reverse_lookup())
     assert socket.getnameinfo(REMOTE, socket.NI_NUMERICHOST | socket.NI_NUMERICSERV) == ('203.0.113.10', '443')
     assert socket.gethostbyname('localhost').startswith('127.')
+
+
+@pytest.mark.parametrize('name', ['ip6-localhost', 'localhost.localdomain', 'localhost.'])
+def test_a_local_looking_name_the_guard_does_not_answer_is_refused(name):
+    # Most hosts files lack these, so the resolver would ask a DNS server for them.
+    with pytest.raises(offline_net.RemoteNetworkRefused):
+        socket.getaddrinfo(name, 443)
+
+
+def test_local_lookups_are_answered_without_the_resolver():
+    """In a fresh process whose resolver only records what it is asked, every local lookup is numeric or none."""
+    code = r'''
+import importlib.util, json, socket, sys
+real_getaddrinfo, real_getnameinfo, asked = socket.getaddrinfo, socket.getnameinfo, []
+
+def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    asked.append(['getaddrinfo', host, bool(flags & socket.AI_NUMERICHOST)])
+    return real_getaddrinfo(host, port, family, type, proto, flags | socket.AI_NUMERICHOST)
+
+def getnameinfo(sockaddr, flags):
+    asked.append(['getnameinfo', sockaddr[0], bool(flags & socket.NI_NUMERICHOST)])
+    return real_getnameinfo(sockaddr, flags | socket.NI_NUMERICHOST)
+
+def resolver(function):
+    def lookup(host):
+        asked.append([function, host, False])
+        raise socket.herror(1, 'the resolver was asked')
+    return lookup
+
+socket.getaddrinfo, socket.getnameinfo = getaddrinfo, getnameinfo
+socket.gethostbyname, socket.gethostbyname_ex, socket.gethostbyaddr = (
+    resolver(f) for f in ('gethostbyname', 'gethostbyname_ex', 'gethostbyaddr'))
+spec = importlib.util.spec_from_file_location('offline_net', sys.argv[1])
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+guard.install()
+serv = socket.NI_NUMERICSERV
+print(json.dumps({'answers': {
+    'ipv6': socket.getaddrinfo('localhost', 443, socket.AF_INET6, socket.SOCK_STREAM)[0][4][0],
+    'ipv4': socket.getaddrinfo('LOCALHOST', 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0],
+    'canonical': socket.getaddrinfo('localhost', 443, 0, socket.SOCK_STREAM, 0, socket.AI_CANONNAME)[0][3],
+    'name': socket.gethostbyname('localhost'),
+    'name_ex': socket.gethostbyname_ex('localhost'),
+    'reverse': [socket.gethostbyaddr(a) for a in ('127.0.0.2', '::1', '0.0.0.0', 'localhost')],
+    'nameinfo': [socket.getnameinfo(s, serv) for s in (('127.0.0.2', 443), ('::1', 443, 0, 0), ('0.0.0.0', 443))],
+    'name_required': socket.getnameinfo(('127.0.0.1', 443), serv | socket.NI_NAMEREQD),
+}, 'asked': asked}))
+'''
+    guard = os.path.abspath(offline_net.__file__)
+    done = subprocess.run([sys.executable, '-I', '-c', code, guard], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    report = json.loads(done.stdout)
+    assert report['answers'] == {
+        'ipv6': '::1', 'ipv4': '127.0.0.1', 'canonical': 'localhost',
+        'name': '127.0.0.1', 'name_ex': ['localhost', [], ['127.0.0.1']],
+        'reverse': [['localhost', [], ['127.0.0.2']], ['localhost', [], ['::1']],
+                    ['localhost', [], ['0.0.0.0']], ['localhost', [], ['127.0.0.1']]],
+        'nameinfo': [['localhost', '443']] * 3,
+        'name_required': ['localhost', '443'],
+    }
+    assert report['asked'] and all(numeric for _, _, numeric in report['asked']), report['asked']
+
+
+@pytest.mark.parametrize('module', ['uvloop', 'winloop'])
+def test_libuv_event_loops_cannot_be_imported(module):
+    # Their loops resolve and connect in C, outside the socket functions the guard replaces.
+    with pytest.raises(ImportError):
+        importlib.import_module(module)
+
+
+def test_uvicorns_default_loop_is_asyncio_under_the_guard():
+    auto = pytest.importorskip('uvicorn.loops.auto')
+    loop = auto.auto_loop_factory(use_subprocess=False)()
+    try:
+        assert type(loop).__module__.startswith('asyncio')
+    finally:
+        loop.close()
+
+
+def test_active_says_whether_the_replacements_are_still_in_place(monkeypatch):
+    assert offline_net.active()
+    monkeypatch.setattr(socket, 'getnameinfo', lambda sockaddr, flags: ('remote', '443'))
+    assert not offline_net.active()
+
+
+def test_install_refuses_when_a_libuv_loop_is_already_imported(monkeypatch):
+    spec = importlib.util.spec_from_file_location('offline_net_fresh', offline_net.__file__)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    monkeypatch.setitem(sys.modules, 'uvloop', type(sys)('uvloop'))
+    with pytest.raises(RuntimeError, match='uvloop was imported before the offline guard'):
+        fresh.install()                      # raises before it replaces anything
 
 
 def test_a_datagram_to_a_remote_address_is_refused_and_one_to_loopback_is_sent():

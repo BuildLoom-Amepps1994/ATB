@@ -24,9 +24,10 @@ Execution model (fixed before any result was seen; see ``PROTOCOL``):
   A bar that touched both a stop and a target is a stop. A profit exit that
   fires anywhere on the way from the low to the high is filled at the LOWEST
   price in that range at which it fires (a ticking engine sells at the first
-  such price on the way up), never at the high itself. The protection band
-  lies below a hold gap, so the range is searched whenever the high is in
-  profit, not only when the high itself fires.
+  such price on the way up), found to within 1/4096 of a 2 bps search step;
+  it fills at the high only when it first fires that close to the high. The
+  protection band lies below a hold gap, so the range is searched whenever
+  the high is in profit, not only when the high itself fires.
 * Market orders only, taker fees on both legs (the larger of the configured
   rate and the public schedule), billed in the quote asset. There is no maker
   simulation, so nothing fills because a price was touched.
@@ -100,16 +101,17 @@ from research import micro_fixtures as fx   # noqa: E402
 from strategy import backtest as atb_backtest, frame_from_ohlcv   # noqa: E402
 
 PROTOCOL = {
-    'version': 'micro-research-v2',      # v1 filled profit exits at the bar's high
+    'version': 'micro-research-v3',      # v1 filled profit exits at the bar's high; v3 rewords v2's fill and hashes more
     'frozen_before_results': True,
     'splits': {'development': 0.6, 'validation': 0.2, 'holdout': 0.2},
     'embargo_bars': 120,
     'warmup_bars_1m': 120,
     'decision': 'every completed 1m bar; execution at the next bar open book',
     'exit_path': 'low (loss, time and regime exits), then high (profit exits), then close of each held bar',
-    'profit_exit_fill': 'the lowest price in the bar range at which a profit exit fires, never the high; the '
-                        'range is searched whenever the high is in profit, since the protection band lies below a '
-                        'hold gap',
+    'profit_exit_fill': 'the lowest price in the bar range at which a profit exit fires, to within 1/4096 of a '
+                        'search step (steps of 2 bps from the low, at most 4000, then 12 halvings), so the high '
+                        'only when the exit first fires that close to it; the range is searched whenever the high '
+                        'is in profit, since the protection band lies below a hold gap',
     'stress_fee': 'the multiple applies to the modeled fee, max(configured, public taker), in decimals',
     'open_at_end': 'counted at its executable estimate in net_marked, which the verdict reads',
     'min_split_bars': 60,
@@ -132,10 +134,21 @@ PROTOCOL = {
 }
 
 
+def strategy_constants() -> dict:
+    """micro_strategy's numeric module constants: stop multiple, protection shares, regime thresholds and the rest."""
+    return {name: value for name, value in vars(strat).items()
+            if name.isupper() and isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)}
+
+
 def protocol_hash() -> str:
-    """The protocol, the two version labels and every decision parameter the run uses (micro.py constants too)."""
+    """The protocol, the two version labels, the run's ``MicroParams`` and micro_strategy's numeric constants.
+
+    Other code the run depends on (micro_economics, the book, the harness) is
+    identified by ``code_identity()``, recorded beside the hash in each result.
+    """
     payload = json.dumps({'protocol': PROTOCOL, 'features': strat.FEATURE_VERSION, 'decision': strat.DECISION_VERSION,
-                          'params': dataclasses.asdict(params())}, sort_keys=True, default=str).encode()
+                          'params': dataclasses.asdict(params()), 'strategy_constants': strategy_constants()},
+                         sort_keys=True, default=str).encode()
     return hashlib.sha256(payload).hexdigest()
 
 

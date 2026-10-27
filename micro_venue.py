@@ -159,9 +159,10 @@ def _floor_step(value: Decimal, step: Decimal) -> Decimal:
     ``money.q_down`` divides at 34 significant digits, so for an input with
     more digits the quotient can round up onto the next boundary and the
     result exceed ``value`` by one step. The result is compared with the input
-    exactly and lowered until it is not above it. A step finer than the
-    value's last 34-digit place is refused by ``money.q_down`` with
-    ``MoneyError`` rather than looped on.
+    exactly and lowered until it is not above it. When the multiple of
+    ``step`` next to the value cannot be written exactly in 34 digits (a step
+    finer than the value's precision), ``money.q_down`` raises ``MoneyError``
+    rather than returning a number that is not a multiple or looping.
     """
     result = money.q_down(value, step)
     while result > value:

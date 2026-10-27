@@ -14,7 +14,10 @@ at import) or ``credentials`` (which asks keyring for a backend) can load.
 * Outbound connections, datagrams and name lookups are refused unless they go
   to a loopback address or a local socket (``scripts/offline_net.py``). The
   suite needs no internet; a test that tried to reach an exchange, a DNS
-  server or GitHub fails instead of silently doing so.
+  server or GitHub fails instead of silently doing so. The guard answers
+  lookups of ``localhost`` and of loopback addresses itself, so those never
+  reach a DNS server either, and it blocks uvloop and winloop, whose event
+  loops resolve and connect outside Python's socket module.
 * Proxy variables are removed and ``NO_PROXY`` is ``*``: a proxy on loopback
   would otherwise pass the guard and forward a request to any host.
 * Python child processes get the same guard: ``tests/offline_child`` goes

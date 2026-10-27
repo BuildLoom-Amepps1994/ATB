@@ -491,13 +491,18 @@ class MicroManager:
                                                 'booked or released; apply the recovery again once it can be '
                                                 'read.') from exc
 
+    @staticmethod
+    def _never_sent(intent: dict | None) -> bool:
+        """True when the current attempt provably sent no order: no intent, an unsent pending one, or a rejected one."""
+        return intent is None or (intent['status'] == 'pending' and not intent.get('submitted_at')) \
+            or intent['status'] == 'rejected'
+
     def _recover_cycle(self, cycle: dict) -> dict | None:
         state, symbol = cycle['state'], cycle['symbol']
         base = {'cycle_id': cycle['cycle_id'], 'symbol': symbol, 'state': state}
         if state in ('ENTRY_RESERVED', 'ENTRY_SUBMITTED', 'ENTRY_UNKNOWN'):
             intent = self._intent(cycle['cycle_id'], 'BUY', attempt=True)
-            if intent is None or (intent['status'] == 'pending' and not intent.get('submitted_at')) \
-                    or intent['status'] == 'rejected':
+            if self._never_sent(intent):
                 with storage.connection() as db:
                     if intent is not None and intent['status'] == 'pending':
                         storage.update_order_intent(intent['intent_id'], 'rejected', note='never sent; released by the recovery check', db=db)
@@ -516,8 +521,7 @@ class MicroManager:
             return {**base, 'state': 'ENTRY_UNKNOWN', 'explanation': explanation, 'action': 'apply_recovery'}
         if state in ('EXIT_SUBMITTED', 'EXIT_UNKNOWN'):
             intent = self._intent(cycle['cycle_id'], 'SELL', attempt=True)
-            if intent is None or (intent['status'] == 'pending' and not intent.get('submitted_at')) \
-                    or intent['status'] == 'rejected':
+            if self._never_sent(intent):
                 with storage.connection() as db:
                     if intent is not None and intent['status'] == 'pending':
                         storage.update_order_intent(intent['intent_id'], 'rejected', note='never sent; released by the recovery check', db=db)
@@ -726,7 +730,18 @@ class MicroManager:
                 # never a position bought outside the cycles: the late fill would be booked into it and adopted.
                 outside = self._outside_position(db, symbol, position) if position else None
                 if outside:
-                    raise CycleError(outside)
+                    problem, retained = outside
+                    if any(intent['side'] == 'BUY' for intent, _view, _extra in late):
+                        raise CycleError(f'{problem}; close that manual or legacy position first, then apply the recovery')
+                    # A late sale only: selling the outside position by hand also sells the retained remainder, so it
+                    # can never make this recovery succeed and is not suggested.
+                    sold = sum((extra for _intent, _view, extra in late), money.ZERO)
+                    if sold > retained:
+                        raise CycleError(f'the venue reports selling {money.text(sold)} more than the micro cycles '
+                                         f'retain ({money.text(retained)}); this cannot be booked automatically')
+                    raise CycleError(f'{problem}; a late sale cannot be booked into a position held partly outside the '
+                                     'cycles, and selling that position would sell the retained remainder too; this '
+                                     'cannot be booked automatically')
                 owned = money.parse(float(position['qty']), field='ledger quantity') if position else money.ZERO
                 basis = money.parse(float(position['cost']), field='ledger cost') if position else money.ZERO
             else:
@@ -837,8 +852,9 @@ class MicroManager:
             self._after_close(cycle)     # a corrected realized result counts toward the loss limits
         return outcome
 
-    def _outside_position(self, db, symbol: str, position) -> str | None:
-        """Why the pair's ledger row is not the remainder the closed cycles retain, or None when it is (or is dust).
+    def _outside_position(self, db, symbol: str, position) -> tuple[str, Decimal] | None:
+        """(why the pair's ledger row is not the remainder the closed cycles retain, that remainder), or None
+        when it is (or is dust).
 
         The newest closed cycle with a residual holds the pair's current remainder: each close records all
         that is left, a later cycle carries it, and a late-fill booking keeps one residual record per pair.
@@ -847,14 +863,14 @@ class MicroManager:
         row = db.execute("SELECT residual_base FROM micro_cycles WHERE exchange=? AND mode='paper' AND symbol=? "
                          "AND state='CLOSED' AND residual_base IS NOT NULL AND residual_base NOT IN ('0', '') "
                          'ORDER BY closed_wall DESC LIMIT 1', (self.engine.exchange_name, symbol)).fetchone()
-        retained = float(_dec(row['residual_base'], money.ZERO)) if row is not None else 0.0
-        if math.isclose(held, retained, rel_tol=1e-9, abs_tol=1e-12):
+        retained = _dec(row['residual_base'], money.ZERO) if row is not None else money.ZERO
+        if math.isclose(held, float(retained), rel_tol=1e-9, abs_tol=1e-12):
             return None
         price = float(position['cost']) / held if held > 0 else 0.0
         if self.engine._is_dust(dict(position), self.engine._catalogue().get(symbol), price):
             return None          # a remainder below the venue minimum is carried, as a new entry carries it
         return (f'the ledger holds {held!r} {symbol.split("/")[0]}, outside the micro cycles (the closed cycles retain '
-                f'{retained!r}); close that manual or legacy position first, then apply the recovery')
+                f'{float(retained)!r})', retained)
 
     def late_fill_symbols(self) -> set[str]:
         """Pairs with a closed cycle whose late fill is not booked yet (its recovery books into the pair's position)."""
@@ -954,24 +970,38 @@ class MicroManager:
                                  'explanation': self._blocking_explanation(cycle)})
             elif idle and cycle['state'] in TRANSIENT_STATES:
                 blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
-                                 'explanation': f'Interrupted ({cycle.get("last_reason") or "mid-operation"}); its '
-                                                'check has not explained it yet. Applying recovery reads the paper '
-                                                "venue's record; nothing is resent.", 'interrupted': True})
+                                 'explanation': self._blocking_explanation(cycle), 'interrupted': True})
         for cycle in self._closed_late_fills():
             blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
                              'explanation': cycle['late_fill_reason'], 'late_fill': True})
         return blockers
 
     def _blocking_explanation(self, cycle: dict) -> str:
-        """An unknown outcome is explained by the venue record its recovery would book, read now."""
-        if cycle['state'] in ('ENTRY_UNKNOWN', 'EXIT_UNKNOWN'):
-            side, leg = ('BUY', 'entry') if cycle['state'] == 'ENTRY_UNKNOWN' else ('SELL', 'exit')
+        """An unknown or interrupted outcome is explained by the venue record its recovery would book, read now.
+
+        An interrupted cycle's recovery explains it and books that record in one step (as ``_recover_cycle``
+        then the unknown-outcome recovery would), so the text the operator confirms states that record, or,
+        when the attempt sent no order, the release or unchanged holding that recovery books instead."""
+        state = cycle['state']
+        interrupted = state in TRANSIENT_STATES
+        if interrupted or state in ('ENTRY_UNKNOWN', 'EXIT_UNKNOWN'):
+            side, leg = ('SELL', 'exit') if state in ('EXIT_SUBMITTED', 'EXIT_UNKNOWN') else ('BUY', 'entry')
+            prefix = f'Interrupted ({cycle.get("last_reason") or "mid-operation"}). ' if interrupted else ''
             try:
                 intent = self._intent(cycle['cycle_id'], side, attempt=True)
+                if interrupted and self._never_sent(intent):
+                    return prefix + ('No entry order was sent, so nothing can have filled. Applying recovery releases '
+                                     'the reservation.' if leg == 'entry' else
+                                     'The exit order was never sent. Applying recovery returns the holding unchanged; '
+                                     'it is managed when the bot starts.')
                 if intent is not None:
-                    return self._explain_record(leg, intent)
+                    return prefix + self._explain_record(leg, intent)
             except Exception:
                 pass
+            if interrupted:
+                return (prefix + 'Its order journal could not be read just now, so its venue record is not shown; '
+                        "refresh before applying the recovery, which books exactly the paper venue's record. "
+                        'Nothing is resent.')
         return cycle.get('review_reason') or cycle.get('last_reason') or 'review required'
 
     def apply_recovery(self, cycle_id: str, confirmation: str) -> dict:

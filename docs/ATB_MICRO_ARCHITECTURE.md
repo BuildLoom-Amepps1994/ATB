@@ -119,8 +119,10 @@ Invariants:
   the end of an Exit all while stopped, a recovery while stopped) was
   interrupted by a failure between its durable writes and is settled by
   `settle_stranded`, exactly as a restart would. One that this check cannot
-  explain is listed in `review_block` while the bot is stopped and idle, and
-  its recovery refuses until the check succeeds.
+  explain is listed in `review_block` while the bot is stopped and idle,
+  explained from the venue record its one-step recovery books (or the release
+  or unchanged holding when no order was sent), and its recovery refuses until
+  the check succeeds.
 * **Each attempt has its own intent.** The outcome of an interrupted attempt
   is read from the newest intent that is not `accounted` or `reconciled`; an
   accounted intent belongs to an earlier, finished attempt (a partial exit),

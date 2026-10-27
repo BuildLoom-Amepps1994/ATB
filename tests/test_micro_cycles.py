@@ -1389,6 +1389,61 @@ def test_an_interrupted_cycle_the_check_cannot_explain_is_listed_for_recovery_wh
     assert_ledger_consistent(w)
 
 
+def test_an_interrupted_cycle_is_listed_with_the_venue_record_its_one_step_recovery_books(world, monkeypatch):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    w.engine.running = False
+    _fail_sell_booking_once(monkeypatch, held['cycle_id'])
+    real = micro.MicroManager._recover_cycle
+
+    def broken(self, cycle):
+        raise RuntimeError('recovery check failed')
+    monkeypatch.setattr(micro.MicroManager, '_recover_cycle', broken)
+    w.engine.micro.flatten()
+    monkeypatch.setattr(micro.MicroManager, '_recover_cycle', real)
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_SUBMITTED'
+    sale = [i for i in w.intents(held['cycle_id']) if i['side'] == 'SELL'][-1]
+    exact = w.venue().fetch_order(None, 'ETH/USDT', {'clientOrderId': sale['client_order_id']})['info']['exact']
+
+    def shown() -> str:
+        [item] = [b for b in w.engine.micro.status()['review_block'] if b['cycle_id'] == held['cycle_id']]
+        assert item.get('interrupted') is True
+        return item['explanation']
+    venue = w.venue()
+    real_fetch = venue.fetch_order
+    monkeypatch.setattr(venue, 'fetch_order', _unreadable)
+    assert 'could not be read' in shown() and 'refused' in shown()       # never shown as no fill
+    monkeypatch.setattr(venue, 'fetch_order', real_fetch)
+    # Before the one press of Apply recovery, the panel (and its confirmation) states the record that press books.
+    assert f'{exact["filled"]} filled for {exact["cost"]}' in shown() and 'books exactly that' in shown()
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_SUBMITTED'   # reading it changed nothing
+    assert w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)['outcome'] == 'exit fill booked from the venue record'
+    assert Decimal(micro.load_cycle(held['cycle_id'])['closed_base']) == Decimal(exact['filled'])
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+def test_an_interrupted_cycle_that_sent_no_order_is_listed_with_what_its_recovery_does(world, monkeypatch):
+    w = world()
+    real = w.engine._authorize
+
+    def broken(*args, **kwargs):
+        if args[1] == 'BUY':
+            raise RuntimeError('gate unavailable')
+        return real(*args, **kwargs)
+    monkeypatch.setattr(w.engine, '_authorize', broken)
+    with pytest.raises(RuntimeError):
+        w.run(60)
+    monkeypatch.setattr(w.engine, '_authorize', real)
+    stranded = w.cycles()[-1]
+    assert stranded['state'] == 'ENTRY_RESERVED'
+    w.engine.running = False                                  # stopped; no further pass has run
+    [item] = w.engine.micro.review_block()
+    assert item['interrupted'] is True and 'releases the reservation' in item['explanation']
+    result = w.engine.micro.apply_recovery(stranded['cycle_id'], REVIEW)
+    assert micro.load_cycle(stranded['cycle_id'])['state'] == 'ABANDONED' and 'released' in result['outcome']
+
+
 def test_the_worker_exit_settles_interrupted_cycles_and_ends_an_exit_all_request(world, monkeypatch):
     w = world()
     held = w.run_until_state('HOLDING')
@@ -1528,6 +1583,67 @@ def test_a_late_fill_after_close_is_booked_onto_the_remainder_the_closed_cycle_r
     adopted = [c for c in w.cycles() if c['strategy'] == 'late_fill_recovery']
     assert len(adopted) == 1 and money_close(adopted[0]['owned_base'], retained + Decimal('0.0004'), Decimal('1e-12'))
     assert_ledger_consistent(w)
+
+
+def _raise_sale_fill(w: World, cycle_id: str, extra_base=Decimal('0.0004'), extra_gross=Decimal('1.0'),
+                     extra_fee=Decimal('0.001')) -> None:
+    sale = [i for i in w.intents(cycle_id) if i['side'] == 'SELL'][-1]
+    stored = w.venue().fetch_order(None, 'ETH/USDT', {'clientOrderId': sale['client_order_id']})['info']['exact']
+    with storage.connection() as db:                # the venue now reports a larger fill on that exit
+        db.execute('UPDATE paper_venue_orders SET filled=?, cost=?, fee_cost=? WHERE client_order_id=?',
+                   (str(Decimal(stored['filled']) + extra_base), str(Decimal(stored['cost']) + extra_gross),
+                    str(Decimal(stored['fee_cost']) + extra_fee), sale['client_order_id']))
+
+
+def test_a_late_sale_after_close_beside_an_outside_position_is_refused_without_advising_a_manual_sale(world):
+    w = world(micro_cooldown_seconds=0)
+    closed = w.run_until_state('CLOSED')
+    assert _eth_position() == []                                  # the cycle sold everything: nothing retained
+    w.engine.running = False
+    w.engine.stop_event.set()
+    w.engine.update_config(micro_settings(watchlist=['BTC/USDT']))
+    _manual(w.engine, 'BUY', 50)                                  # ETH bought by hand outside the cycles
+    manual = _eth_position()
+    _raise_sale_fill(w, closed['cycle_id'])                       # then the venue reports a late sale on the exit
+    engine = w.restart()
+    assert [b['cycle_id'] for b in engine.micro.review_block()] == [closed['cycle_id']]
+    cash, cycles = w.cash(), w.cycles()
+    with pytest.raises(storage.ConfigValidationError) as refused:
+        engine.micro.apply_recovery(closed['cycle_id'], REVIEW)
+    # Selling the manual position can never let a late sale the cycles do not cover be booked: no such advice.
+    assert 'more than the micro cycles retain (0); this cannot be booked automatically' in str(refused.value)
+    assert 'close that manual' not in str(refused.value) and 'first' not in str(refused.value)
+    assert _eth_position() == manual and w.cash() == cash and w.cycles() == cycles
+    assert engine.micro.review_block()                            # it stays blocked (register item 4)
+
+
+def test_a_covered_late_sale_after_close_beside_an_outside_position_is_refused_without_advising_a_manual_sale(world):
+    w = world(micro_cooldown_seconds=0)
+    held = w.run_until_state('HOLDING')
+    venue = w.venue()
+    original = venue.create_order
+
+    def sale_fills_97_percent(symbol, *args, **kwargs):
+        venue.partial_next = Decimal('0.97')                # the rest is below the 1 USDT market minimum
+        return original(symbol, *args, **kwargs)
+    venue.create_order = sale_fills_97_percent
+    assert w.run(120, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    venue.create_order = original
+    retained = Decimal(micro.load_cycle(held['cycle_id'])['residual_base'])
+    with storage.connection() as db:                 # stands for a position added outside the cycles
+        db.execute("UPDATE positions SET qty=qty+0.02, cost=cost+50 WHERE symbol='ETH/USDT' AND mode='paper'")
+    mixed = _eth_position()
+    _raise_sale_fill(w, held['cycle_id'], extra_base=retained / 2, extra_gross=Decimal('0.5'),
+                     extra_fee=Decimal('0.0005'))
+    engine = w.restart()
+    cash, cycles = w.cash(), w.cycles()
+    with pytest.raises(storage.ConfigValidationError) as refused:
+        engine.micro.apply_recovery(held['cycle_id'], REVIEW)
+    # A manual sale would sell the retained remainder too, turning a covered late sale into an uncovered one.
+    assert 'outside the micro cycles' in str(refused.value) and 'cannot be booked automatically' in str(refused.value)
+    assert 'close that manual' not in str(refused.value) and 'first' not in str(refused.value)
+    assert _eth_position() == mixed and w.cash() == cash and w.cycles() == cycles
+    assert engine.micro.review_block()
 
 
 def test_a_manual_buy_waits_while_a_late_fill_on_a_closed_cycle_of_the_pair_is_unbooked(world):

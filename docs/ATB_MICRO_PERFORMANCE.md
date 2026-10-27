@@ -15,7 +15,7 @@ and a Windows host are **NOT RUN** (register item 11 in
 | Legacy paths | `benchmarks/bench_latency.py`, the same file run in a checkout of main `b1e0217` (before) and of this branch (after), 5 discarded warm-up iterations and 100 samples per row |
 | Micro paths | `benchmarks/bench_micro.py`, 100 samples per CPU row; 30 timed ticks per tick row after 5 warm-up ticks; one 240-minute run of the mechanics fixture for the cycle rows |
 | Before for the micro paths | Commit `483d204`, the micro manager before the integration and data reviews. That commit cannot open a cycle on the mechanics fixture at its loss cap, so it was run with `--no-cycles` and its holding and cycle rows do not exist |
-| Order | Legacy rows: main and branch alternately, four times, back to back; runs 3 and 4 are on `d51ca7f`, whose legacy paths are those of the final `9535a55` (the later commits changed only the micro manager, the research fixtures and tests), runs 1 and 2 on `2f99435`, before the monitor fix below. Micro rows: `483d204`, `2f99435` and `d51ca7f` in the same session as the legacy runs; `9535a55`, the final code, alone after the idle-cadence fix. Runs of nearly the same tree show the host's drift |
+| Order | Legacy rows: main and branch alternately, four times, back to back; runs 3 and 4 are on `d51ca7f`, whose legacy paths are those of the final code (the later commits changed no legacy module: only micro modules, the research harness and fixtures, the test guard, the soak and source-archive scripts, tests, documentation and recorded benchmark results), runs 1 and 2 on `2f99435`, before the monitor fix below. Micro rows: `483d204`, `2f99435` and `d51ca7f` in the same session as the legacy runs; `9535a55`, the idle-cadence fix, alone after it (the later code commits changed the engine only in `money.py`'s rounding, float repr and magnitude bound, `venue_rules.py`'s side and age rules and an account-fee argument of `cost_model` that no engine path passes; the tables were not rerun on them. One check run of every micro row on `20c7067`, after the fixture-clock fix (`benchmarks/results/micro_bench_clock_check_20c7067.json`), is described at the end of the wall-clock smoke section and is not used in the tables). Runs of nearly the same tree show the host's drift |
 | Quantiles | The sorted sample at index round(q x (n - 1)), close to but not the textbook nearest rank (for 12 samples the p95 is the 11th value). p99 only for rows with at least 100 samples; below that the last column is the maximum and is marked `*`. The engine's reservoirs keep only their latest 512 samples, so a reservoir row whose Samples exceed 512 gives the quantiles of its last 512 |
 | Raw files | `benchmarks/results/micro_latency_*.json` (legacy rows, runs 1 to 4) and `benchmarks/results/micro_bench_*.json` (micro rows) |
 
@@ -81,8 +81,14 @@ tick or per scan, averaged over the timed samples.
 
 `before` is `483d204`, the manager before the integration and data reviews.
 The three later columns are `2f99435` and `d51ca7f`, whose micro managers
-differ only in the query for micro-owned pairs, and `9535a55`, the final
-code. A tick reads books for every selected pair, the candles of every pair
+differ only in the query for micro-owned pairs, and `9535a55`, the
+idle-cadence fix. The final code's engine differs from it only in
+`money.py`'s rounding, float repr and magnitude bound, `venue_rules.py`'s
+side and age rules and an account-fee argument of `cost_model` that no
+engine path passes. The benchmark's own fixture clock and book builder in
+`research/micro_fixtures.py` also changed after it (see "The micro rows ran
+before the fixture-clock fix" at the end of the wall-clock smoke section).
+The final code was not benchmarked here. A tick reads books for every selected pair, the candles of every pair
 whose bar closed, and the exits of every holding. In this benchmark each
 flat fixture pair has a possible setup, so it reads its book on every pass.
 The idle cadence of a pair with no possible setup (one read per new
@@ -164,46 +170,77 @@ decision, otherwise every 30 s) is measured in the wall-clock smoke below.
 
 ## Wall-clock smoke: latency, requests and resources
 
-The two 20-minute runs of `scripts/micro_soak.py --fixture` described in
+The four 20-minute runs of `scripts/micro_soak.py --fixture` described in
 `docs/ATB_MICRO_VALIDATION.md` ran the real engine thread on the real clock
 against three fixture markets with a 0 ms round trip, streaming off. The
-first ran on `c043668`, before the idle-cadence fix; the second on `9535a55`,
-the final code. Neither had the host to itself: the full test suite ran
-alongside the first five minutes of each, the 12-minute research run
-alongside the first, and a cycle-test run alongside minutes 5 to 10 of the
-second. Cells are p50 / p95 / p99 in
+first ran on `c043668`, before the idle-cadence fix; the second on `9535a55`;
+the third on `fb52624`, whose code is `20c7067`'s; the fourth on `ec3c59f`,
+whose engine paths are the final code's but for `money.parse` (the final
+code adds the account-fee parser, a `cost_model` argument no engine path
+passes, and in `money.parse` a float read through `float`'s own repr and an
+exact magnitude bound, the same result for every plain float and in-range
+value). None had the host to itself for its whole length: the full
+test suite ran alongside the first five minutes of the first two, the
+12-minute research run alongside the first, a cycle-test run alongside
+minutes 5 to 10 of the second, the agents of the third review round (running
+focused tests at low priority) alongside all of the third, and the agents of
+a documentation fact-check (reading files and running short commands)
+alongside the last ten minutes of the fourth. Cells are p50 / p95 / p99 in
 milliseconds from each run's metrics reservoir, which keeps the latest 512
 samples, so the rows with more describe only the later part of each run (from
 about minute 9 for the tick and book reads, minute 14 for entry decisions and
 minute 5 for exit decisions); `*` marks a maximum in place
 of p99 below 100 samples.
 
-| Path | First run, `c043668` | Second run, `9535a55` | Samples (first, second) |
-|---|---|---|---|
-| `micro.tick_ms` | 26.62 / 42.13 / 69.74 | 26.21 / 45.12 / 65.29 | 981, 981 |
-| `micro.book_fetch_ms` | 0.14 / 0.26 / 0.37 | 0.15 / 0.24 / 0.28 | 1131, 1121 |
-| `micro.context_ms` | 1.87 / 2.90 / 3.73 | 1.92 / 4.08 / 9.47 | 123, 123 |
-| `micro.entry_decision_ms` | 0.49 / 0.76 / 0.86 | 0.50 / 0.84 / 1.18 | 2093, 2001 |
-| `micro.exit_decision_ms` | 1.20 / 2.07 / 2.92 | 1.21 / 2.07 / 2.56 | 653, 653 |
-| `micro.book_to_decision_ms` | 5.35 / 5.35 / 5.35* | 5.41 / 5.41 / 5.41* | 1, 1 |
-| `micro.reservation_ms` | 4.45 / 4.45 / 4.45* | 3.45 / 3.45 / 3.45* | 1, 1 |
-| `risk.authorize_ms` | 1.60 / 10.72 / 10.72* | 2.00 / 10.20 / 10.20* | 2, 2 |
-| `execution.submit_total_ms` | 14.87 / 19.63 / 19.63* | 19.75 / 20.12 / 20.12* | 2, 2 |
-| `micro.fill_to_commit_ms` | 4.02 / 4.12 / 4.12* | 3.08 / 4.30 / 4.30* | 2, 2 |
-| `micro.exit_submit_ms` | 15.27 / 15.27 / 15.27* | 20.36 / 20.36 / 20.36* | 1, 1 |
+| Path | First run, `c043668` | Second run, `9535a55` | Third run, `fb52624` | Fourth run, `ec3c59f` | Samples (first to fourth) |
+|---|---|---|---|---|---|
+| `micro.tick_ms` | 26.62 / 42.13 / 69.74 | 26.21 / 45.12 / 65.29 | 32.13 / 54.80 / 80.54 | 34.25 / 57.86 / 80.00 | 981, 981, 982, 981 |
+| `micro.book_fetch_ms` | 0.14 / 0.26 / 0.37 | 0.15 / 0.24 / 0.28 | 0.19 / 0.31 / 0.58 | 0.20 / 0.32 / 0.97 | 1131, 1121, 1114, 1116 |
+| `micro.context_ms` | 1.87 / 2.90 / 3.73 | 1.92 / 4.08 / 9.47 | 2.12 / 6.71 / 19.72 | 2.63 / 4.23 / 5.03 | 123, 123, 123, 120 |
+| `micro.entry_decision_ms` | 0.49 / 0.76 / 0.86 | 0.50 / 0.84 / 1.18 | 0.62 / 0.95 / 1.95 | 0.67 / 0.99 / 1.33 | 2093, 2001, 1950, 1977 |
+| `micro.exit_decision_ms` | 1.20 / 2.07 / 2.92 | 1.21 / 2.07 / 2.56 | 1.37 / 2.64 / 3.84 | 1.47 / 2.52 / 3.23 | 653, 653, 654, 652 |
+| `micro.book_to_decision_ms` | 5.35 / 5.35 / 5.35* | 5.41 / 5.41 / 5.41* | 8.37 / 8.37 / 8.37* | 5.97 / 5.97 / 5.97* | 1, 1, 1, 1 |
+| `micro.reservation_ms` | 4.45 / 4.45 / 4.45* | 3.45 / 3.45 / 3.45* | 8.97 / 8.97 / 8.97* | 6.00 / 6.00 / 6.00* | 1, 1, 1, 1 |
+| `risk.authorize_ms` | 1.60 / 10.72 / 10.72* | 2.00 / 10.20 / 10.20* | 2.31 / 14.31 / 14.31* | 2.10 / 11.69 / 11.69* | 2, 2, 2, 2 |
+| `execution.submit_total_ms` | 14.87 / 19.63 / 19.63* | 19.75 / 20.12 / 20.12* | 23.80 / 28.12 / 28.12* | 32.62 / 40.44 / 40.44* | 2, 2, 2, 2 |
+| `micro.fill_to_commit_ms` | 4.02 / 4.12 / 4.12* | 3.08 / 4.30 / 4.30* | 4.94 / 5.35 / 5.35* | 4.58 / 6.23 / 6.23* | 2, 2, 2, 2 |
+| `micro.exit_submit_ms` | 15.27 / 15.27 / 15.27* | 20.36 / 20.36 / 20.36* | 28.65 / 28.65 / 28.65* | 33.30 / 33.30 / 33.30* | 1, 1, 1, 1 |
 
-| Resource or request | First run | Second run |
-|---|---|---|
-| Book reads per minute, BTC / ETH / SOL | 14.26 / 31.49 / 11.44 | 14.26 / 31.49 / 10.77 |
-| Books refused | 0 | 0 |
-| Entry decisions (abstain, enter) | 2092, 1 | 2000, 1 |
-| Threads in every sample | 2 | 2 |
-| Peak resident memory (`ru_maxrss`), first and last sample | 127.1 MB, 132.6 MB | 127.3 MB, 133.0 MB |
-| STALE_DATA samples | 4 (SOL, last two minutes) | 0 |
+| Resource or request | First run | Second run | Third run | Fourth run |
+|---|---|---|---|---|
+| Book reads per minute, BTC / ETH / SOL | 14.26 / 31.49 / 11.44 | 14.26 / 31.49 / 10.77 | 14.36 / 31.59 / 10.15 | 14.31 / 31.59 / 10.57 |
+| Books refused | 0 | 0 | 0 | 0 |
+| Entry decisions (abstain, enter) | 2092, 1 | 2000, 1 | 1949, 1 | 1976, 1 |
+| Threads in every sample | 2 | 2 | 2 | 2 |
+| Peak resident memory (`ru_maxrss`), first and last sample | 127.1 MB, 132.6 MB | 127.3 MB, 133.0 MB | 126.5 MB, 132.2 MB | 126.9 MB, 132.8 MB |
+| STALE_DATA samples | 4 (SOL, last two minutes) | 0 | 0 | 6 (ETH 1, BTC 2, SOL 3; each about 7 s after a bar close, see below) |
 
 * **The idle-cadence fix cost no measurable tick time.** The tick p50 is 26.6
   and 26.2 ms; p95 and p99 move by a few ms either way, which one run per
   commit on a shared host cannot separate from noise.
+* **The third and fourth runs are slower than the second** in most rows, by
+  about 6 and 8 ms at the tick p50 and more in the tails. Both shared the
+  host with agents during the part of the run the tick reservoir covers
+  (from about minute 9), and their engine code differs from the second run's
+  only in `money.py`'s rounding and `venue_rules.py`'s side and age rules, so
+  host load is the likely cause; neither was separated from the code change
+  by a run on an idle host.
+* **The fourth run's STALE_DATA samples are the documented wait after a bar
+  close**, not a regression. Just after a close the candle cache still holds
+  the previous minute's frame for about 2 s, so the first read lacks the new
+  bar and is retried after 5 s (`CONTEXT_RETRY_S`; `docs/ATB_MICRO_ARCHITECTURE.md`,
+  *Data path and cadence*). The fourth run started about 7 s after a minute
+  boundary (its `started_utc`, 01:14:06, is truncated to the second), so half
+  its samples fell about 7 s after a close, and at 3 of those 20
+  sample times one or more pairs were still waiting (6 pair samples, 5.7 to
+  6.0 s into the wait); the second and third runs
+  sampled 24 and 54 s, and 27 and 57 s, after each close. Two 5-minute runs
+  with 1-second samples, side by side on `fb52624` and `ec3c59f`, showed the
+  same wait, starting 0 to 2 s after every bar close and lasting 5 to 7 s, on
+  every pair not holding a cycle. So an entry decision on a new bar comes
+  about 6 to 9 s after the close: the first read, about 1 to 2 s after the
+  close, lacks the bar, and the retry 5 s later finds it. The research
+  harness does not model this (it executes at the next bar's opening book).
 * **Request rate stays well inside MEXC's public limit.** The busier run made
   about 57 book reads a minute across three pairs (about 29 weight per 10 s
   at depth weight 3) plus a 1m candle read per pair at each bar close and a 5m read about every fifth,
@@ -211,7 +248,7 @@ of p99 below 100 samples.
   shared with anything else on the same address. A pair with no possible setup now reads
   its book for each new decision and otherwise every 30 s; SOL read 10.77
   times a minute against 11.44 before the fix.
-* **Peak memory rose 5.5 to 5.7 MB over 20 minutes** in both runs. A peak
+* **Peak memory rose 5.5 to 5.9 MB over 20 minutes** in every run. A peak
   only rises, and twenty minutes cannot tell a slow leak from warm-up; the
   24 hour soak's samples will show more.
 * These are fixture round trips on Linux. Windows and real network latency
@@ -227,10 +264,15 @@ of p99 below 100 samples.
   (`benchmarks/results/micro_bench_clock_check_20c7067.json`, run while the
   research harness used another core), closed the same 12 cycles, with entry
   and exit decision to commit at 50.67 and 35.37 ms p50. At p50 its 0 ms tick
-  rows were 9 to 33 % faster and its 150 ms rows 0.2 to 1.7 % faster, but its first row,
-  which had no chain in either run, was faster too (14.34 against 19.72 ms
-  between bars), so the difference is host variation, not the fix. The tables
-  above keep the `9535a55` run.
+  rows were 9 to 33 % faster and its 150 ms rows 0.2 to 1.7 % faster, but its
+  first row, which had no chain in either run, was faster too (14.34 against
+  19.72 ms between bars). The cycle row, the last in the chain and the one the
+  fix changes most, was mixed: its entry and exit decision to commit p50s were
+  faster (50.67 against 53.48 ms and 35.37 against 40.74 ms), as were eight of
+  its ten engine reservoirs, but its engine's book-to-decision p50 was 13.54
+  against 6.17 ms and its tick p50 33.52 against 25.33 ms. With the
+  research harness running alongside, this one run cannot separate the fix
+  from host variation. The tables above keep the `9535a55` run.
 
 ## Limits
 

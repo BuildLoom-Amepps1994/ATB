@@ -234,4 +234,14 @@ structured log with redaction.
 * Use authenticated endpoints. The account's own fee rate needs MEXC's signed
   `tradeFee` endpoint, which this build never calls; the modeled fee is the
   larger of the configured rate and the public schedule.
+  `venue_rules.parse_mexc_symbol_commission` validates a response to that
+  endpoint which a caller supplies (the documented shape, checked
+  2026-10-27). It fails closed on a `code` that is not the integer 0, no
+  `data` object, a missing, malformed or out-of-range taker or maker rate, an
+  invalid stated RPI rate, a bad timestamp, a repeated key or JSON it cannot
+  read; it does not check `msg` or other keys, and accepts rates given as
+  strings or numbers. `micro_economics.cost_model(...,
+  account=...)` lets its taker rate join that maximum, so a known account rate
+  can raise the modeled fee but never lower it. Nothing obtains such a
+  response, and no engine path passes one (`tests/test_micro_commission.py`).
 * Size up to reach a venue minimum, use spare cash, or compound gains.

@@ -9,10 +9,10 @@ overlap the full suite and are never added to it.
 | Item | Value |
 |---|---|
 | Branch | `claude/project-thread-vqle7r`, from main `b1e0217` |
-| Code commit tested | `20c7067` (the commits after it change documentation and recorded results only; `git diff 20c7067 HEAD -- '*.py' '*.js' '*.html' '*.cjs' '*.yml' '*.iss' '*.txt'` is empty) |
+| Code commit tested | `82913ca` (the commits after it change documentation and recorded results only; `git diff 82913ca HEAD -- '*.py' '*.js' '*.html' '*.cjs' '*.yml' '*.iss' '*.txt'` is empty) |
 | Host | Linux cloud container, 4 CPUs, Python 3.13.17, Node 22.22.0 |
 | Dependencies | `requirements-lock.txt` as on main (ccxt 4.5.90, pandas 3.1.0) |
-| Isolation | `tests/conftest.py` sets a new temporary `CRYPTOPILOT_DATA_DIR` and `LOCALAPPDATA`, the null keyring backend and no update checks before any application module is imported, removes every proxy variable, and refuses every non-loopback connection, datagram and name lookup, in child Python processes too (`scripts/offline_net.py`). Every pytest and benchmark command below also exported a new `CRYPTOPILOT_DATA_DIR` under `/tmp` and `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring` first; the soak sets both itself for its `--data-dir` folder |
+| Isolation | `tests/conftest.py` sets a new temporary `CRYPTOPILOT_DATA_DIR` and `LOCALAPPDATA`, the null keyring backend and no update checks before any application module is imported, removes every proxy variable, refuses every connection, datagram, bind and name lookup that is not local (loopback, `localhost` or the wildcard address), answers local lookups itself so none reaches a DNS server, and blocks uvloop and winloop, in child Python processes too (`scripts/offline_net.py`). Every pytest and benchmark command below also exported a new `CRYPTOPILOT_DATA_DIR` under `/tmp` and `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring` first; the soak sets both itself for its `--data-dir` folder |
 | Exchange access | None. MEXC and Kraken are unreachable from this host; every exchange interaction is a fixture |
 | Credentials | None requested, read or used. No settings file, portfolio, order database or log of a real installation was opened |
 
@@ -26,8 +26,8 @@ node --test tests/test_dashboard.js
 
 | Suite | Passed | Failed | Skipped | Errors | Duration |
 |---|---|---|---|---|---|
-| `pytest tests` (Python 3.13.17) | 1317 | 0 | 0 | 0 | 278.4 s (wall 4 min 40 s) |
-| `node --test tests/test_dashboard.js` (Node 22.22.0) | 19 | 0 | 0 | 0 | 0.2 s |
+| `pytest tests` (Python 3.13.17), on `82913ca` (a clean `git worktree` of it) | 1542 | 0 | 0 | 0 | 389.9 s, alongside the research rerun |
+| `node --test tests/test_dashboard.js` (Node 22.22.0), on `82913ca` | 19 | 0 | 0 | 0 | 0.2 s |
 
 The two pytest warnings are aiohttp's `enable_cleanup_closed` deprecation
 notice from the websocket tests, unrelated to this change.
@@ -39,10 +39,14 @@ duration to its fixed step, so a slow host can still change them: review
 round 3 found one such test and it was fixed, and every cycle test passed with
 each tick slowed by 15 ms (see *Focused runs*).
 
-**Changed expectations.** Two pre-existing test files changed. In
+**Changed expectations.** Three pre-existing test files changed. In
 `tests/test_recovery.py` the expected database schema version moved from 3 to
-4, for the new micro tables. `tests/test_dashboard.js` gained three micro
-panel tests and imports two more helpers; its existing tests are unchanged.
+4, for the new micro tables. In `tests/test_launcher.py`,
+`test_browser_readiness_uses_loopback_http_without_tls_or_proxies` now
+removes `NO_PROXY` and `no_proxy` before it runs, because the suite's
+`NO_PROXY=*` would otherwise hide a launcher that used a proxy; its
+assertions are unchanged. `tests/test_dashboard.js` gained three micro panel
+tests and imports two more helpers; its existing tests are unchanged.
 No pre-existing test was deleted, skipped or marked.
 
 ## Focused runs during development
@@ -63,12 +67,24 @@ after each change; they are not added to the totals above.
 | Slow-host check of the same five tests | each tick slowed by 0, 3, 6, 8, 10, 15, 20 and 40 ms of real time | All passed at every setting |
 | Slow-host check of every cycle test on `9535a55` | `tests/test_micro_cycles.py`, each tick slowed by 15 ms of real time | 58 passed, 292.2 s |
 | New test for the 25 USDT settings bound | `tests/test_micro_refusal.py` | 15 passed; the new test fails if the bound is raised to 50 or if `MicroManager.budget_cap` stops taking the minimum with the 25 USDT constant |
-| After the final review round's fixes, before their commit | `tests` | 1368 passed and 1 failed: the archive self-screen test, which reads HEAD and passed (29 archive tests) once the fixes were committed as `7066d6f`; dashboard 19 passed |
+| After the final review round's fixes, before their commit | `tests` on the working tree of that moment, five tests short of `7066d6f` (which has 1374) | 1368 passed and 1 failed: the archive self-screen test, which reads HEAD and passed (29 archive tests) once the fixes were committed as `7066d6f`; dashboard 19 passed. No full Linux run of `7066d6f` or `20c7067` was made; the full suite of each ran on Windows (below) |
 | Mutation check of the final round's main fixes | the new tests, against the network guard without the `NO_PROXY` setting, without the child-process guard, without the proxy clearing in `conftest.py`, and the research harness with the high fill, the MEXC-only rules and the verdict on closed cycles only | Each variant fails at least one new test |
 | Windows CI on `7066d6f` | the full suite on `windows-latest`, Python 3.14.9 | 1365 passed, 2 failed, 7 skipped, 658.8 s. Both failures were archive tests whose fixture wrote its file with `write_text`, which gives CRLF on Windows, so the committed blob was not the bytes the test expected; the fixture now writes bytes (`3c0c45d`), and the Windows test step of `3c0c45d` passed |
 | After the second review round's fixes (`20c7067`) | `tests/test_micro_*.py`, `tests/test_money_and_venue_rules.py`, `tests/test_offline_guard.py`, `tests/test_source_archive.py` | 705 passed, 219.3 s |
 | Mutation check of the second round's fixes | each new test against its fix reverted: the anchored name screen, `create_system` left to `zipfile`, `getnameinfo` unguarded, the search only when the high fires, and the unbounded rounding loops | Each fails: three name cases, the cross-platform hash, the lookup test, the band test (0.0249 instead of the band's bottom) and both rounding cases (still looping after 10 s) |
 | Windows CI on `20c7067` | the full suite on `windows-latest`, Python 3.14.9, then the installer build and its smoke tests | 1374 passed, 0 failed, 7 skipped, 665.2 s; the installer built and both smoke tests passed |
+| After the third review round's fixes, before their commit | `tests/test_money_and_venue_rules.py` and every `tests/test_micro_*.py`; then `tests/test_offline_guard.py tests/test_micro_soak.py`; then the launcher, uvicorn, soak and archive tests | 728 passed, 316.1 s; 30 passed; 168 passed |
+| Mutation check of the third round's fixes | each new test against its fix reverted: the old local-name list, `localhost` passed to the resolver, reverse lookups passed to the resolver, no uvloop block, no check for an already imported uvloop, `NI_NAMEREQD` kept; the hash without the strategy constants; the old step rounding; the soak without its guard block | Each fails at least one new test (the old rounding fails five cases; the soak variant fails both soak tests that read the flag) |
+| DNS probe of the guard, before and after the third and fourth rounds | each local lookup form under `strace` in an empty network namespace, counting connections to port 53 | Before: 6 for each of `localhost` over IPv6, `localhost.localdomain`, `ip6-localhost` and the reverse lookups of `127.0.0.2`, `::1` and `0.0.0.0`. After the third round (`cb7d082`): 0 for every lookup form. With `fb1e544`'s guard and a hosts file that lacks `localhost`: also 0 for the socket methods and `bind` |
+| Windows CI on `cb7d082`, `fb1e544` and `ec3c59f` | the full suite on `windows-latest`, Python 3.14.9, then the installer build and its smoke tests | All three succeeded |
+| After the fourth and fifth reviews' fixes (`fb1e544`, `ec3c59f`) | `tests/test_offline_guard.py` | 24, then 30 passed; each of the 11 variants that reverts one part of those fixes fails at least one test |
+| Full suite at `ec3c59f`, before the account-fee parser | `tests`; `node --test tests/test_dashboard.js` | 1468 passed, 0 failed, 0 skipped, 387.8 s; dashboard 19 passed |
+| Account-fee parser, after its first and second review rounds | `tests/test_micro_commission.py tests/test_micro_economics.py tests/test_money_and_venue_rules.py`; then `tests` on the working tree | 286, then 301 passed; 1525, then 1540 passed, 0 failed, 0 skipped |
+| Mutation check of the account-fee parser and its review fixes | 32 variants, each removing or weakening one check: the parser's code check, its Decimal number parsing (`parse_float=Decimal`), and its rate, bound, digit, timestamp, symbol, time, length, repeated-key and exponent checks; `cost_model`'s account handling; `money.parse`'s float repr and exact bound; and the static test against a `tradeFee` request, a raw URL, a network import in `venue_rules.py` and an `account` keyword | Each fails at least one test in `tests/test_micro_commission.py` or `tests/test_money_and_venue_rules.py`. One variant, a second catch that the `money.parse` fix had made unreachable for every input then tested, survived until a test with a hostile number type was added |
+| Full suite at `6aeeb01` (a clean `git worktree` of it) | `tests`; `node --test tests/test_dashboard.js` | 1540 passed, 0 failed, 0 skipped, 395.5 s, alongside the research rerun; dashboard 19 passed |
+| Windows CI on `6aeeb01` | the full suite on `windows-latest`, Python 3.14.9 | 1530 passed, 1 failed, 8 skipped and 2 errors, 823.4 s, all in the new `tests/test_micro_commission.py`: one parametrized case's id was its 200,000-character argument, which pytest puts in `PYTEST_CURRENT_TEST` and Windows refuses above 32767 characters (an error at setup and at teardown), and the static no-caller test walked the runner's build venv inside the checkout (`.build-venv`) and stopped at CCXT's `ccxt/abstract/kucoin.py`, whose KuCoin endpoint name `privateGetTradeFees` contains the forbidden spelling `gettradefee` (the message of `82913ca` names `fetch_trading_fee` instead, in error). Both fixed in `82913ca`, each with a test that fails without its fix (the longest collected id is now 490 characters) |
+| Windows CI on `82913ca` | the full suite on `windows-latest`, Python 3.14.9, then the installer build and its smoke tests | 1534 passed, 0 failed, 8 skipped, 698.2 s; the installer built and both smoke tests passed. 1534 plus 8 is the Linux count of 1542. Eight is the number of tests that skip on Windows: the seven cases of the pre-existing `tests/test_updater.py::test_publish_job_never_replaces_or_outranks_a_release` (marked to skip on win32) and this branch's netlink test in `tests/test_offline_guard.py` (no `AF_NETLINK` on Windows); the log, from `pytest -q`, does not name them |
+| Check of the fourth wall-clock run's STALE_DATA samples | `scripts/micro_soak.py --minutes 5 --fixture --sample-seconds 1`, side by side on `fb52624` (exported with `git archive`) and `ec3c59f` | Both completed with no fault. Over 5 bar closes each, every pair not holding a cycle showed STALE_DATA starting 0 to 2 s after every close and lasting 5 to 7 s on `fb52624` and 5 to 6 s on `ec3c59f` (13 spells in each run): the documented wait for the new bar's candles |
 
 ## Reviews
 
@@ -152,7 +168,7 @@ after each change; they are not added to the totals above.
     were indexed anyway; a holding still open at the end of a split was left
     out of the verdict; the result recorded neither the book model, the
     decision parameters nor the code; and a second fixture clock did not
-    replace the first (`tests/test_micro_research.py`). The protocol is now
+    replace the first (`tests/test_micro_research.py`). The protocol became
     `micro-research-v2` and the fixture results were re-run (*Research run*).
   * Venue rules: an unrecognised MEXC side rule allowed both sides; it now
     allows sells only, so a holding can close but nothing opens.
@@ -161,8 +177,11 @@ after each change; they are not added to the totals above.
   market rules stamped in the future or read with a bad clock are stale
   (`tests/test_money_and_venue_rules.py`). Not changed: the `DECIMAL_PLACES`
   precision path (neither venue uses it), `money.parse` of a NumPy float (no
-  caller passes one) and the benchmark's request count for the ticker
-  fallback (the benchmark never takes that path).
+  caller passed one then; round 1 of the account-fee parser's review found
+  the same crash through that parser, and `money.parse` itself was then
+  fixed in `6aeeb01`: it reads a float through `float.__repr__`) and the
+  benchmark's request count for the ticker fallback (the benchmark never
+  takes that path).
 * **Second review of those fixes**: two reviewers (the network guard, archive
   and soak; the research harness, money and venue rules), each finding then
   checked by a separate verifier that reproduced it. Five were confirmed and
@@ -186,6 +205,125 @@ after each change; they are not added to the totals above.
   The verifiers confirmed every other part of the fixes, including the
   Windows asyncio signatures, the proxy handling of urllib, requests and
   httpx, and the linear time of the secret patterns on 400 KB inputs.
+* **Third review**: two code reviewers (the network guard, archive and
+  soak; the research harness and money) and two fact-checkers (the research
+  document; the validation, performance and gates documents and the
+  changelog), each finding then checked by a separate verifier that
+  reproduced it. Fixed in `cb7d082`, each with a test that fails when its fix
+  is reverted:
+  * The network guard let local lookups reach the system resolver, which
+    asks a DNS server for any name or address the hosts file lacks
+    (`localhost` over IPv6, `::1`, `127.0.0.2`, `0.0.0.0`, `ip6-localhost`,
+    `localhost.localdomain`). The guard now answers `localhost` and loopback
+    addresses itself and refuses the other names.
+  * uvloop, which ccxt installs on Linux and uvicorn's default loop picks,
+    resolves and connects in C, outside the guard (nothing in the suite ran
+    a uvloop loop). The guard now blocks uvloop and winloop from import.
+  * The fixture soak's guard had no test of its own: its summary flag was
+    read from the `--fixture` option. It now reads the guard, and a test runs
+    the soak without the suite's child-process guard.
+  * With a step finer than the value's 34-digit precision, step rounding
+    could return a number that was not a multiple of the step (the second
+    round had stopped only the loop). The multiple is now formed exactly or
+    refused.
+  * The protocol hash left out `micro_strategy`'s own constants (the stop
+    multiple, the protection shares, the regime thresholds), and its fill
+    text said "never the high", which is wrong when an exit first fires at
+    the high. Protocol version 3 widens the hash and rewords the fill; the
+    fixture run was repeated with identical figures (*Research run*).
+  The fact-checks corrected these statements: the *Final runs* table still
+  showed the `9535a55` run while naming `20c7067` as the code tested, and no
+  full Linux run had been made of `7066d6f` or `20c7067` (the full suite now
+  runs on the final code, *Final runs*); the
+  pre-commit run of the first round was five tests short of its commit;
+  version 2's hash changed under one label without saying so; version 1's
+  tick and venue handling; the per-cycle values at 10 and 15 USDT; the marked
+  figures of the identical validation and holdout windows; the benchmark
+  clock-check bullet, which left out the cycle row; register item 17's file
+  list; the changelog's account of version 1's hold-gap fill; and the
+  archive's cross-platform check. Not changed, because the verifiers found
+  no defect: the manifest's line endings on Windows (nothing needs identical
+  bytes, and `sha256sum -c` accepts CRLF), the always-enter figures (closed
+  net compared with closed net) and the Python version of the Windows runs
+  (3.14.9, read again from the job log).
+* **Fourth review**, of `cb7d082`: two code reviewers and their verifiers.
+  The money and research changes had no defect: 2.04 million value and step
+  pairs of the kinds the callers pass gave no refusal and no mismatch
+  against an exact reference, and the one finding there, that the protocol
+  hash leaves out non-numeric constants such as the exit-trigger order, was
+  rejected (the hash claims only the numeric ones; the code identity covers
+  the rest). Four gaps in the network guard were confirmed,
+  all latent (no code in the repository takes these paths), and fixed in
+  `fb1e544`, each with a test that fails when its fix is reverted: `bind`
+  resolved a host name in C and was not guarded; `connect`, `connect_ex`,
+  `sendto` and `sendmsg` passed the name `localhost` to the C resolver;
+  `gethostbyaddr` answered a bytes host with its repr and made up answers for
+  bracketed or zoned spellings; and `active()` did not check that uvloop was
+  still blocked.
+* **Fifth review**, of `fb1e544`'s guard changes: one reviewer and its
+  verifier. Everything the suite does locally still worked under the guard
+  (socket pairs, ancillary data, Unix, netlink and packet sockets, TLS
+  sockets, `multiprocessing` listeners, `socketserver`, `http.server`,
+  asyncio servers and datagrams, uvicorn reached by aiohttp, requests and
+  urllib), and a logging DNS stub saw no query from any local form. Two low
+  findings were confirmed and fixed in `ec3c59f`: the socket methods passed
+  a bracketed or zoned loopback spelling to C, which resolves it (with a
+  hosts entry for such a name, a packet went to that entry's address; such a
+  spelling now gets no answer); and five parts of `fb1e544` had no test that
+  failed without them (each now has one). These two fixes have had no review
+  of their own (register item 17).
+* **Final fact-check** of the documents, the pull request text and the
+  report: four checkers, each finding then checked by a separate verifier.
+  20 findings survived and were corrected, 6 were rejected. The serious one
+  was in the report: it said the parser for MEXC's symbol-commission
+  response was implemented and tested on supplied responses, as the brief
+  asks, when no such code existed. It was then written (next bullet). The
+  others were wrong or out-of-date statements: the changelog's bind wording
+  (the wildcard address is allowed), the DNS-probe row, the third review's
+  account of when the full Linux suite last ran, the count of changed
+  pre-existing test files, two places that named a different final commit,
+  the cycle row of the benchmark clock check, register item 17, the protocol
+  row's fill wording, and in the report and pull request text a smoke-run
+  summary, the 25 USDT gross and fee figures for ADA and XRP, the cause given
+  for the earlier +0.3987 (the hold-gap close fill, not the high fill), a
+  collection command asking for 200 book snapshots (capped at 50, and the
+  harness never reads depth), a real-data command without `--out`, an
+  overclaim about revert checks, the expected Windows skips and two Windows
+  results not yet read.
+* **Account-fee parser** (`venue_rules.parse_mexc_symbol_commission` and
+  the `account` argument of `micro_economics.cost_model`, in `6aeeb01`):
+  three review rounds, each finding then checked by a separate verifier that
+  reproduced it. Every confirmed finding was fixed with a test before the
+  commit.
+  * Round 1, two reviewers (the parser; its integration with the cost model
+    and the rest of the code), 7 confirmed: a JSON exponent too large for
+    Decimal escaped as `InvalidOperation`; NumPy's `float64` crashed
+    `money.parse` through its repr; `received_at` and `age_seconds` raised on
+    a huge integer or a non-number (two findings); JSON that repeats a key was read with the last copy, so a
+    refusal code could be overridden; and the test that nothing calls the
+    endpoint missed CCXT's `fetch_trading_fee` and
+    `spot_private_get_tradefee` spellings (two findings). Rejected: a
+    hand-built `AccountCommission` skipping the bounds, and the symbol's
+    format: a caller that follows the docstring ("passes the one it asked
+    for") may hold MEXC's native market id `ETHUSDT`, which `cost_model`
+    refuses because it wants the unified symbol `ETH/USDT` (this fails
+    closed).
+  * Round 2, three reviewers (fail-closed parsing; the cost model and
+    money; the tests), 5 confirmed: a long JSON number became a Decimal whose
+    stored form could not be read back, where the same digits as a string
+    were refused; the 1 % bound used `abs()`, which rounds to the caller's
+    decimal context (with a precision of 1, a 1.4 % taker rate passed); a
+    5000-digit integer code raised a plain `ValueError` while being
+    formatted; the static test missed CCXT's generic `request('tradeFee',
+    ...)` and a raw URL; and no test made the public rate the binding term
+    with an account rate passed. `money.parse` had the same `abs()` rounding
+    against its magnitude bound and was fixed too. Five findings were
+    rejected: no upper bound on the venue timestamp and `functools.partial`
+    call forms (not changed), and an infinite age from readings of minus and
+    plus 1e308 and two missing test cases, negative timestamps and infinite
+    times (all three added anyway).
+  * Round 3, two reviewers (the round 2 parser fixes; the `money.parse`
+    changes and every caller of `money.parse`): no finding.
 
 ## Brief test matrix (items 1 to 30)
 
@@ -241,7 +379,44 @@ These are synthetic markets: the runs prove the engine runs unattended
 through bars, cycles and exits, not anything about a market. Twenty minutes
 is a smoke run, not a soak.
 
-**Second run, on `9535a55`** (the final code), 20:09 to 20:29 UTC:
+**Fourth run, on `ec3c59f`** (whose engine paths are the final code's but
+for `money.parse`: the final code adds, in `6aeeb01`, the account-fee parser, a
+`cost_model` argument no engine path passes, and in `money.parse` a float
+read through `float`'s own repr and an exact magnitude bound, which give the
+same result for every plain float and in-range value; the working tree held only uncommitted edits to these
+documents and the research result file, so the summary records it as dirty), 01:14 to 01:34 UTC on 27 October: completed,
+1200.1 s, 40 samples, no faults, PAPER throughout, worker alive in every
+sample, no risk block, no latch, no review block, no error and no refused
+book. The same cycle closed on the mechanics fixture by take profit after
+653 s, net +0.0723 USDT, fees 0.0501 USDT, as in the earlier runs. Book reads
+per minute: BTC 14.31, ETH 31.59, SOL 10.57. Two threads in every sample;
+maximum resident memory 126.9 MB at the first sample and 132.8 MB at the
+last. The summary records the source as `ec3c59f`, 37 files with SHA-256
+`3a766f0c...4b08f9`, unchanged during the run, and `remote_network_refused`
+true. Six pair samples showed STALE_DATA (ETH 1, BTC 2, SOL 3), at three
+sample times each about 7 s after a bar close, 5.7 to 6.0 s into the wait:
+the documented wait for
+the new bar's candles (`docs/ATB_MICRO_ARCHITECTURE.md`, *Data path and
+cadence*), which this run's sample times happened to catch. Two 5-minute
+runs with 1-second samples, side by side on `fb52624` and `ec3c59f`, showed
+the same wait, starting 0 to 2 s after every bar close and lasting 5 to 7 s,
+on every pair not holding a cycle (`docs/ATB_MICRO_PERFORMANCE.md`). A documentation fact-check ran alongside
+its last ten minutes.
+
+**Third run, on `fb52624`** (the code of `20c7067`, after both review rounds
+of the final fixes), 23:28 to 23:48 UTC: completed, 1200.0 s, 40 samples, no
+faults, PAPER throughout, worker alive in every sample, no risk block, no
+latch, no review block, no error, no STALE_DATA and no refused book. The
+same cycle closed on the mechanics fixture by take profit after 654 s, net
++0.0723 USDT, fees 0.0501 USDT, as in both earlier runs. Book reads per
+minute: BTC 14.36, ETH 31.59, SOL 10.15. Two threads in every sample; maximum
+resident memory 126.5 MB at the first sample and 132.2 MB at the last. The
+summary records the source as `fb52624`, clean, 37 files with SHA-256
+`bca1b748...b309f1`, unchanged during the run, and `remote_network_refused`
+true. Its latencies are higher than the second run's
+(`docs/ATB_MICRO_PERFORMANCE.md`).
+
+**Second run, on `9535a55`**, 20:09 to 20:29 UTC:
 completed, 1200.0 s, 40 samples, no faults, PAPER throughout, worker alive in
 every sample, no risk block, no latch, no review block, no error, and no
 STALE_DATA on any pair. The SOL pair, which showed it four times in the first
@@ -272,16 +447,21 @@ made while it ran; the code files' hash at the end was the same.
 
 ## Research run
 
-`python -m research.micro_research --out research/results/micro_fixtures.json`
-on `20c7067` (protocol `micro-research-v2`; the result file records the
-commit and that the decision and research files were unmodified): exit 0,
-20 min 14 s wall clock (the report records a run time of 1213.3 s; the
-benchmark check in `docs/ATB_MICRO_PERFORMANCE.md` ran on another core for
-8 of those minutes; the wider profit-exit search, which prices more points of
-each held bar, is the likely cause of the rise from 731 s, but it was not
-profiled). At 25 USDT on the untouched holdout with baseline costs
-it closed 21 cycles on the ETH mechanics fixture, each by profit protection
-at about 0.0126 USDT, and none on the other four fixtures. Results and their
+`python -m research.micro_research --out <scratch folder>/micro_fixtures.json`
+in a clean `git worktree` of `6aeeb01` (protocol `micro-research-v3`; the
+result file records the commit, that the decision and research files were
+unmodified, and their hash, `4d8beb5b...7ab3297`, which `82913ca` keeps since
+it changes only a test file), run inside an empty network namespace
+(`unshare -n`), so it could not reach any network: exit 0, 03:01 to 03:30 UTC
+on 27 October, 28 min 38 s wall clock (the report records 1716.9 s); the
+file was then copied to `research/results/micro_fixtures.json`. Two full test
+suites ran alongside it, so its run time says nothing about the code.
+Compared field by field with the first version 3 run, on `cb7d082` (00:13 to
+00:41 UTC, 1704.2 s), every figure is equal; only the code identity and the
+run times differ. That run in turn equalled version 2's run on `20c7067` in
+every figure. At 25 USDT on the untouched holdout with baseline costs it
+closed 21 cycles on the ETH mechanics fixture, each by profit protection at
+about 0.0126 USDT, and none on the other four fixtures. Results and their
 meaning are in `docs/ATB_MICRO_RESEARCH.md`, including why every earlier
 fixture run is superseded. Real data: **NOT RUN**.
 
@@ -301,7 +481,9 @@ that looks like a database (by name or content), a settings, environment or
 log file, a key or a credential assignment, and it writes a manifest with
 every file's SHA-256 and the archive's own. Entries are stored uncompressed
 with a fixed time, permissions and creating system, so the same commit gives
-the same archive hash on Windows and Linux (a test builds it both ways).
+the same archive hash on Windows and Linux (a test builds it with the
+platform set to Windows and compares the hashes; no archive built on a
+Windows host has been compared with a Linux one yet).
 Until the final review it refused
 this repository itself (see *Reviews*), so no archive existed before then. A
 file cannot contain the hash of the archive it is in, so the archive of the

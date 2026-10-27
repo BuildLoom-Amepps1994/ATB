@@ -2,7 +2,9 @@
 
 Everything in this document is **algebra or a modeled estimate**. None of it is
 an actual MEXC account fee, a recommended target, or a predicted opportunity.
-The account's own fee rate needs a signed endpoint that this work never called.
+The account's own fee rate needs a signed endpoint that this work never called;
+the parser for its response is tested on supplied responses only and is not
+used by any engine path (`docs/ATB_MICRO_ARCHITECTURE.md`).
 
 All numbers below come from `micro_economics.py` (the same code the engine
 uses). `tests/test_micro_economics.py` pins the headline break-even and target ratios and checks how the other tables behave (budget independence, the minimum fee, rounding and depth); their individual figures are not pinned.

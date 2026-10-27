@@ -17,6 +17,17 @@ Added
   never raised; venue minimums, steps and fee schedules come from the market
   catalogue (`venue_rules.py`); amounts are bounded Decimals (`money.py`).
   The smallest workable budget is shown for a pair the cap cannot trade.
+* A validating parser for a supplied response of MEXC's signed symbol
+  commission endpoint (`GET /api/v3/tradeFee`). It fails closed on JSON text
+  that repeats a key or that it cannot read, a `code` other than the integer
+  0, a missing `data` object, a missing, malformed or out-of-range taker or
+  maker rate, an RPI rate that is stated but invalid, or a missing or
+  non-positive integer `timestamp`; it does not check `msg` or extra keys,
+  and accepts rates given as strings. An optional `account` argument to
+  `micro_economics.cost_model` lets a parsed account taker rate join the
+  maximum of the configured and public rates. Nothing calls the endpoint and
+  no engine path passes an account rate (`venue_rules.py`,
+  `tests/test_micro_commission.py`).
 * Net-profit exits estimated by walking the order book's bids, bounded-loss,
   maximum-hold and regime exits that need no profit or depth, and confirmed
   realized P/L from the simulated fill (`micro_strategy.py`, `micro_book.py`).
@@ -63,23 +74,40 @@ Changed
   (a new bar's candles becoming current, a changed gate) and otherwise every
   30 s, keeping its last decision in between.
 * Tests run in an isolated environment: a new temporary data folder, the null
-  keyring backend, no proxy variables, and a refusal of every non-loopback
-  connection, datagram and name lookup, also in child Python processes
-  (`tests/conftest.py`, `scripts/offline_net.py`).
+  keyring backend, no proxy variables, and a refusal of every connection,
+  datagram and name lookup that is not local (loopback, `localhost` or the
+  wildcard address), also in child Python processes
+  (`tests/conftest.py`, `scripts/offline_net.py`). Lookups of `localhost` and
+  of loopback addresses are answered by the guard, never sent to a DNS
+  server; socket methods get the loopback literal in place of the name
+  `localhost` and no answer for a bracketed or zoned spelling, which C would
+  resolve; a bind to any address but loopback or the wildcard, or to any
+  name but `localhost`, is refused; and uvloop and winloop are
+  blocked, since their event loops resolve and connect outside Python's
+  socket module. The fixture soak records whether its own guard is in place.
 * The source archive is built from the commit's git objects; committed links
   and submodules are refused, entries are stored uncompressed with a fixed
   creator system so Windows and Linux give the same hash, and the secret
   screen covers more forms.
-* The research protocol is `micro-research-v2`: a profit exit fills at the
-  lowest price in the bar at which it fires, also when the high sits in the
-  hold gap above the protection band (v1 filled it at the bar's high),
-  stress fees multiply the fee actually modeled, real-data books use the
-  market's own tick and venue, short splits are reported as not run, a
-  holding open at the end counts in the verdict, and results record the book
-  model, decision parameters and code identity.
+* The research protocol is `micro-research-v3`: a profit exit fills at the
+  lowest price in the bar at which it fires, to within 1/4096 of a 2 bps
+  search step (v1 filled one that fired at the high at the high), also when
+  the high sits in the hold gap above the protection band (where v1 sold at
+  the close); stress fees multiply the fee actually modeled, real-data books
+  use the market's own tick and venue, short splits are reported as not run,
+  a holding open at the end counts in the verdict, results record the book
+  model, decision parameters and code identity, and the protocol hash also
+  covers `micro_strategy`'s numeric constants. Version 3 changes no rule of
+  version 2; it corrects the fill wording and widens the hash.
 * An unrecognised MEXC side rule (`tradeSideType`) allows sells only.
-* Step rounding (`money.q_down`, `money.q_up`) refuses a step finer than the
-  value's 34-digit precision instead of looping.
+* Step rounding (`money.q_down`, `money.q_up`) forms the multiple of the
+  step exactly, and raises `MoneyError` when that multiple needs more than 34
+  digits (a step finer than the value's precision) instead of returning a
+  rounded number that is not a multiple, or looping.
+* `money.parse` reads a float through `float`'s own repr, so a subclass such
+  as NumPy's `float64` (whose repr is `np.float64(...)`) parses to the same
+  value instead of raising, and compares a magnitude with its bound exactly,
+  not through `abs()`, which rounds to the caller's decimal context.
 * The risk gate's `issued_at` reads the monotonic clock at issue time.
 * `MarketData` has a priority `order_book` read; the order journal has an
   index on client order ids; the database schema version is 4.

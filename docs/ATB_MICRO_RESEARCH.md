@@ -10,14 +10,14 @@ makes money in a real market, and nothing in this document says it does.
 ## Protocol (frozen)
 
 The protocol is the `PROTOCOL` dictionary in `research/micro_research.py`.
-Its SHA-256, which also covers the feature and decision versions and every
-decision parameter the run uses, is written into every result file, so a
-result can be matched to the rules that produced it.
+Its SHA-256, which also covers the feature and decision versions, the
+decision parameters and `micro_strategy`'s numeric constants, is written into
+every result file, so a result can be matched to the rules that produced it.
 
 | Item | Value |
 |---|---|
-| Protocol version | `micro-research-v2` |
-| Protocol SHA-256 | `5db2787e1cb75662aa7b66b9757a346a2f807e8643ec91477a36a529d255bc50` |
+| Protocol version | `micro-research-v3` |
+| Protocol SHA-256 | `635c6356dd2521244c33e6917869cca854e2fe72129c80c97eb238d5f799bf34` |
 | Feature version | `micro-features-v1` |
 | Decision version | `micro-entry-v1` |
 | Splits | 60 % development, 20 % validation, 20 % holdout, in time order |
@@ -25,7 +25,7 @@ result can be matched to the rules that produced it.
 | Decisions | On every completed 1-minute bar, by the production `micro_strategy` code |
 | Execution | At the next bar's opening book, market orders only, taker fee on both legs |
 | Held-bar path | Low, then high, then close of each bar (the pessimistic order for a long). Loss, time and regime exits act at the low |
-| Profit exit fill | The lowest price in the bar's range at which a profit exit fires, found by a search of at most 2 bps steps and 12 halvings; never the high. The range is searched whenever the high is in profit, because the protection band lies below a hold gap |
+| Profit exit fill | The lowest price in the bar's range at which a profit exit fires, found to within 1/4096 of a search step (2 bps steps up from the low, at most 4,000 of them, then 12 halvings), so the fill is the high only when the exit first fires that close to it. The range is searched whenever the high is in profit, because the protection band lies below a hold gap |
 | Stress fees | The doubled and severe multiples apply to the fee actually modeled (the larger of the configured rate and the public taker rate) |
 | Open at the end | A holding still open when a split ends is counted at its executable estimate (`net_marked`), and the verdict and the random baseline read that figure |
 | Sizing | The production `micro_economics.size_entry`, at 10, 15 and 25 USDT all-in |
@@ -34,13 +34,16 @@ result can be matched to the rules that produced it.
 | Baselines | Cash; buy and hold over the split; 200 random-entry runs with the strategy's own exits and cycle count; always enter on every eligible bar; the unchanged ATB Rapid strategy over the same bars |
 | Verdict rule | DEMONSTRATED only on real holdout data, when the net result is above zero, above the random-entry mean plus two standard deviations, and above zero under doubled costs. Synthetic fixtures are MECHANICS ONLY whatever their numbers |
 
-The hash covers the protocol, the two version labels and the decision
-parameters (`params()`, including the `micro.py` constants), not the source
-code. Each result file identifies the code separately: a SHA-256 of the
-decision and research files, the commit and whether those files were
-modified. The verdict rule was written before any result existed.
+The hash covers the protocol, the two version labels, the decision
+parameters (`params()`, including the `micro.py` constants) and
+`micro_strategy`'s numeric module constants (the stop multiple and floor, the
+protection shares, the regime and setup thresholds), not the rest of the
+source code. Version 2's hash left those constants out. Each result file
+identifies the code separately: a SHA-256 of the decision and research files,
+the commit and whether those files were modified. The verdict rule was
+written before any result existed.
 
-**Three revisions, disclosed.** Before any real data was seen, the stop rule was
+**Four revisions, disclosed.** Before any real data was seen, the stop rule was
 revised (the stop now includes the round-trip cost carried at entry, see
 `docs/ATB_MICRO_ECONOMICS.md`, *Stops and the loss cap*) and the protocol's
 loss cap moved from 80 to 120 bps with it. Under the earlier rule the
@@ -56,16 +59,34 @@ The third revision is `micro-research-v2`, made after an independent review
 of the harness and before any real data. Version 1 filled a profit exit that
 fired at the bar's high at the high itself, which overstated it; its stress scenarios did not
 scale a public taker fee above the configured rate; it left a holding open at
-the end of a split out of the verdict; and it read every market's rules as
-MEXC's with a 0.01 price tick. Version 2 fixes those and records the decision
+the end of a split out of the verdict; and it normalized every market's rules
+and books as MEXC's, and for real data modeled the book at a fixed 0.01 tick
+whatever the market's own tick (falling back to a 0.01-tick MEXC market when
+the file had no market entry). Version 2 fixes those and records the decision
 parameters and the code identity. Its first run (at `7066d6f`) still filled a
 protection exit at the bar's close when the high sat in the hold gap above the
 protection band; a second review found that, and the fix searches the whole
 range whenever the high is in profit. That run gave the same strategy result
 as version 1 (+0.3987 on the ETH holdout, every cycle closed by protection at
 about 0.0190 USDT) because the close fill was the same; with the fix each
-cycle closes at the band's bottom, about 0.0126 USDT. The run reported here is
-the first one on the fixed code (`20c7067`); every earlier fixture run is
+cycle closes at the band's bottom, about 0.0126 USDT. That fix rewrote
+version 2's fill rule without a new label, so version 2's hash changed from
+`60436361f0e94c24b4273afab59247564930998af40d9bdd9434f9b3e6945439` (the
+superseded run at `7066d6f`) to
+`5db2787e1cb75662aa7b66b9757a346a2f807e8643ec91477a36a529d255bc50` (the run at
+`20c7067`).
+
+The fourth revision is `micro-research-v3`, made after a third review and
+before any real data. It changes no rule. It corrects the fill wording:
+version 2 said a profit exit never fills at the high, but the search does fill
+at the high when the exit first fires within 1/4096 of a step below it. It
+also adds `micro_strategy`'s numeric constants to the hash, since version 2's
+hash did not change when a stop multiple or a protection share did. The run
+reported here is the version 3 run on `6aeeb01`, whose hashed code files are
+the final code's (`82913ca` after it changes one test file). Every figure in
+its result file equals the first version 3 run, on `cb7d082`, and version 2's
+run on `20c7067`; only the protocol text and its hash (against version 2),
+the code identity and the run times differ. Every earlier fixture run is
 superseded and is not evidence of anything.
 
 ## Data
@@ -90,9 +111,13 @@ costs at coarser, illustrative steps (not MEXC's, which come from the live catal
   21 validation and 21 holdout cycles at 25 USDT, every one closed by profit
   protection. These cycles are not
   independent samples. The fixture is periodic, so its validation and holdout
-  windows repeat the same 20-bar saw-tooth (8 bars out of phase) and the strategy's results on them are identical by
-  construction (register item 9 in `docs/ATB_MICRO_RELEASE_GATES.md`).
-* Every cycle on that fixture books between 0.012579 and 0.012580 USDT: the
+  windows repeat the same 20-bar saw-tooth (8 bars out of phase), so the
+  strategy's closed cycles and closed net on them are identical by
+  construction (register item 9 in `docs/ATB_MICRO_RELEASE_GATES.md`). The
+  marked figures differ only because validation ends with a holding still
+  open: 0.2684 USDT marked against the holdout's 0.2642.
+* At 25 USDT every cycle on that fixture books between 0.012579 and 0.012580
+  USDT (0.005032 to 0.005034 at 10 USDT, 0.007546 to 0.007547 at 15): the
   path is deterministic, so a confidence interval would be meaningless and
   none is given.
 * The random-entry baseline (200 runs) gives the only spread: on the ETH
@@ -117,7 +142,7 @@ The tables below are the output of
 which formats the committed result file without recomputing it. Amounts are
 USDT of simulated cash.
 
-Protocol `micro-research-v2`, SHA-256 `5db2787e1cb75662aa7b66b9757a346a2f807e8643ec91477a36a529d255bc50`; features `micro-features-v1`, decisions `micro-entry-v1`; run time 1213.3 s.
+Protocol `micro-research-v3`, SHA-256 `635c6356dd2521244c33e6917869cca854e2fe72129c80c97eb238d5f799bf34`; features `micro-features-v1`, decisions `micro-entry-v1`; run time 1716.9 s.
 
 Real data: NOT RUN: exchange endpoints are unreachable from the build environment
 

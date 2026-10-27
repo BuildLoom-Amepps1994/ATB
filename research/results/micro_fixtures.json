@@ -1,6 +1,6 @@
 {
  "protocol": {
-  "version": "micro-research-v2",
+  "version": "micro-research-v3",
   "frozen_before_results": true,
   "splits": {
    "development": 0.6,
@@ -11,7 +11,7 @@
   "warmup_bars_1m": 120,
   "decision": "every completed 1m bar; execution at the next bar open book",
   "exit_path": "low (loss, time and regime exits), then high (profit exits), then close of each held bar",
-  "profit_exit_fill": "the lowest price in the bar range at which a profit exit fires, never the high; the range is searched whenever the high is in profit, since the protection band lies below a hold gap",
+  "profit_exit_fill": "the lowest price in the bar range at which a profit exit fires, to within 1/4096 of a search step (steps of 2 bps from the low, at most 4000, then 12 halvings), so the high only when the exit first fires that close to it; the range is searched whenever the high is in profit, since the protection band lies below a hold gap",
   "stress_fee": "the multiple applies to the modeled fee, max(configured, public taker), in decimals",
   "open_at_end": "counted at its executable estimate in net_marked, which the verdict reads",
   "min_split_bars": 60,
@@ -63,7 +63,7 @@
   "random_baseline_budget": 25,
   "verdict_rule": "DEMONSTRATED only on real holdout data: net > 0, net > random mean + 2 sd, doubled-stress net > 0. Synthetic fixtures: MECHANICS ONLY."
  },
- "protocol_sha256": "5db2787e1cb75662aa7b66b9757a346a2f807e8643ec91477a36a529d255bc50",
+ "protocol_sha256": "635c6356dd2521244c33e6917869cca854e2fe72129c80c97eb238d5f799bf34",
  "feature_version": "micro-features-v1",
  "decision_version": "micro-entry-v1",
  "params": {
@@ -89,8 +89,8 @@
    "research/micro_research.py",
    "research/micro_fixtures.py"
   ],
-  "files_sha256": "f0bf6c28d39ffc96bdd43c99ecbc210243ab014b10337dd62c0bedf5de14b94d",
-  "commit": "20c70670a3d5fecf7caa8adceadc4d8bdb2ba875",
+  "files_sha256": "4d8beb5bef99e43434a379b2ceef796b61315e2aafdf83ede50a0d0fb7ab3297",
+  "commit": "6aeeb018edfd5d7d058d6e6d906392c184e0c26e",
   "dirty": false
  },
  "series": [
@@ -119,7 +119,7 @@
     "tick": 0.01,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 6.87,
+   "feature_seconds": 9.99,
    "by_budget": {
     "10": {
      "development": {
@@ -1461,7 +1461,7 @@
     "tick": 0.0001,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 7.05,
+   "feature_seconds": 9.29,
    "by_budget": {
     "10": {
      "development": {
@@ -2806,7 +2806,7 @@
     "tick": 0.01,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 6.89,
+   "feature_seconds": 9.11,
    "by_budget": {
     "10": {
      "development": {
@@ -4157,7 +4157,7 @@
     "tick": 0.01,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 7.07,
+   "feature_seconds": 9.01,
    "by_budget": {
     "10": {
      "development": {
@@ -5495,7 +5495,7 @@
     "tick": 0.0001,
     "from": "each bar (no recorded depth)"
    },
-   "feature_seconds": 6.84,
+   "feature_seconds": 10.11,
    "by_budget": {
     "10": {
      "development": {
@@ -7449,5 +7449,5 @@
   }
  ],
  "real_data": "NOT RUN: exchange endpoints are unreachable from the build environment",
- "runtime_seconds": 1213.3
+ "runtime_seconds": 1716.9
 }

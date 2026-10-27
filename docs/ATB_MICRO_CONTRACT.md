@@ -48,6 +48,18 @@ unless a field is explicitly a legacy float.
   Reason-code constants: `MARKET_UNKNOWN`, `MARKET_INACTIVE`, `MARKET_NOT_SPOT`,
   `SIDE_NOT_ALLOWED`, `MARKET_ORDERS_UNSUPPORTED`, `COST_BUY_UNSUPPORTED`,
   `METADATA_STALE`.
+  Added with the micro mode: `parse_mexc_symbol_commission(response, *,
+  symbol, received_at) -> AccountCommission` validates a supplied response of
+  MEXC's signed `GET /api/v3/tradeFee` (text, bytes or a decoded dict). It
+  raises `CommissionError` unless `code` is the integer 0, `data` is an
+  object with a valid taker rate (0 to 1 %), a valid maker rate (-1 % to
+  1 %) and, if one is stated, a valid RPI taker rate, and `timestamp` is a
+  positive integer; also on text that is not a JSON object, is over 4096
+  characters or repeats a key, and when the symbol or receive time is
+  missing. `msg` and extra keys are not checked; string or number rates are
+  accepted. Nothing calls the endpoint. `AccountCommission` (frozen): `exchange`, `symbol`,
+  `maker`, `taker`, `rpi_taker`, `venue_ms`, `received_at`, `source`;
+  `age_seconds(now)`, `as_dict()`.
 
 ## `micro_book.py`: validated order-book snapshots
 
@@ -133,8 +145,11 @@ class CostModel:
     sell_fee_currency: str      # quote | base | unknown
     def as_dict(self) -> dict
 
-def cost_model(*, configured_fee_pct, configured_slippage_pct, latency_bps, rules: VenueRules) -> CostModel
+def cost_model(*, configured_fee_pct, configured_slippage_pct, latency_bps, rules: VenueRules,
+               account: AccountCommission | None = None) -> CostModel
     # taker_fee = max(configured_fee_pct/100, rules.taker_fee or 0); unknown public fee -> configured only, noted.
+    # account (same exchange and symbol as rules, else MoneyError) joins the max: it can raise the fee, never lower it.
+    # No engine path passes one.
 
 @dataclass(frozen=True)
 class Walk:

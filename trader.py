@@ -2076,6 +2076,8 @@ class TradingEngine:
                 raise error('Stop the bot and wait for active operations before placing a manual trade.')
             if self.mode == 'paper' and symbol in self.micro.owned_symbols():
                 raise error('A micro cycle owns this pair. Use Exit all micro positions instead of a manual order.')
+            if self.mode == 'paper' and side == 'BUY' and symbol in self.micro.late_fill_symbols():
+                raise error('A late micro fill on this pair is not booked yet. Apply its recovery before a manual buy.')
             if (side == 'BUY' and micro_policy.is_micro(horizon=self.cfg.get('time_horizon'))
                     and symbol in self.cfg['watchlist']):
                 raise error('This pair is selected for micro cycles; a manual buy would block them. '

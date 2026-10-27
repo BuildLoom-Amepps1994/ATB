@@ -148,6 +148,13 @@ class CycleError(RuntimeError):
     """An illegal cycle transition or a cycle that changed underneath an update."""
 
 
+def _refusal(message: str, code: str) -> CycleError:
+    """A reservation refusal that names the waiting code the pair shows."""
+    error = CycleError(message)
+    error.code = code
+    return error
+
+
 # ---------------------------------------------------------------------- store
 def transition(db, cycle: dict, to_state: str, reason: str, *, data: dict | None = None, **fields) -> dict:
     """Move ``cycle`` to ``to_state`` inside the caller's transaction (optimistic version check)."""
@@ -309,7 +316,10 @@ class MicroManager:
 
     # ------------------------------------------------------------ latches
     def latch(self) -> dict | None:
-        raw = storage.get_meta(self._key('stop'))
+        return self._latch_record(storage.get_meta(self._key('stop')))
+
+    @staticmethod
+    def _latch_record(raw: str | None) -> dict | None:
         if not raw:
             return None
         try:
@@ -657,7 +667,11 @@ class MicroManager:
             position = db.execute('SELECT qty, cost FROM positions WHERE exchange=? AND mode=? AND symbol=?',
                                   (engine.exchange_name, 'paper', symbol)).fetchone()
             if closed:
-                # The ledger position is what is left of a closed cycle (its residual, if no later cycle carried it).
+                # The ledger position is what is left of a closed cycle (its residual, if no later cycle carried it),
+                # never a position bought outside the cycles: the late fill would be booked into it and adopted.
+                outside = self._outside_position(db, symbol, position) if position else None
+                if outside:
+                    raise CycleError(outside)
                 owned = money.parse(float(position['qty']), field='ledger quantity') if position else money.ZERO
                 basis = money.parse(float(position['cost']), field='ledger cost') if position else money.ZERO
             else:
@@ -768,6 +782,29 @@ class MicroManager:
             self._after_close(cycle)     # a corrected realized result counts toward the loss limits
         return outcome
 
+    def _outside_position(self, db, symbol: str, position) -> str | None:
+        """Why the pair's ledger row is not the remainder the closed cycles retain, or None when it is (or is dust).
+
+        The newest closed cycle with a residual holds the pair's current remainder: each close records all
+        that is left, a later cycle carries it, and a late-fill booking keeps one residual record per pair.
+        """
+        held = float(position['qty'])
+        row = db.execute("SELECT residual_base FROM micro_cycles WHERE exchange=? AND mode='paper' AND symbol=? "
+                         "AND state='CLOSED' AND residual_base IS NOT NULL AND residual_base NOT IN ('0', '') "
+                         'ORDER BY closed_wall DESC LIMIT 1', (self.engine.exchange_name, symbol)).fetchone()
+        retained = float(_dec(row['residual_base'], money.ZERO)) if row is not None else 0.0
+        if math.isclose(held, retained, rel_tol=1e-9, abs_tol=1e-12):
+            return None
+        price = float(position['cost']) / held if held > 0 else 0.0
+        if self.engine._is_dust(dict(position), self.engine._catalogue().get(symbol), price):
+            return None          # a remainder below the venue minimum is carried, as a new entry carries it
+        return (f'the ledger holds {held!r} {symbol.split("/")[0]}, outside the micro cycles (the closed cycles retain '
+                f'{retained!r}); close that manual or legacy position first, then apply the recovery')
+
+    def late_fill_symbols(self) -> set[str]:
+        """Pairs with a closed cycle whose late fill is not booked yet (its recovery books into the pair's position)."""
+        return {cycle['symbol'] for cycle in self._closed_late_fills()}
+
     def _sellable(self, symbol: str, quantity: Decimal, price: Decimal) -> bool:
         rules = self.rules(symbol)
         step = rules.amount_step
@@ -850,12 +887,21 @@ class MicroManager:
         return fresh
 
     def review_block(self) -> list[dict]:
-        """Unfinished outcomes that block every new micro entry."""
+        """Unfinished outcomes that block every new micro entry.
+
+        A mid-operation state is listed too when no operation can be running (stopped and idle): it was
+        interrupted and its check could not explain it, so it blocks entries like an unknown outcome."""
         blockers = []
+        idle = not self.engine._busy()
         for cycle in open_cycles(self.engine.exchange_name, 'paper'):
             if cycle['state'] in BLOCKING_STATES:
                 blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
                                  'explanation': cycle.get('review_reason') or cycle.get('last_reason') or 'review required'})
+            elif idle and cycle['state'] in TRANSIENT_STATES:
+                blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
+                                 'explanation': f'Interrupted ({cycle.get("last_reason") or "mid-operation"}); its '
+                                                'check has not explained it yet. Applying recovery reads the paper '
+                                                "venue's record; nothing is resent.", 'interrupted': True})
         for cycle in self._closed_late_fills():
             blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
                              'explanation': cycle['late_fill_reason'], 'late_fill': True})
@@ -880,9 +926,13 @@ class MicroManager:
                 # Interrupted mid-operation while the bot ran: explain it as a restart would, then recover.
                 self.settle_stranded()
                 cycle = load_cycle(cycle_id)
+                explanation = next((item.get('explanation') for item in self.recovery
+                                    if item.get('cycle_id') == cycle_id), cycle.get('last_reason'))
+                if cycle['state'] in TRANSIENT_STATES:
+                    raise storage.ConfigValidationError(f'The interrupted {cycle["symbol"]} cycle could not be checked '
+                                                        f'({explanation}). Nothing was booked; apply the recovery '
+                                                        'again, or restart the app.')
                 if cycle['state'] not in BLOCKING_STATES:
-                    explanation = next((item.get('explanation') for item in self.recovery
-                                        if item.get('cycle_id') == cycle_id), cycle.get('last_reason'))
                     return {'cycle_id': cycle_id, 'outcome': f'{cycle["state"].lower()}: {explanation}'}
             if cycle['state'] in TERMINAL and cycle.get('late_fill_reason'):
                 result = self._apply_closed_late_fill(cycle)
@@ -1681,20 +1731,29 @@ class MicroManager:
     def _entries(self, params, selected: list[str]) -> None:
         engine = self.engine
         now = time.time()
-        try:
-            # Re-evaluated before every entry pass: a close whose check never ran (a crash, a recovery) still counts.
-            self._check_loss_limits()
-        except Exception as exc:
-            for symbol in selected:
-                self._set_waiting(symbol, 'RISK', f'Micro loss limits could not be checked ({type(exc).__name__}); '
-                                  'no entry this pass', [type(exc).__name__])
+        open_symbols, blockers, latch, capacity = set(), [], None, False
+
+        def read_gates() -> bool:
+            """Read before every pair: an earlier pair's failed or unknown entry, or a close (and the latch it
+            engages) booked by the exit check between pairs, must stop the later pairs of this pass."""
+            nonlocal open_symbols, blockers, latch, capacity
+            try:
+                # Before every entry: a close whose check never ran (a crash, a recovery, a failure) still counts.
+                self._check_loss_limits()
+            except Exception as exc:
+                for symbol in selected:
+                    self._set_waiting(symbol, 'RISK', f'Micro loss limits could not be checked ({type(exc).__name__}); '
+                                      'no entry this pass', [type(exc).__name__])
+                return False
+            opened = open_cycles(engine.exchange_name, 'paper')
+            open_symbols = {c['symbol'] for c in opened}
+            blockers = [c for c in opened if c['state'] in BLOCKING_STATES or c['state'] in TRANSIENT_STATES]
+            blockers += self._closed_late_fills()
+            latch = self.latch()
+            capacity = len(opened) < int(engine.cfg['micro_max_cycles'])
+            return True
+        if not read_gates():
             return
-        opened = open_cycles(engine.exchange_name, 'paper')
-        open_symbols = {c['symbol'] for c in opened}
-        blockers = [c for c in opened if c['state'] in BLOCKING_STATES or c['state'] in TRANSIENT_STATES]
-        blockers += self._closed_late_fills()
-        latch = self.latch()
-        capacity = len(opened) < int(engine.cfg['micro_max_cycles'])
         entered = 0
         max_age = float(engine.cfg['micro_book_max_age_seconds'])
         offset = engine._clock_offset()
@@ -1704,6 +1763,8 @@ class MicroManager:
             if index:
                 # Every pair's book read can wait on the exchange: held cycles are re-checked between pairs.
                 self._manage_exits(params, only_due=True)
+                if not read_gates():
+                    return
             if symbol in open_symbols:
                 self._set_waiting(symbol, None, 'Cycle open', [])
                 continue
@@ -1810,9 +1871,6 @@ class MicroManager:
                 continue
             if self._enter(symbol, verdict, sizing, book, rules, cost, features, params):
                 entered += 1
-                opened = open_cycles(engine.exchange_name, 'paper')
-                open_symbols = {c['symbol'] for c in opened}
-                capacity = len(opened) < int(engine.cfg['micro_max_cycles'])
 
     def _record_decision(self, symbol, verdict, sizing_dict, book_summary, regime, context) -> None:
         with self.lock:
@@ -1864,8 +1922,9 @@ class MicroManager:
                 db.execute('BEGIN IMMEDIATE')
                 cash = money.parse(float(db.execute('SELECT value FROM meta WHERE key=?',
                                                     (engine._key('paper_cash'),)).fetchone()['value']), field='paper cash')
-                rows = db.execute("SELECT state, reserved_quote, basis_quote FROM micro_cycles WHERE exchange=? AND mode='paper' "
-                                  "AND state NOT IN ('CLOSED','ABANDONED')", (engine.exchange_name,)).fetchall()
+                rows = db.execute("SELECT symbol, state, reserved_quote, basis_quote FROM micro_cycles WHERE exchange=? "
+                                  "AND mode='paper' AND state NOT IN ('CLOSED','ABANDONED')",
+                                  (engine.exchange_name,)).fetchall()
                 reserved = money.add(*[_dec(r['reserved_quote'], money.ZERO) for r in rows])
                 basis = money.add(*[_dec(r['basis_quote'], money.ZERO) for r in rows])
                 if len(rows) >= int(engine.cfg['micro_max_cycles']):
@@ -1874,6 +1933,23 @@ class MicroManager:
                     raise CycleError('paper cash is already reserved by other entries')
                 if money.add(reserved, basis, sizing.max_debit) > self.allocation():
                     raise CycleError('the micro allocation is fully committed')
+                # The reservation is the last gate before any order: whatever happened earlier in this pass, an
+                # unresolved outcome, an unbooked late fill or the micro stop refuses it here.
+                unresolved = next((r for r in rows if r['state'] in BLOCKING_STATES or r['state'] in TRANSIENT_STATES),
+                                  None)
+                if unresolved is not None:
+                    raise _refusal(f'the {unresolved["symbol"]} cycle is unresolved ({unresolved["state"]}); new '
+                                   'entries wait for its recovery', 'REVIEW')
+                late = db.execute("SELECT symbol FROM micro_cycles WHERE exchange=? AND mode='paper' AND state IN "
+                                  "('CLOSED','ABANDONED') AND late_fill_reason IS NOT NULL LIMIT 1",
+                                  (engine.exchange_name,)).fetchone()
+                if late is not None:
+                    raise _refusal(f'a late {late["symbol"]} fill after its cycle closed is not booked; new entries '
+                                   'wait for its recovery', 'REVIEW')
+                stop = db.execute('SELECT value FROM meta WHERE key=?', (self._key('stop'),)).fetchone()
+                latched = self._latch_record(stop['value'] if stop is not None else None)
+                if latched:
+                    raise _refusal(f'the micro stop is latched ({latched.get("reason")})', 'RISK')
                 position = db.execute('SELECT qty, cost FROM positions WHERE exchange=? AND mode=? AND symbol=?',
                                       (engine.exchange_name, 'paper', symbol)).fetchone()
                 carried_base = carried_basis = money.ZERO
@@ -1898,8 +1974,9 @@ class MicroManager:
                             json.dumps({'reserved': money.text(sizing.max_debit), 'decision_id': verdict.decision_id,
                                         'opportunity_key': proposal['opportunity_key']})))
         except CycleError as exc:
-            self._set_waiting(symbol, 'CAPACITY' if 'capacity' in str(exc) or 'allocation' in str(exc) else 'RISK',
-                              str(exc), [str(exc)])
+            code = getattr(exc, 'code', None) or ('CAPACITY' if 'capacity' in str(exc) or 'allocation' in str(exc)
+                                                  else 'RISK')
+            self._set_waiting(symbol, code, str(exc), [str(exc)])
             return False
         except Exception as exc:
             # A duplicate opportunity key lands here too: that opportunity was already used.
@@ -1972,6 +2049,13 @@ class MicroManager:
                     self._manage_exit(cycle, params, operator=True, ignore_backoff=True)
                     results.append(cycle['symbol'])
         finally:
+            try:
+                # No pass follows while stopped: a sale whose booking failed, or that a failure interrupted after
+                # its fill, is explained now (EXIT_UNKNOWN, with its recovery), before anything else can start.
+                self.settle_stranded()
+            except Exception as exc:
+                storage.audit('error', f'Micro check after Exit all failed ({type(exc).__name__}); restart the app to '
+                                       'explain unfinished cycles.')
             with engine.lock:
                 engine._manual_order_active = engine.control_busy = False
                 engine.scan_lock.release()

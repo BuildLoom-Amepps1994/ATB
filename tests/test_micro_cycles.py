@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from decimal import Decimal
 from pathlib import Path
 
@@ -499,8 +500,8 @@ def two_setups(minute):
             SeriesMarket('BTC/USDT', minute - 300, mechanics(base=60000.0), market=fine_market('BTC/USDT'))]
 
 
-def captured_entries(w: World, monkeypatch) -> dict:
-    """Run the real strategy until both pairs decide to enter; keep the arguments, enter neither."""
+def captured_entries(w: World, monkeypatch, count: int = 2) -> dict:
+    """Run the real strategy until ``count`` pairs (both) decide to enter; keep the arguments, enter none."""
     captured = {}
     real_enter = micro.MicroManager._enter
 
@@ -508,7 +509,7 @@ def captured_entries(w: World, monkeypatch) -> dict:
         captured.setdefault(symbol, args)
         return False
     monkeypatch.setattr(micro.MicroManager, '_enter', capture)
-    assert w.run(60, until=lambda: len(captured) == 2)
+    assert w.run(60, until=lambda: len(captured) == count)
     monkeypatch.setattr(micro.MicroManager, '_enter', real_enter)
     return captured
 
@@ -551,6 +552,37 @@ def test_concurrent_entries_cannot_exceed_the_cycle_capacity(world, monkeypatch)
     assert len(w.cycles()) == 1 and len(held) == 1 and Decimal(held[0]['entry_debit']) <= Decimal('25')
     assert len(w.venue().records()) == 1
     assert_ledger_consistent(w)
+
+
+def test_the_reservation_refuses_while_the_micro_stop_is_latched_or_an_outcome_is_unresolved(world, monkeypatch):
+    # The reservation is the authoritative gate: it re-reads the latch and every cycle in its own transaction.
+    w = world(two_setups, micro_max_cycles=2)
+    captured = captured_entries(w, monkeypatch)
+    manager = w.engine.micro
+
+    def waiting(symbol):
+        return next(r for r in manager.status()['pairs'] if r['symbol'] == symbol)['waiting']
+    manager._engage_latch('test latch')
+    assert manager._enter('ETH/USDT', *captured['ETH/USDT']) is False
+    assert w.cycles() == [] and 'micro stop' in waiting('ETH/USDT')['status']
+    manager.clear_latch(micro.RESUME_PHRASE)
+    with storage.connection() as db:
+        db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (manager._key('stop'), '{not json'))
+    assert manager._enter('ETH/USDT', *captured['ETH/USDT']) is False and w.cycles() == []
+    manager.clear_latch(micro.RESUME_PHRASE)
+    assert manager._enter('ETH/USDT', *captured['ETH/USDT']) is True
+    held = w.cycles('HOLDING', 'ETH/USDT')[0]
+    with storage.connection() as db:
+        micro.transition(db, held, 'REVIEW', 'test: outcome needs review', review_reason='test')
+    assert manager._enter('BTC/USDT', *captured['BTC/USDT']) is False
+    assert w.cycles(symbol='BTC/USDT') == [] and waiting('BTC/USDT')['code'] == 'REVIEW'
+    with storage.connection() as db:
+        db.execute("UPDATE micro_cycles SET state='CLOSED', late_fill_reason='test late fill' WHERE cycle_id=?",
+                   (held['cycle_id'],))
+    assert manager._enter('BTC/USDT', *captured['BTC/USDT']) is False and w.cycles(symbol='BTC/USDT') == []
+    with storage.connection() as db:
+        db.execute('UPDATE micro_cycles SET late_fill_reason=NULL WHERE cycle_id=?', (held['cycle_id'],))
+    assert manager._enter('BTC/USDT', *captured['BTC/USDT']) is True          # nothing else was in the way
 
 
 def test_capacity_and_allocation_hold_across_pairs(world):
@@ -1140,6 +1172,86 @@ def test_a_booking_failure_while_running_is_settled_on_the_next_pass_and_blocks_
     assert_ledger_consistent(w)
 
 
+def _record_buys(w: World, monkeypatch) -> list:
+    """Each BUY sent, as (pass, symbol, other cycles mid-operation or blocking, micro stop engaged)."""
+    sent = []
+    real = w.engine._submit
+
+    def recording(client, symbol, side, **kwargs):
+        if side == 'BUY':
+            others = [(c['symbol'], c['state']) for c in micro.open_cycles(w.engine.exchange_name, 'paper')
+                      if c['symbol'] != symbol and c['state'] in micro.BLOCKING_STATES + micro.TRANSIENT_STATES]
+            sent.append((w.engine.micro.tick_count, symbol, others, w.engine.micro.latch() is not None))
+        return real(client, symbol, side, **kwargs)
+    monkeypatch.setattr(w.engine, '_submit', recording)
+    return sent
+
+
+def test_a_booking_failure_in_an_entry_pass_stops_the_next_pair_entering_in_that_pass(world, monkeypatch):
+    w = world(two_setups, micro_max_cycles=2)
+    sent = _record_buys(w, monkeypatch)
+    real = storage.update_order_intent
+    armed = {'on': True}
+
+    def flaky(intent_id, status, *args, **kwargs):
+        db = kwargs.get('db')
+        if armed['on'] and status == 'accounted' and db is not None:
+            if db.execute('SELECT side FROM order_journal WHERE intent_id=?', (intent_id,)).fetchone()['side'] == 'BUY':
+                armed['on'] = False
+                raise sqlite3.OperationalError('disk I/O error')     # the first entry's booking rolls back
+        return real(intent_id, status, *args, **kwargs)
+    monkeypatch.setattr(storage, 'update_order_intent', flaky)
+    w.run(120, until=lambda: not armed['on'])
+    stranded = w.cycles()[0]
+    assert stranded['state'] == 'ENTRY_SUBMITTED' and not w.engine.stop_event.is_set()
+    assert len(w.cycles()) == 1                  # no other pair entered in the pass that left a fill unbooked
+    assert [buy for buy in sent if buy[2]] == []
+    other = ({'ETH/USDT', 'BTC/USDT'} - {stranded['symbol']}).pop()
+    assert w.engine.micro.pairs[other]['decision']['code'] == 'REVIEW'      # its gates showed the block
+    w.run(30)
+    assert micro.load_cycle(stranded['cycle_id'])['state'] == 'ENTRY_UNKNOWN' and len(w.cycles()) == 1
+
+
+def test_an_unknown_entry_outcome_stops_the_next_pair_entering_in_that_pass(world, monkeypatch):
+    w = world(two_setups, micro_max_cycles=2)
+    sent = _record_buys(w, monkeypatch)
+    w.venue().drop_response_next = True                       # the first order fills, its answer is lost ...
+    monkeypatch.setattr(w.engine, '_locate_after_ambiguity', lambda *a, **k: None)    # ... and is not found
+    assert w.run(120, until=lambda: bool(w.cycles('ENTRY_UNKNOWN')))
+    assert len(w.cycles()) == 1 and len(w.venue().records()) == 1
+    assert [buy for buy in sent if buy[2]] == []
+
+
+def test_a_micro_stop_latched_by_the_exit_check_between_pairs_blocks_the_next_pair_in_that_pass(world, monkeypatch):
+    def eth_flat_btc_setup(minute):
+        return [SeriesMarket('ETH/USDT', minute - 300, flat(900, base=2500.0), market=fine_market('ETH/USDT')),
+                SeriesMarket('BTC/USDT', minute - 300, mechanics(base=60000.0), market=fine_market('BTC/USDT'))]
+    w = world(eth_flat_btc_setup, micro_max_cycles=2)
+    assert list(captured_entries(w, monkeypatch, 1)) == ['BTC/USDT']    # BTC decides to enter on this bar
+    real_entries, real_exits = micro.MicroManager._entries, micro.MicroManager._manage_exits
+    inside = {'entries': False}
+
+    def entries(self, params, selected):
+        inside['entries'] = True
+        try:
+            return real_entries(self, params, selected)
+        finally:
+            inside['entries'] = False
+
+    def exits(self, params, *, only_due=False):
+        real_exits(self, params, only_due=only_due)
+        if inside['entries']:
+            # Stands for a held cycle's losing close, booked by the check between pairs, reaching a loss limit.
+            self._engage_latch('test: a losing close reached the micro loss limit')
+    monkeypatch.setattr(micro.MicroManager, '_entries', entries)
+    monkeypatch.setattr(micro.MicroManager, '_manage_exits', exits)
+    sent = _record_buys(w, monkeypatch)
+    w.tick()                                                   # the same bar, BTC's setup unchanged
+    assert w.engine.micro.latch() is not None
+    assert w.cycles() == [] and sent == []
+    assert w.engine.micro.pairs['BTC/USDT']['decision']['code'] == 'RISK'   # decided on the latched gate
+
+
 def test_a_cycle_interrupted_mid_exit_can_be_recovered_while_stopped(world, monkeypatch):
     w = world()
     held = w.run_until_state('HOLDING')
@@ -1150,6 +1262,72 @@ def test_a_cycle_interrupted_mid_exit_can_be_recovered_while_stopped(world, monk
     result = w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)
     assert result['outcome'] == 'exit fill booked from the venue record'
     assert micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED'
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+def test_a_booking_failure_during_a_stopped_exit_all_is_explained_at_once_and_recoverable(world, monkeypatch):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    w.engine.running = False                                  # stopped: no pass will follow
+    armed = _fail_sell_booking_once(monkeypatch, held['cycle_id'])
+    assert w.engine.micro.flatten() == {'queued': False, 'attempted': ['ETH/USDT']}
+    assert not armed['on'] and [r['side'] for r in w.venue().records()] == ['buy', 'sell']
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_UNKNOWN'      # not left as "Exit sent"
+    assert [b['cycle_id'] for b in w.engine.micro.review_block()] == [held['cycle_id']]
+    result = w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)
+    assert result['outcome'] == 'exit fill booked from the venue record'
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED'
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+def test_a_failure_escaping_a_stopped_exit_all_after_the_fill_is_explained_at_once(world, monkeypatch):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    w.engine.running = False
+    real = storage.order_intent
+    armed = {'on': True}
+
+    def flaky(intent_id, *args, **kwargs):
+        if armed['on']:                         # the first read is _sell's, after the venue fill
+            armed['on'] = False
+            raise RuntimeError('journal read failed')
+        return real(intent_id, *args, **kwargs)
+    monkeypatch.setattr(storage, 'order_intent', flaky)
+    with pytest.raises(RuntimeError):
+        w.engine.micro.flatten()
+    monkeypatch.setattr(storage, 'order_intent', real)
+    assert [r['side'] for r in w.venue().records()] == ['buy', 'sell']
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_UNKNOWN'
+    assert [b['cycle_id'] for b in w.engine.micro.review_block()] == [held['cycle_id']]
+    assert w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)['outcome'] == 'exit fill booked from the venue record'
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+def test_an_interrupted_cycle_the_check_cannot_explain_is_listed_for_recovery_while_stopped(world, monkeypatch):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    w.engine.running = False
+    _fail_sell_booking_once(monkeypatch, held['cycle_id'])
+    real = micro.MicroManager._recover_cycle
+
+    def broken(self, cycle):
+        raise RuntimeError('recovery check failed')
+    monkeypatch.setattr(micro.MicroManager, '_recover_cycle', broken)
+    w.engine.micro.flatten()
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_SUBMITTED'
+    blockers = w.engine.micro.review_block()                 # stopped and idle: nothing can still be running
+    assert [(b['cycle_id'], b.get('interrupted')) for b in blockers] == [(held['cycle_id'], True)]
+    w.go()
+    assert w.engine.micro.review_block() == []               # while running, a mid-operation state is normal
+    w.engine.running = False
+    with pytest.raises(storage.ConfigValidationError, match='could not be checked'):
+        w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_SUBMITTED'
+    monkeypatch.setattr(micro.MicroManager, '_recover_cycle', real)
+    assert w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)['outcome'] == 'exit fill booked from the venue record'
     _no_order_booked_twice(w)
     assert_ledger_consistent(w)
 
@@ -1234,6 +1412,81 @@ def test_a_late_fill_after_the_cycle_closed_blocks_until_booked_and_never_ages_o
     w.run(45, until=lambda: micro.load_cycle(adopted[0]['cycle_id'])['state'] == 'CLOSED')
     assert micro.load_cycle(adopted[0]['cycle_id'])['state'] == 'CLOSED'
     assert_ledger_consistent(w)
+
+
+def _eth_position() -> list[dict]:
+    return storage.rows("SELECT qty, cost FROM positions WHERE symbol='ETH/USDT' AND mode='paper'")
+
+
+def _manual(engine, side: str, amount=None) -> dict:
+    return engine.manual_trade('ETH/USDT', side, amount, request_id=str(uuid.uuid4()),
+                               expected_context=engine.manual_order_context)
+
+
+def test_a_late_fill_after_close_is_never_booked_into_a_position_bought_outside_the_cycles(world):
+    w = world(micro_cooldown_seconds=0)
+    closed = w.run_until_state('CLOSED')
+    assert _eth_position() == []                                  # the cycle sold everything it held
+    w.engine.running = False
+    w.engine.stop_event.set()
+    w.engine.update_config(micro_settings(watchlist=['BTC/USDT']))     # ETH leaves the selection ...
+    _manual(w.engine, 'BUY', 50)                                       # ... and is bought by hand
+    manual = _eth_position()
+    _raise_entry_fill(w, closed['cycle_id'])                 # then the venue reports a late fill on the closed entry
+    engine = w.restart()
+    assert [b['cycle_id'] for b in engine.micro.review_block()] == [closed['cycle_id']]
+    cash, cycles = w.cash(), w.cycles()
+    with pytest.raises(storage.ConfigValidationError, match='outside the micro cycles'):
+        engine.micro.apply_recovery(closed['cycle_id'], REVIEW)
+    assert w.cycles() == cycles and w.cash() == cash             # nothing adopted, booked or changed
+    assert _eth_position() == manual and 'ETH/USDT' not in engine.micro.owned_symbols()
+    assert engine.micro.review_block()                            # the late fill still blocks new entries
+    # Once the outside position is closed, the recovery books the late quantity alone.
+    _manual(engine, 'SELL')
+    assert _eth_position() == []
+    engine.micro.apply_recovery(closed['cycle_id'], REVIEW)
+    adopted = [c for c in w.cycles() if c['strategy'] == 'late_fill_recovery']
+    assert len(adopted) == 1 and Decimal(adopted[0]['owned_base']) == Decimal('0.0004')
+    assert money_close(adopted[0]['basis_quote'], Decimal('1.0004') + Decimal('0.0010004'))
+    assert money_close(_eth_position()[0]['qty'], adopted[0]['owned_base'], Decimal('1e-12'))
+
+
+def test_a_late_fill_after_close_is_booked_onto_the_remainder_the_closed_cycle_retained(world):
+    w = world(micro_cooldown_seconds=0)
+    held = w.run_until_state('HOLDING')
+    venue = w.venue()
+    original = venue.create_order
+
+    def sale_fills_97_percent(symbol, *args, **kwargs):
+        venue.partial_next = Decimal('0.97')                # the rest is below the 1 USDT market minimum
+        return original(symbol, *args, **kwargs)
+    venue.create_order = sale_fills_97_percent
+    assert w.run(120, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    venue.create_order = original
+    retained = Decimal(micro.load_cycle(held['cycle_id'])['residual_base'])
+    assert retained > 0 and money_close(_eth_position()[0]['qty'], retained, Decimal('1e-12'))
+    _raise_entry_fill(w, held['cycle_id'])
+    engine = w.restart()
+    assert 'late fill booked' in engine.micro.apply_recovery(held['cycle_id'], REVIEW)['outcome']
+    adopted = [c for c in w.cycles() if c['strategy'] == 'late_fill_recovery']
+    assert len(adopted) == 1 and money_close(adopted[0]['owned_base'], retained + Decimal('0.0004'), Decimal('1e-12'))
+    assert_ledger_consistent(w)
+
+
+def test_a_manual_buy_waits_while_a_late_fill_on_a_closed_cycle_of_the_pair_is_unbooked(world):
+    w = world(micro_cooldown_seconds=0)
+    closed = w.run_until_state('CLOSED')
+    _raise_entry_fill(w, closed['cycle_id'])
+    w.run(5)
+    assert [b['cycle_id'] for b in w.engine.micro.review_block()] == [closed['cycle_id']]
+    w.engine.running = False
+    w.engine.stop_event.set()
+    w.engine.update_config(micro_settings(watchlist=['BTC/USDT']))
+    with pytest.raises(storage.ConfigValidationError, match='late micro fill'):
+        _manual(w.engine, 'BUY', 50)
+    assert _eth_position() == []
+    w.engine.micro.apply_recovery(closed['cycle_id'], REVIEW)
+    assert w.engine.micro.review_block() == []
 
 
 def test_a_late_sale_fill_corrects_the_cycle_totals_and_the_results(world):

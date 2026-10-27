@@ -94,7 +94,10 @@ Invariants:
 * **Durable intent and reservation before submit.** The cycle row with its
   reservation is committed (`BEGIN IMMEDIATE`, capacity, cash minus
   reservations and allocation re-checked inside the transaction) before the
-  risk gate; the journal intent before the order leaves.
+  risk gate; the journal intent before the order leaves. The same transaction
+  refuses the reservation while any cycle is unknown, in review or
+  mid-operation, a closed cycle carries an unbooked late fill, or the micro
+  stop is latched.
 * **One workflow per pair.** A unique partial index allows one unfinished
   cycle per exchange, mode and pair; another unique index allows one cycle per
   opportunity key (`pair|candidate|bar time`), so a duplicate event or a retry
@@ -106,12 +109,18 @@ Invariants:
   `REVIEW`, and any closed cycle carrying a late fill, blocks every new micro
   entry until the operator applies a recovery. The failure is contained: the
   worker keeps running (`_ledger_failure(contain=True)` for micro paper
-  orders), so every other open cycle keeps its exits.
+  orders), so every other open cycle keeps its exits. The entry pass reads
+  its gates again before each pair, so a failed or unknown entry, or a close
+  and latch booked by the exit check between pairs, stops the later pairs of
+  that pass too.
 * **Mid-operation states are short-lived.** `ENTRY_RESERVED`,
   `ENTRY_SUBMITTED` and `EXIT_SUBMITTED` exist only while one entry or exit
-  runs. One seen when nothing runs (the start of a pass, the worker's exit, a
-  recovery while stopped) was interrupted by a failure between its durable
-  writes and is settled by `settle_stranded`, exactly as a restart would.
+  runs. One seen when nothing runs (the start of a pass, the worker's exit,
+  the end of an Exit all while stopped, a recovery while stopped) was
+  interrupted by a failure between its durable writes and is settled by
+  `settle_stranded`, exactly as a restart would. One that this check cannot
+  explain is listed in `review_block` while the bot is stopped and idle, and
+  its recovery refuses until the check succeeds.
 * **Each attempt has its own intent.** The outcome of an interrupted attempt
   is read from the newest intent that is not `accounted` or `reconciled`; an
   accounted intent belongs to an earlier, finished attempt (a partial exit),
@@ -154,6 +163,9 @@ exactly the venue record, or releases when there is none. Nothing is resent.
 For a closed cycle with a late fill it books the extra quantity, fee and cash,
 corrects the cycle's totals, and gives a sellable resulting holding to a new
 `HOLDING` cycle (strategy `late_fill_recovery`) so that its exits manage it.
+It refuses while the pair's ledger position is not the remainder the closed
+cycles retain (a manual or legacy position that is not dust), and a manual buy
+of a pair waits while such a late fill is unbooked.
 
 While running, three checks keep the ledger and the venue record in step:
 

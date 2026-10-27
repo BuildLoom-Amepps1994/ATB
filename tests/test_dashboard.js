@@ -234,6 +234,22 @@ test('the recovery panel and its confirmation show the venue record the recovery
   assert.deepEqual(view.recoveryNotes, ['SOL/USDT: A venue order no journal intent explains <b>', 'micro cycle table unreadable: OperationalError']);
 });
 
+test('recovery check notes are dated: a pair\'s latest venue check, or what a start-up or interruption check found then', () => {
+  const state = microState();
+  state.recovery = [
+    {cycle_id: 'cyc_eeeeeeeeeeeeeeeeeeeeeeee', symbol: 'ETH/USDT', state: 'HOLDING', source: 'startup', at: 1767225600,
+     explanation: 'The exit order was never sent; the holding is unchanged and will be managed when the bot starts.'},
+    {symbol: 'BTC/USDT', order_id: 'paper-micro-9', action: 'review', source: 'conflict', at: 1767226500,
+     explanation: 'The paper venue holds an order no journal intent explains (orphan) <b>'},
+    {cycle_id: 'cyc_ffffffffffffffffffffffff', symbol: 'SOL/USDT', state: 'ABANDONED', source: 'settle', at: 1767226000,
+     explanation: 'The reservation was released: no order intent had been sent, so nothing can have filled.'}];
+  const utc = seconds => new Date(seconds * 1000).toISOString().slice(11, 19) + ' UTC';
+  assert.deepEqual(microView(state, utc).recoveryNotes, [
+    'ETH/USDT: The exit order was never sent; the holding is unchanged and will be managed when the bot starts. · start-up check at 00:00:00 UTC',
+    'BTC/USDT: The paper venue holds an order no journal intent explains (orphan) <b> · venue check at 00:15:00 UTC',   // plain text: the renderer escapes it
+    'SOL/USDT: The reservation was released: no order intent had been sent, so nothing can have filled. · interruption check at 00:06:40 UTC']);
+});
+
 test('a cycle that owns nothing never shows an exit estimate, its prices or its verdict', () => {
   const state = microState();
   state.cycles = [{cycle_id: 'cyc_dddddddddddddddddddddddd', symbol: 'ETH/USDT', state: 'ENTRY_UNKNOWN', strategy: 'range_reversion', owned_base: '0',

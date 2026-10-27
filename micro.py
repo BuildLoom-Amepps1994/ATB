@@ -427,7 +427,8 @@ class MicroManager:
         try:
             cycles = open_cycles(self.engine.exchange_name, 'paper')
         except Exception as exc:
-            self.recovery = [{'error': f'micro cycle table unreadable: {type(exc).__name__}'}]
+            self.recovery = [{'error': f'micro cycle table unreadable: {type(exc).__name__}', 'source': 'startup',
+                              'at': time.time()}]
             return self.recovery
         for cycle in cycles:
             try:
@@ -443,7 +444,8 @@ class MicroManager:
             self._check_loss_limits()
         except Exception as exc:
             self._engage_latch(f'micro loss limits could not be checked at startup ({type(exc).__name__})')
-        self.recovery = [item for item in explanations if item]
+        checked = time.time()                    # each finding is dated: what this check found then
+        self.recovery = [{**item, 'source': 'startup', 'at': checked} for item in explanations if item]
         if self.recovery:
             observability.event('micro.recovery', level='warning', items=self.recovery)
         return self.recovery
@@ -489,13 +491,23 @@ class MicroManager:
                     'nothing is booked or released meanwhile.')
         return self._describe_record(leg, intent, record)
 
+    @staticmethod
+    def _unreadable_refusal(exc: VenueRecordUnreadable) -> storage.ConfigValidationError:
+        return storage.ConfigValidationError(f'The paper venue record could not be read ({exc}). Nothing was '
+                                             'booked or released; apply the recovery again once it can be read.')
+
     def _recovery_record(self, intent: dict | None) -> dict | None:
         try:
             return self._venue_record(intent, strict=True)
         except VenueRecordUnreadable as exc:
-            raise storage.ConfigValidationError(f'The paper venue record could not be read ({exc}). Nothing was '
-                                                'booked or released; apply the recovery again once it can be '
-                                                'read.') from exc
+            raise self._unreadable_refusal(exc) from exc
+
+    def _recovery_late_fills(self, cycle: dict) -> list[tuple[dict, dict, Decimal]]:
+        """The late fills a recovery books; refused, before any write, while a venue record cannot be read."""
+        try:
+            return self._late_fills(cycle, strict=True)
+        except VenueRecordUnreadable as exc:
+            raise self._unreadable_refusal(exc) from exc
 
     @staticmethod
     def _never_sent(intent: dict | None) -> bool:
@@ -574,7 +586,7 @@ class MicroManager:
                 item = {'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
                         'explanation': f'recovery check failed: {type(exc).__name__}; review required'}
             if item:
-                found.append(item)
+                found.append({**item, 'source': 'settle', 'at': time.time()})
         if found:
             known = {item.get('cycle_id') for item in found}
             self.recovery = [item for item in self.recovery if item.get('cycle_id') not in known] + found
@@ -672,17 +684,22 @@ class MicroManager:
                             "('CLOSED','ABANDONED') AND late_fill_reason IS NOT NULL ORDER BY created_at",
                             (self.engine.exchange_name,))
 
-    def _late_fills(self, cycle: dict) -> list[tuple[dict, dict, Decimal]]:
-        """(intent, venue view, extra base) for each accounted order of ``cycle`` the venue later filled further."""
+    def _late_fills(self, cycle: dict, *, strict: bool = False) -> list[tuple[dict, dict, Decimal]]:
+        """(intent, venue view, extra base) for each accounted order of ``cycle`` the venue later filled further.
+
+        With ``strict`` a record that cannot be read or parsed raises ``VenueRecordUnreadable`` instead of
+        counting as no late fill: a recovery must never clear a late fill or adopt the ledger on a failed read."""
         found = []
         for intent in storage.rows("SELECT * FROM order_journal WHERE decision_id=? AND status='accounted' "
                                    'ORDER BY created_at', (cycle['cycle_id'],)):
-            view = self._venue_record(intent)
+            view = self._venue_record(intent, strict=strict)
             if view is None or intent.get('filled_quantity') is None:
                 continue
             try:
                 venue_filled = self._fill(view)['filled']
-            except Exception:
+            except Exception as exc:
+                if strict:
+                    raise VenueRecordUnreadable(type(exc).__name__) from exc
                 continue
             booked = money.parse(float(intent['filled_quantity']), field='booked fill')
             if venue_filled > booked:
@@ -917,7 +934,7 @@ class MicroManager:
         if others:
             raise storage.ConfigValidationError(f'Exit or recover the open {cycle["symbol"]} cycle first; the late fill '
                                                 'changes the same ledger position.')
-        late = self._late_fills(cycle)
+        late = self._recovery_late_fills(cycle)
         if not late:
             with storage.connection() as db:
                 stamp = _now_iso()
@@ -941,10 +958,13 @@ class MicroManager:
             return checked[1]
         found = self._orphans(symbol, since_ms=int((now - RECONCILE_WINDOW_S) * 1000))
         self._note_closed_late_fills(found)
+        stamp = time.time()
+        found = [{**item, 'symbol': symbol, 'source': 'conflict', 'at': stamp} for item in found]
         self._conflicts[symbol] = (mono, found)
-        if found:
-            known = {(item.get('order_id'), item.get('explanation')) for item in self.recovery}
-            self.recovery.extend(item for item in found if (item.get('order_id'), item.get('explanation')) not in known)
+        # The pair's latest check replaces its earlier one: a conflict that cleared, or a read that failed once,
+        # is not kept as if current. A closed cycle's late fill stays blocking through its late_fill_reason.
+        self.recovery = [item for item in self.recovery
+                         if not (item.get('source') == 'conflict' and item.get('symbol') == symbol)] + found
         return found
 
     def _final_answer(self, symbol: str, intent: dict | None, order: dict) -> dict:
@@ -1107,7 +1127,7 @@ class MicroManager:
         return {'cycle_id': cycle['cycle_id'], 'outcome': 'exit fill booked from the venue record'}
 
     def _apply_review(self, cycle: dict) -> dict:
-        late = self._late_fills(cycle)
+        late = self._recovery_late_fills(cycle)
         if late:
             try:
                 outcome = self._book_late_fills(cycle, late)
@@ -2267,6 +2287,10 @@ class MicroManager:
             opened = open_cycles(engine.exchange_name, 'paper')
         except Exception as exc:
             return {'active': self.active(), 'error': f'micro status unavailable: {type(exc).__name__}'}
+        blockers = self.review_block()
+        # A blocked cycle's row states what its recovery item states: an unknown outcome's venue record is read
+        # once per refresh, not taken from the reason stored when it was last explained (perhaps unreadable then).
+        explained = {item['cycle_id']: item['explanation'] for item in blockers}
         cycles = []
         for cycle in opened:
             row = self.pairs.get(cycle['symbol'], {})
@@ -2278,6 +2302,7 @@ class MicroManager:
                 'entry_price', 'entry_fee_status', 'entry_partial', 'carried_base', 'target_net', 'stop_net',
                 'max_hold_s', 'peak_est_net', 'realized_net', 'exit_count', 'last_reason', 'review_reason',
                 'reserved_quote')} | {
+                'review_reason': explained.get(cycle['cycle_id'], cycle['review_reason']),
                 'age_s': round(time.time() - float(cycle['opened_wall']), 1) if cycle['opened_wall'] else None,
                 'pending_s': None if cycle['opened_wall'] else _seconds_since(cycle.get('created_at')),
                 'estimate': exit_view.get('estimate'), 'exit_verdict': exit_view.get('verdict'),
@@ -2313,7 +2338,7 @@ class MicroManager:
             'params': {key: engine.cfg[key] for key in storage.MICRO_FIELDS} | {
                 'uncertainty_floor_bps': UNCERTAINTY_FLOOR_BPS, 'max_spread_bps': self.params().max_spread_bps,
                 'max_vol_bps': MAX_VOL_BPS, 'edge_ratio': EDGE_RATIO},
-            'latch': latch, 'review_block': self.review_block(), 'recovery': list(self.recovery),
+            'latch': latch, 'review_block': blockers, 'recovery': list(self.recovery),
             'exit_all_pending_s': round(self.flatten_pending(), 1),
             'pairs': pairs, 'cycles': cycles, 'results': self.results(), 'counters': counters,
             'books': books, 'last_tick': self.last_tick, 'last_error': self.last_error,

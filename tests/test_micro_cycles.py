@@ -388,6 +388,71 @@ def test_an_orphan_venue_order_blocks_new_entries_on_that_pair(world):
     assert any('orphan' in item['explanation'] for item in w.engine.micro.recovery)
 
 
+def test_a_pairs_conflict_note_is_replaced_by_its_next_venue_check(world, monkeypatch):
+    w = world()
+    venue = w.venue()
+    real = venue.records
+    failed = []
+
+    def flaky(symbol=None, *args, **kwargs):
+        if symbol == 'ETH/USDT' and not failed:             # one transient failure of the pair's conflict check
+            failed.append(time.time())
+            raise sqlite3.OperationalError('database is locked')
+        return real(symbol, *args, **kwargs)
+    monkeypatch.setattr(venue, 'records', flaky)
+
+    def unreadable() -> list[dict]:
+        return [item for item in w.engine.micro.status()['recovery'] if 'unreadable' in str(item.get('explanation'))]
+    assert w.run(60, until=lambda: bool(failed))
+    found = time.time()
+    [note] = unreadable()                                    # shown while it is the pair's latest check
+    assert note['symbol'] == 'ETH/USDT'
+    assert w.run(600, until=lambda: len(w.cycles('CLOSED', 'ETH/USDT')) >= 2)    # later checks are clean
+    assert unreadable() == []
+    assert note.get('source') == 'conflict' and failed[0] <= note.get('at', 0) <= found   # dated by its check
+
+
+def test_start_up_and_interruption_check_findings_carry_the_time_of_their_check(world, monkeypatch):
+    w = world()
+    real = w.engine._submit
+
+    def die(client, symbol, side, **kwargs):
+        if side == 'SELL':
+            raise Crash()                                    # the process dies before the exit order leaves
+        return real(client, symbol, side, **kwargs)
+    monkeypatch.setattr(w.engine, '_submit', die)
+    with pytest.raises(Crash):
+        w.run(120)
+    stranded = w.cycles()[-1]
+    assert stranded['state'] == 'EXIT_SUBMITTED'
+    before = time.time()
+    engine = w.restart()
+    checked = time.time()
+    [item] = [i for i in engine.micro.status()['recovery'] if i.get('cycle_id') == stranded['cycle_id']]
+    assert item['state'] == 'HOLDING' and 'never sent' in item['explanation']
+    assert item.get('source') == 'startup' and before <= item.get('at', 0) <= checked
+    w.go()
+    assert w.run(600, until=lambda: micro.load_cycle(stranded['cycle_id'])['state'] == 'CLOSED')
+    [later] = [i for i in engine.micro.status()['recovery'] if i.get('cycle_id') == stranded['cycle_id']]
+    assert later['at'] == item['at'] < time.time()            # a dated past event, not a current check
+    # A reservation interrupted while running is settled in-process: its finding is dated too.
+    authorize = engine._authorize
+
+    def broken(*args, **kwargs):
+        if args[1] == 'BUY':
+            raise RuntimeError('gate unavailable')
+        return authorize(*args, **kwargs)
+    monkeypatch.setattr(engine, '_authorize', broken)
+    with pytest.raises(RuntimeError):
+        w.run(600)
+    monkeypatch.setattr(engine, '_authorize', authorize)
+    before = time.time()
+    w.tick()
+    [released] = [i for i in engine.micro.recovery if i.get('state') == 'ABANDONED']
+    assert 'released' in released['explanation'] and released['source'] == 'settle'
+    assert before <= released['at'] <= time.time()
+
+
 # ===================================================================== item 17
 def test_reentry_needs_a_settled_exit_a_new_bar_and_survives_a_restart(world):
     w = world(micro_cooldown_seconds=0)
@@ -2469,9 +2534,103 @@ def test_an_exit_whose_venue_record_cannot_be_read_is_not_returned_to_holding(wo
     assert_ledger_consistent(w)
 
 
+def _venue_record_fails(monkeypatch, failure: str):
+    """The paper venue record cannot be read ('read') or its fill cannot be parsed ('parse'); returns an undo."""
+    if failure == 'read':
+        real = micro.micro_venue.MicroPaperVenue.fetch_order
+        monkeypatch.setattr(micro.micro_venue.MicroPaperVenue, 'fetch_order', _unreadable)
+        return lambda: monkeypatch.setattr(micro.micro_venue.MicroPaperVenue, 'fetch_order', real)
+    real = micro.MicroManager.__dict__['_fill']
+
+    def unparseable(order):
+        raise money.MoneyError('the fill has no positive quantity and cost')
+    monkeypatch.setattr(micro.MicroManager, '_fill', staticmethod(unparseable))
+    return lambda: monkeypatch.setattr(micro.MicroManager, '_fill', real)
+
+
+@pytest.mark.parametrize('failure', ['read', 'parse'])
+def test_a_closed_cycles_late_fill_is_never_cleared_while_its_venue_record_cannot_be_read(world, monkeypatch, failure):
+    w = world(micro_cooldown_seconds=0)
+    w.venue().partial_next = Decimal('0.5')
+    w.run_until_state('HOLDING')
+    closed = w.run_until_state('CLOSED')
+    _raise_entry_fill(w, closed['cycle_id'])
+    w.run(30)
+    engine = w.restart()
+    blocked = micro.load_cycle(closed['cycle_id'])
+    assert blocked['late_fill_reason'] and [b['cycle_id'] for b in engine.micro.review_block()] == [closed['cycle_id']]
+    cash, cycles, position = w.cash(), w.cycles(), _eth_position()
+    restore = _venue_record_fails(monkeypatch, failure)
+    with pytest.raises(storage.ConfigValidationError, match='could not be read'):
+        engine.micro.apply_recovery(closed['cycle_id'], REVIEW)
+    assert micro.load_cycle(closed['cycle_id']) == blocked          # the late fill is not cleared
+    assert w.cycles() == cycles and w.cash() == cash and _eth_position() == position
+    assert [b['cycle_id'] for b in engine.micro.review_block()] == [closed['cycle_id']]   # still blocks entries
+    restore()
+    assert 'late fill booked' in engine.micro.apply_recovery(closed['cycle_id'], REVIEW)['outcome']
+    assert engine.micro.review_block() == []
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+@pytest.mark.parametrize('failure', ['read', 'parse'])
+def test_a_review_recovery_never_adopts_the_ledger_while_the_venue_record_cannot_be_read(world, monkeypatch, failure):
+    w = world()
+    w.venue().partial_next = Decimal('0.5')
+    held = w.run_until_state('HOLDING')
+    _raise_entry_fill(w, held['cycle_id'])
+    w.set_closes('ETH/USDT', float(Decimal(held['entry_price'])))     # keep the price still: no exit meanwhile
+    w.run(1)
+    review = micro.load_cycle(held['cycle_id'])
+    assert review['state'] == 'REVIEW' and 'late fill' in review['review_reason']
+    w.engine.running = False
+    cash, position = w.cash(), _eth_position()
+    restore = _venue_record_fails(monkeypatch, failure)
+    with pytest.raises(storage.ConfigValidationError, match='could not be read'):
+        w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)
+    assert micro.load_cycle(held['cycle_id']) == review             # still REVIEW, with its reason
+    assert w.cash() == cash and _eth_position() == position
+    assert [b['state'] for b in w.engine.micro.review_block()] == ['REVIEW']
+    restore()
+    assert w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)['outcome'] == 'late fill booked from the venue record'
+    after = micro.load_cycle(held['cycle_id'])
+    assert after['state'] == 'HOLDING' and Decimal(after['owned_base']) == Decimal(held['owned_base']) + Decimal('0.0004')
+    assert_ledger_consistent(w)
+
+
 def _status_cycle(w: World, cycle_id: str) -> dict:
     [found] = [c for c in w.engine.micro.status()['cycles'] if c['cycle_id'] == cycle_id]
     return found
+
+
+@pytest.mark.parametrize('readable_at_restart', [False, True])
+def test_an_unknown_outcomes_row_states_the_venue_record_its_recovery_item_states(world, monkeypatch, readable_at_restart):
+    w = world()
+    _fail_entry_journal_once(monkeypatch)
+    assert w.run(60, until=lambda: bool(w.cycles('ENTRY_UNKNOWN')))
+    cycle = w.cycles('ENTRY_UNKNOWN')[0]
+    real_fetch = micro.micro_venue.MicroPaperVenue.fetch_order
+    reads = []
+
+    def counted(*args, **kwargs):
+        reads.append(1)
+        return real_fetch(*args, **kwargs)
+
+    def reading(readable: bool) -> None:
+        monkeypatch.setattr(micro.micro_venue.MicroPaperVenue, 'fetch_order', counted if readable else _unreadable)
+    reading(readable_at_restart)
+    engine = w.restart()                       # the start-up check stores what it could read in review_reason
+    stored = micro.load_cycle(cycle['cycle_id'])['review_reason']
+    assert ('could not be read' in stored) is not readable_at_restart
+    reading(not readable_at_restart)           # then the venue becomes readable, or unreadable
+    reads.clear()
+    status = engine.micro.status()
+    [row] = [c for c in status['cycles'] if c['cycle_id'] == cycle['cycle_id']]
+    [item] = [b for b in status['review_block'] if b['cycle_id'] == cycle['cycle_id']]
+    assert row['review_reason'] == item['explanation']       # the row's Next text is the recovery's text
+    assert ('could not be read' in row['review_reason']) is readable_at_restart
+    assert ('filled for' in row['review_reason']) is not readable_at_restart
+    assert len(reads) == (0 if readable_at_restart else 1)    # one venue read per refresh, not one per place shown
 
 
 def test_a_closed_cycles_last_estimate_never_shows_on_the_next_cycle_of_the_pair(world):

@@ -161,9 +161,10 @@
     return 'Apply the recovery for ' + String(item?.symbol ?? '') + ' (' + String(item?.state ?? '') + ')? It books exactly what the paper venue record shows'
       + ' (the bot must be stopped): ' + String(item?.explanation || 'no explanation is available; refresh the dashboard first.') + ' Type exactly: I HAVE REVIEWED THIS CYCLE';
   }
+  const MICRO_CHECKS = {conflict: 'venue check', startup: 'start-up check', settle: 'interruption check'};
   // Everything the micro panel shows, from /api/state's micro block, as plain strings for escaping.
   // null hides the panel (micro not selected and nothing open). Estimates and confirmed figures stay apart.
-  function microView(micro) {
+  function microView(micro, formatTime = seconds => new Date(seconds * 1000).toLocaleTimeString()) {
     if (!micro || typeof micro !== 'object') return null;
     const cycles = Array.isArray(micro.cycles) ? micro.cycles : [];
     if (!micro.active && !cycles.length) return null;
@@ -236,11 +237,16 @@
     const counters = Object.entries(micro.counters || {}).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([code, count]) => String(code) + ' ' + String(count));
     const triggers = Object.entries(r.exit_triggers || {}).map(([trigger, count]) => String(trigger) + ' ' + String(count));
     const recovery = blockers.map(item => ({cycle_id: String(item.cycle_id), symbol: String(item.symbol), state: MICRO_STATES[item.state] || String(item.state), explanation: String(item.explanation || '')}));
-    // What the recovery checks found that has no cycle to apply here (an orphan venue order, a released reservation).
+    // What the recovery checks found that has no cycle to apply here (an orphan venue order, a released reservation),
+    // dated by its check: a pair's venue check is replaced by its next one; a start-up or interruption check is past.
     const blocking = new Set(blockers.map(item => String(item.cycle_id)));
     const recoveryNotes = [...new Set((Array.isArray(micro.recovery) ? micro.recovery : [])
       .filter(item => item && typeof item === 'object' && !(item.cycle_id != null && blocking.has(String(item.cycle_id))))
-      .map(item => (item.symbol ? String(item.symbol) + ': ' : '') + String(item.explanation || item.error || 'review required')))];
+      .map(item => {
+        const text = (item.symbol ? String(item.symbol) + ': ' : '') + String(item.explanation || item.error || 'review required');
+        const at = Number(item.at);
+        return Number.isFinite(at) && at > 0 ? text + ' · ' + (Object.hasOwn(MICRO_CHECKS, String(item.source)) ? MICRO_CHECKS[item.source] : 'check') + ' at ' + String(formatTime(at)) : text;
+      }))];
     const notes = [String(micro.paper_only_reason || 'PAPER only.'), String(r.note || ''), String(micro.heuristic_note || '')].filter(Boolean);
     if (triggers.length) notes.push('Exit triggers: ' + triggers.join(' · '));
     return {headline: !micro.active ? 'Micro cycles open (strategy changed)' : micro.running ? 'Running · PAPER micro cycles' : 'Stopped · Start bot begins PAPER micro cycles for the selected pairs',

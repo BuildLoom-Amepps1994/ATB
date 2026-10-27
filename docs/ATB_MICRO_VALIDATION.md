@@ -324,6 +324,22 @@ after each change; they are not added to the totals above.
     times (all three added anyway).
   * Round 3, two reviewers (the round 2 parser fixes; the `money.parse`
     changes and every caller of `money.parse`): no finding.
+* **Fact-check of the final documentation changes** (everything above about
+  the parser, the research rerun and the final runs): two checkers, each
+  finding then checked by a separate verifier. 16 findings survived, none
+  was rejected, and all were corrected in these documents: the file the
+  Windows no-caller failure stopped at (`ccxt/abstract/kucoin.py`, not
+  `fetch_trading_fee`), what the second rejected finding of parser round 1
+  was about, a rejection listed under the third review that came from the
+  fourth, an unclear "sixth review", the list of the final fact-check's
+  corrections, the mutation variants, register item 17 and the review row
+  (which left out `82913ca`), three statements in the performance document
+  about what changed after the benchmarked commits, the STALE_DATA timing
+  after a bar close (about 6 to 9 s until an entry decision, and about 7 s
+  for the fourth run's samples), and the changelog, contract and
+  architecture wording that said the parser refuses anything but the
+  documented shape (it does not check `msg` or extra keys, and accepts rates
+  as strings).
 
 ## Brief test matrix (items 1 to 30)
 

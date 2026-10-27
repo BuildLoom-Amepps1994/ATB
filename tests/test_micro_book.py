@@ -603,6 +603,29 @@ def test_a_venue_counter_restart_is_accepted_once_rising_lower_ids_outlast_the_a
     assert tracker.sequence_resets == 2
 
 
+def test_a_venue_counter_restart_is_accepted_while_a_lagging_replica_answers_inside_the_run():
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(7_000_000_023, mono=100.0))
+    # the venue restarted its lastUpdateId counter. Reads are 1 s apart and every other one comes from a replica
+    # that lags by more than that: its id is lower than the previous read's, but not lower than the run's first
+    for n, mono in ((264, 101.0), (270, 102.0), (267, 103.0), (276, 104.0), (273, 105.0), (282, 106.0)):
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(n, mono=mono))
+    # the run began at 101.0 and its ids rose above its first one: the restart is accepted after the age limit
+    restarted = tracker.accept(seq(288, mono=107.0))
+    assert tracker.latest('ETH/USDT', now_mono=107.1) is restarted and restarted.generation == 2
+    row = tracker.status(107.1)['ETH/USDT']
+    assert row['sequence_resets'] == 1 and row['sequence'] == 288 and tracker.sequence_resets == 1
+    # on the new counter the lagging replica is out of order again, and the leading one is accepted
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(285, mono=108.0))
+    assert tracker.accept(seq(294, mono=109.0)).generation == 3
+    # an id lower than the run's first one could be a second restart: the run starts over from it
+    tracker.accept(seq(9_000, mono=110.0, symbol='BTC/USDT'))
+    for n, mono in ((264, 111.0), (250, 112.0), (270, 116.5)):
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(n, mono=mono, symbol='BTC/USDT'))
+    assert tracker.accept(seq(275, mono=117.5, symbol='BTC/USDT')).venue_sequence == 275
+    assert tracker.sequence_resets == 2
+
+
 def test_a_lagging_or_stuck_replica_is_still_refused_as_out_of_order():
     tracker = BookTracker(max_age_s=5)
     tracker.accept(seq(1000, mono=100.0))
@@ -611,7 +634,7 @@ def test_a_lagging_or_stuck_replica_is_still_refused_as_out_of_order():
     # a replica stuck on one id never rises, however long it answers
     for mono in (203.0, 206.0, 260.0):
         refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(990, mono=mono))
-    # ids that fall back come from two sources, not one restarted counter: the run starts over
+    # an id below the run's first one could be a second restart: the run starts over from it
     refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(980, mono=261.0))
     refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(985, mono=265.0))
     # an accepted book ends the run too

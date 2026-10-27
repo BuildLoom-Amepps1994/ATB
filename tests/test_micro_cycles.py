@@ -2080,6 +2080,33 @@ def test_a_venue_id_restart_while_held_recovers_the_book_the_profit_exit_and_the
     assert_ledger_consistent(w)
 
 
+def test_a_venue_id_restart_while_held_recovers_the_profit_exit_under_a_lagging_replica(world):
+    w = world()
+    offset = {'ids': 7_000_000_000}
+    offset_depth_ids(w, 'ETH/USDT', offset)
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    served, leading = [], w.exchange.fetch_order_book
+
+    def replicas(name, limit=None, params=None):
+        book = leading(name, limit, params)
+        if name == 'ETH/USDT' and offset['ids'] == 0:
+            if len(served) % 2:
+                # every other read comes from a replica that lags by more than the time between reads: its id is
+                # lower than the previous read's (only the id lags here, the prices and stamp are the leading ones)
+                book['nonce'] = served[-1] - 1
+            served.append(book['nonce'])
+        return book
+    w.exchange.fetch_order_book = replicas
+    offset['ids'] = 0                                    # the venue restarted its lastUpdateId counter
+    assert w.run(60, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    closed = micro.load_cycle(held['cycle_id'])
+    assert closed['last_exit_trigger'] == 'take_profit', closed['last_exit_trigger']   # depth came back
+    assert len(served) >= 4 and any(b < a for a, b in zip(served, served[1:]))
+    row = w.engine.micro.books.status(w.clock.monotonic())['ETH/USDT']
+    assert row['sequence_resets'] == 1 and row['sequence'] < 7_000_000_000
+    assert_ledger_consistent(w)
+
+
 def test_a_venue_id_restart_on_a_residual_pair_does_not_block_entries_on_other_pairs(world):
     w = world(two_setups, micro_cooldown_seconds=0, data_max_age_seconds=30)
     offset = {'ids': 7_000_000_000}

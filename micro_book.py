@@ -414,7 +414,7 @@ class _Track:
     last_error: str | None = None
     accepted: int = 0
     refused: int = 0
-    # (first receipt, first id, last id, last receipt) of the lower venue ids refused since the stored book
+    # (first receipt, first id, highest id, last receipt) of the lower venue ids refused since the stored book
     lower_run: tuple[float, int, int, float] | None = None
     sequence_resets: int = 0          # venue counter restarts accepted (see BookTracker)
 
@@ -442,14 +442,15 @@ class BookTracker:
     venue's update ids or the venue's own clock.
 
     A venue that restarted its update-id counter sends only ids lower than
-    the newest accepted. When such lower ids keep arriving, each no lower
-    than the one before and rising overall, for longer than ``max_age_s``
-    with no snapshot accepted in between (and each received after the
-    stored book), the stored book has expired and nothing else is coming:
-    that symbol's id evidence starts over from the current snapshot, which
-    is accepted and counted in ``sequence_resets``. One lower id, a replica
-    stuck on one id, ids that fall back, or a venue timestamp older than the
-    newest accepted are still refused.
+    the newest accepted. When such lower ids keep arriving, none below the
+    first of them and rising above it, for longer than ``max_age_s`` with no
+    snapshot accepted in between (and each received after the stored book),
+    the stored book has expired and nothing else is coming: that symbol's id
+    evidence starts over from the current snapshot, which is accepted and
+    counted in ``sequence_resets``. A lagging replica's id below the previous
+    one keeps the run; an id below the run's first starts it over. One lower
+    id, a replica stuck on one id, or a venue timestamp older than the newest
+    accepted are still refused.
 
     ``invalidate`` (a stream reconnect) clears the served snapshot and the
     venue evidence, so a venue that restarted its counters cannot lock a
@@ -584,19 +585,22 @@ class BookTracker:
         """Record a venue id lower than the newest accepted; True once the run of them shows a counter restart.
 
         A run starts at the first lower id received after the stored book and
-        ends with the next accepted snapshot. A lower id received before the
-        run's last one (handed over late) adds nothing; one lower than the
-        run's last starts a new run, since one counter never goes back.
+        ends with the next accepted snapshot; its third field is its highest
+        id. A lower id received before the run's last one (handed over late)
+        adds nothing. One below the run's last but not below its first comes
+        from a lagging replica and keeps the run; one below the run's first
+        starts a new run, since it could be a second restart.
         """
         mono, sequence = snapshot.received_mono, snapshot.venue_sequence
         stored, run = track.snapshot, track.lower_run
         if (stored is not None and mono <= stored.received_mono) or (run is not None and mono < run[3]):
             return False
-        if run is None or sequence < run[2]:
+        if run is None or sequence < run[1]:
             track.lower_run = (mono, sequence, sequence, mono)
             return False
-        track.lower_run = (run[0], run[1], sequence, mono)
-        return sequence > run[1] and mono - run[0] > self.max_age_s
+        highest = max(run[2], sequence)
+        track.lower_run = (run[0], run[1], highest, mono)
+        return highest > run[1] and mono - run[0] > self.max_age_s
 
     def latest(self, symbol: str, *, now_mono: float, max_age_s: float | None = None) -> BookSnapshot | None:
         """The stored snapshot when it is valid and no older than the limit, else None.

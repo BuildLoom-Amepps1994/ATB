@@ -7,6 +7,7 @@ or hostile variants that must fail closed. No request is signed or sent.
 """
 import ast
 import json
+import os
 import sys
 from dataclasses import replace
 from decimal import Decimal
@@ -133,7 +134,8 @@ def test_a_maker_rebate_is_kept_as_a_negative_rate():
     ('not json', 'not valid JSON'),
     ('{"code": 0, "data": {"takerCommission": NaN, "makerCommission": 0}, "timestamp": 1}', 'not valid JSON'),
     ('{"code": 0, "data": {"takerCommission": Infinity, "makerCommission": 0}, "timestamp": 1}', 'not valid JSON'),
-    ('[' * 100000 + ']' * 100000, 'too long'),
+    # A short id: pytest puts the id in PYTEST_CURRENT_TEST, which Windows caps at 32767 characters.
+    pytest.param('[' * 100000 + ']' * 100000, 'too long', id='200k-nested-brackets'),
     (b'\xff\xfe', 'not UTF-8'),
     # Decimal raises InvalidOperation (an ArithmeticError) on an exponent it cannot hold.
     (DOCUMENTED.replace('0.000500000000000000', '1e1000000000000000000'), 'not valid JSON'),
@@ -245,14 +247,21 @@ def test_an_account_rate_for_another_symbol_or_venue_is_refused():
         model({'taker': '0.0005'})
 
 
-SKIPPED_DIRS = {'tests', '.claude', '.git', '__pycache__', 'build', 'dist', 'node_modules'}
+SKIPPED_DIRS = {'tests', '__pycache__', 'build', 'dist', 'node_modules', 'site-packages', 'venv', 'env'}
 
 
-def application_sources():
-    root = Path(__file__).resolve().parents[1]
-    for path in sorted(root.rglob('*.py')):
-        if not SKIPPED_DIRS.intersection(path.relative_to(root).parts[:-1]):
-            yield path, path.read_text(encoding='utf-8')
+def application_sources(root=Path(__file__).resolve().parents[1]):
+    """The repository's own Python files: not tests, hidden folders (.git, .claude, the CI's .build-venv) or environments."""
+    found = []
+    for folder, subfolders, files in os.walk(root):
+        here = Path(folder)
+        subfolders[:] = sorted(name for name in subfolders
+                               if not name.startswith('.') and name not in SKIPPED_DIRS
+                               and not (here / name / 'pyvenv.cfg').exists()
+                               and not (here / name / 'conda-meta').exists())
+        found.extend(here / name for name in sorted(files) if name.endswith('.py'))
+    for path in found:
+        yield path, path.read_text(encoding='utf-8')
 
 
 def test_no_application_module_obtains_a_signed_fee():
@@ -265,6 +274,7 @@ def test_no_application_module_obtains_a_signed_fee():
     forbidden = ('gettradefee', 'get_tradefee', 'fetch_trading_fee', 'fetchtradingfee')
     sources = list(application_sources())
     assert any(path.name == 'micro.py' for path, _ in sources)      # the walk does see the application
+    assert {'research', 'scripts', 'benchmarks'} <= {path.parent.name for path, _ in sources}
     for path, text in sources:
         lowered = text.lower()
         assert not any(name in lowered for name in forbidden), path
@@ -284,3 +294,21 @@ def test_no_application_module_obtains_a_signed_fee():
                       if isinstance(node, ast.Call) and getattr(node.func, 'attr', getattr(node.func, 'id', None))
                       == 'cost_model' and any(keyword.arg in ('account', None) for keyword in node.keywords)]
     assert passes_account == []                                     # no code path feeds an account rate yet
+
+
+def test_the_source_walk_skips_tests_hidden_folders_and_environments(tmp_path):
+    """The Windows CI builds its virtual environment inside the checkout (.build-venv), full of CCXT's own fee methods."""
+    for name in ('app.py', 'research/harness.py', 'tests/test_app.py', '.build-venv/Lib/site-packages/ccxt/x.py',
+                 'local-env/lib/y.py', 'conda/lib/z.py', 'other/site-packages/w.py', '.git/hooks/h.py', '__pycache__/c.py'):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text('pass\n', encoding='utf-8')
+    (tmp_path / 'local-env' / 'pyvenv.cfg').write_text('home = x\n', encoding='utf-8')
+    (tmp_path / 'conda' / 'conda-meta').mkdir()
+    walked = sorted(path.relative_to(tmp_path).as_posix() for path, _ in application_sources(tmp_path))
+    assert walked == ['app.py', 'research/harness.py']
+
+
+def test_every_collected_test_id_fits_in_a_windows_environment_variable(request):
+    """pytest stores the running test's id in PYTEST_CURRENT_TEST; Windows refuses a variable over 32767 characters."""
+    longest = max(len(item.nodeid) for item in request.session.items)
+    assert longest < 32000, longest

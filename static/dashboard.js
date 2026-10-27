@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops, microView} = CryptoPilotUI;
+const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops, microView, microRecoveryPrompt} = CryptoPilotUI;
 let state = null, online = false, chartSymbol = 'BTC/USDT', chartTF = '1h', chartData = [], btData = [];
 let lastSuccess = 0, pollTimer = null, modalFocus = null;
 let orderDraft = null, orderFocus = null;
@@ -104,9 +104,10 @@ function renderMicro(s) {
   $('microResults').innerHTML = tiles(view.results);
   $('microCounters').textContent = view.counters.length ? 'Why entries waited (checks so far): ' + view.counters.join(' · ') : '';
   $('microNotes').innerHTML = view.notes.map(note => `<p class="micro">${esc(note)}</p>`).join('');
-  $('microRecovery').innerHTML = view.recovery.map(item => `<div class="note"><p><b>${esc(item.symbol)} · ${esc(item.state)}</b>: ${esc(item.explanation)}</p><button class="small" data-recover="${esc(item.cycle_id)}">Apply recovery…</button></div>`).join('');
+  $('microRecovery').innerHTML = view.recovery.map(item => `<div class="note"><p><b>${esc(item.symbol)} · ${esc(item.state)}</b>: ${esc(item.explanation)}</p><button class="small" data-recover="${esc(item.cycle_id)}">Apply recovery…</button></div>`).join('')
+    + view.recoveryNotes.map(note => `<div class="note"><p><b>Recovery check</b>: ${esc(note)}</p></div>`).join('');
   $('microPairs').innerHTML = view.pairs.length ? view.pairs.map(p => `<tr><td><strong>${esc(p.symbol)}</strong>${p.selected ? '' : '<br><span class="amber">Removed from the watchlist · exits only</span>'}</td><td>${esc(p.state)}<br><small>${esc(p.regime)}</small></td><td class="${p.eligible ? 'green' : 'amber'}">${esc(p.eligibility)}</td><td>${esc(p.minimum)}</td><td>${esc(p.freshness)}</td><td>${esc(p.waiting)}${p.error ? '<br><span class="amber">' + esc(p.error) + '</span>' : ''}${p.checks.length ? '<details><summary>All checks</summary><ul class="checks">' + p.checks.map(line => `<li>${esc(line)}</li>`).join('') + '</ul></details>' : ''}</td></tr>`).join('') : '<tr><td colspan="6" class="empty">No micro data yet. Start the bot with the Micro strategy selected.</td></tr>';
-  $('microCycles').innerHTML = view.cycles.length ? view.cycles.map(c => `<tr><td><strong>${esc(c.symbol)}</strong><br><small>${esc(c.strategy)}</small></td><td>${esc(c.state)}</td><td>${esc(c.owned)}</td><td>${esc(c.debit)}</td><td>${esc(c.estimate)}<br><small>${esc(c.prices)}</small></td><td>${esc(c.target)}</td><td>${esc(c.age)}</td><td>${esc(c.next)}</td></tr>`).join('') : '<tr><td colspan="8" class="empty">No open micro cycles.</td></tr>';
+  $('microCycles').innerHTML = view.cycles.length ? view.cycles.map(c => `<tr><td><strong>${esc(c.symbol)}</strong><br><small>${esc(c.strategy)}</small></td><td>${esc(c.state)}</td><td>${esc(c.owned)}</td><td>${esc(c.debit)}</td><td>${esc(c.estimate)}<br><small>${esc(c.prices)}</small>${c.estimate_note ? `<br><small class="${c.estimate_stale ? 'amber' : 'micro'}">${esc(c.estimate_note)}</small>` : ''}</td><td>${esc(c.target)}</td><td>${esc(c.age)}</td><td>${esc(c.next)}</td></tr>`).join('') : '<tr><td colspan="8" class="empty">No open micro cycles.</td></tr>';
 }
 function render(s) {
   $('settingsRecovery').hidden = !s.settings_health?.review_required;
@@ -289,7 +290,8 @@ $('microClearBtn').onclick = () => {
 $('microRecovery').addEventListener('click', event => {
   const button = event.target.closest('[data-recover]');
   if (!button) return;
-  const phrase = prompt('Book exactly what the paper venue record shows for this cycle (the bot must be stopped). Read the explanation first. Type exactly: I HAVE REVIEWED THIS CYCLE');
+  const item = microView(state?.micro)?.recovery.find(entry => entry.cycle_id === button.dataset.recover);
+  const phrase = prompt(microRecoveryPrompt(item));
   if (phrase === null) return;
   action('micro', '/micro', {action: 'apply_recovery', cycle_id: button.dataset.recover, confirmation: phrase}, 'Recovery applied.');
 });

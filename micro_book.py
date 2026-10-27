@@ -683,6 +683,7 @@ class BookTracker:
                 'depth_known': snapshot.depth_known if snapshot else None,
                 'best_bid': money.text(snapshot.best_bid) if snapshot else None,
                 'best_ask': money.text(snapshot.best_ask) if snapshot else None,
+                'spread_bps': float(snapshot.spread_bps) if snapshot else None,
                 'accepted': track.accepted, 'refused': track.refused, 'sequence_resets': track.sequence_resets}
         return out
 

@@ -161,6 +161,8 @@ micro venue keeps durable records, so their outcome is knowable.
 
 `apply_recovery` (bot stopped, phrase `I HAVE REVIEWED THIS CYCLE`) books
 exactly the venue record, or releases when there is none. Nothing is resent.
+A record that cannot be read is not taken for none: the explanation says so
+and `apply_recovery` refuses until it can be read.
 For a closed cycle with a late fill it books the extra quantity, fee and cash,
 corrects the cycle's totals, and gives a sellable resulting holding to a new
 `HOLDING` cycle (strategy `late_fill_recovery`) so that its exits manage it.

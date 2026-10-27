@@ -2117,3 +2117,146 @@ def test_a_catalogue_reload_made_outside_the_micro_pass_rebuilds_the_rules_from_
     assert micro.load_cycle(held['cycle_id'])['state'] == 'HOLDING'
     w.tick()
     assert mgr.rules_loaded_at == pytest.approx(loaded_wall, abs=1.0)
+
+
+# ===================================================================== what the panel shows
+def _fail_entry_journal_once(monkeypatch) -> dict:
+    """One failed journal write after the paper venue filled the buy: the outcome is unknown in-process."""
+    real = storage.update_order_intent
+    armed = {'on': True}
+
+    def flaky(intent_id, status, *args, **kwargs):
+        if armed['on'] and status in ('acked', 'submitted'):
+            armed['on'] = False
+            raise sqlite3.OperationalError('database is locked')
+        return real(intent_id, status, *args, **kwargs)
+    monkeypatch.setattr(storage, 'update_order_intent', flaky)
+    return armed
+
+
+def _unreadable(*args, **kwargs):
+    raise sqlite3.OperationalError('disk I/O error')
+
+
+def test_an_unknown_outcome_is_explained_by_the_venue_record_it_will_book(world, monkeypatch):
+    w = world()
+    armed = _fail_entry_journal_once(monkeypatch)
+    assert w.run(60, until=lambda: bool(w.cycles('ENTRY_UNKNOWN')))
+    assert not armed['on']
+    cycle = w.cycles('ENTRY_UNKNOWN')[0]
+    intent = [i for i in w.intents(cycle['cycle_id']) if i['side'] == 'BUY'][0]
+    exact = w.venue().fetch_order(None, 'ETH/USDT', {'clientOrderId': intent['client_order_id']})['info']['exact']
+    booked = f'{exact["filled"]} filled for {exact["cost"]}'
+
+    def shown(engine) -> str:
+        [item] = [b for b in engine.micro.status()['review_block'] if b['cycle_id'] == cycle['cycle_id']]
+        return item['explanation']
+    assert booked in shown(w.engine)                                   # in-process, while the bot still runs
+    engine = w.restart()
+    assert booked in shown(engine)                                     # and after a restart
+    assert booked in micro.load_cycle(cycle['cycle_id'])['review_reason']   # the cycle's own record says so too
+    result = engine.micro.apply_recovery(cycle['cycle_id'], REVIEW)
+    assert result['outcome'] == 'entry fill booked from the venue record'
+    assert Decimal(micro.load_cycle(cycle['cycle_id'])['entry_filled_base']) == Decimal(exact['filled'])
+    assert_ledger_consistent(w)
+
+
+def test_a_venue_record_that_cannot_be_read_is_never_taken_for_no_fill(world, monkeypatch):
+    w = world()
+    _fail_entry_journal_once(monkeypatch)
+    assert w.run(60, until=lambda: bool(w.cycles('ENTRY_UNKNOWN')))
+    cycle = w.cycles('ENTRY_UNKNOWN')[0]
+    cash = w.cash()
+    real_fetch = micro.micro_venue.MicroPaperVenue.fetch_order
+    monkeypatch.setattr(micro.micro_venue.MicroPaperVenue, 'fetch_order', _unreadable)
+    engine = w.restart()                                               # the start-up check cannot read the venue
+    assert 'could not be read' in micro.load_cycle(cycle['cycle_id'])['review_reason']
+    [item] = engine.micro.status()['review_block']
+    assert 'could not be read' in item['explanation'] and 'no fill' not in item['explanation']
+    with pytest.raises(storage.ConfigValidationError, match='could not be read'):
+        engine.micro.apply_recovery(cycle['cycle_id'], REVIEW)
+    assert micro.load_cycle(cycle['cycle_id'])['state'] == 'ENTRY_UNKNOWN'    # not released while the venue filled
+    assert w.cash() == cash and len(w.venue().records()) == 1
+    monkeypatch.setattr(micro.micro_venue.MicroPaperVenue, 'fetch_order', real_fetch)
+    assert 'filled for' in engine.micro.status()['review_block'][0]['explanation']
+    assert engine.micro.apply_recovery(cycle['cycle_id'], REVIEW)['outcome'] == 'entry fill booked from the venue record'
+    assert_ledger_consistent(w)
+
+
+def test_an_exit_whose_venue_record_cannot_be_read_is_not_returned_to_holding(world, monkeypatch):
+    w = world()
+    held = w.run_until_state('HOLDING')
+    armed = _fail_sell_booking_once(monkeypatch, held['cycle_id'])
+    w.run(120, until=lambda: not armed['on'])
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_SUBMITTED'
+    w.engine.running = False                                  # stopped; the venue sold, the ledger did not book it
+    venue = w.venue()
+    real_fetch = venue.fetch_order
+    monkeypatch.setattr(venue, 'fetch_order', _unreadable)
+    with pytest.raises(storage.ConfigValidationError, match='could not be read'):
+        w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)
+    after = micro.load_cycle(held['cycle_id'])
+    assert after['state'] == 'EXIT_UNKNOWN' and 'could not be read' in after['review_reason']
+    monkeypatch.setattr(venue, 'fetch_order', real_fetch)
+    assert w.engine.micro.apply_recovery(held['cycle_id'], REVIEW)['outcome'] == 'exit fill booked from the venue record'
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED'
+    _no_order_booked_twice(w)
+    assert_ledger_consistent(w)
+
+
+def _status_cycle(w: World, cycle_id: str) -> dict:
+    [found] = [c for c in w.engine.micro.status()['cycles'] if c['cycle_id'] == cycle_id]
+    return found
+
+
+def test_a_closed_cycles_last_estimate_never_shows_on_the_next_cycle_of_the_pair(world):
+    import ccxt
+    w = world()
+    assert w.run(60, until=lambda: len(w.cycles('CLOSED')) >= 1)
+    assert (w.engine.micro.pairs['ETH/USDT'].get('exit') or {}).get('estimate')   # the closed cycle's last estimate
+    held = w.run_until_state('HOLDING')                       # entered at the end of a pass: no exit check yet
+    fresh = _status_cycle(w, held['cycle_id'])
+    assert fresh['estimate'] is None and fresh['exit_verdict'] is None
+    w.run(0.25)
+    assert _status_cycle(w, held['cycle_id'])['estimate'] is not None          # its own estimate is shown
+    assert w.run(60, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    w.venue().reject_next = ccxt.RequestTimeout('injected timeout')
+    assert w.run(60, until=lambda: bool(w.cycles('ENTRY_UNKNOWN')))
+    unknown = w.cycles('ENTRY_UNKNOWN')[0]
+    shown = _status_cycle(w, unknown['cycle_id'])
+    assert shown['estimate'] is None and shown['exit_verdict'] is None and shown['depth_model'] is None
+
+
+def test_the_panel_reports_the_current_book_and_the_estimate_age_not_decision_time_snapshots(world):
+    w = world()
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    w.run(1)
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'HOLDING'
+    status = w.engine.micro.status()
+    row = next(r for r in status['pairs'] if r['symbol'] == 'ETH/USDT')
+    live = status['books']['ETH/USDT']
+    # While held, the entry loop skips the pair: its row shows the book the exit path reads now.
+    assert row['book']['generation'] == live['generation'] and row['book']['age_s'] == live['age_s']
+    assert row['book']['spread_bps'] is not None and row['book']['state'] == 'fresh'
+    w.engine.running = False
+    w.engine.stop_event.set()
+    w.clock.advance(7200)
+    status = w.engine.micro.status()
+    row = next(r for r in status['pairs'] if r['symbol'] == 'ETH/USDT')
+    assert row['book']['age_s'] >= 7200 and row['book']['state'] == 'stale'
+    [cycle] = [c for c in status['cycles'] if c['cycle_id'] == held['cycle_id']]
+    assert cycle['estimate'] is not None and cycle['estimate_age_s'] >= 7200
+
+
+def test_an_unfilled_cycle_reports_how_long_its_outcome_has_been_pending(world):
+    import ccxt
+    w = world()
+    w.venue().reject_next = ccxt.RequestTimeout('injected timeout')
+    assert w.run(60, until=lambda: bool(w.cycles('ENTRY_UNKNOWN')))
+    unknown = w.cycles('ENTRY_UNKNOWN')[0]
+    w.engine.running = False
+    w.engine.stop_event.set()
+    w.clock.advance(3 * 3600)
+    shown = _status_cycle(w, unknown['cycle_id'])
+    assert shown['age_s'] is None                              # never held: no hold time
+    assert shown['pending_s'] >= 3 * 3600

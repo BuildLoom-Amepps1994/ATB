@@ -38,6 +38,8 @@ from collections import Counter, deque
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import ccxt
+
 import micro_book
 import micro_economics as econ
 import micro_policy
@@ -135,6 +137,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='milliseconds')
 
 
+def _seconds_since(stamp: str | None) -> float | None:
+    """Seconds from an ISO time this module wrote until now, or None when it cannot be read."""
+    try:
+        return round(max(0.0, time.time() - datetime.fromisoformat(str(stamp)).timestamp()), 1)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _dec(value, default: Decimal | None = None) -> Decimal | None:
     if value is None or value == '':
         return default
@@ -146,6 +156,10 @@ def _dec(value, default: Decimal | None = None) -> Decimal | None:
 
 class CycleError(RuntimeError):
     """An illegal cycle transition or a cycle that changed underneath an update."""
+
+
+class VenueRecordUnreadable(RuntimeError):
+    """The paper venue's record of an order could not be read (not the same as the venue having none)."""
 
 
 def _refusal(message: str, code: str) -> CycleError:
@@ -443,13 +457,39 @@ class MicroManager:
                              (cycle_id, side, *(SETTLED_INTENT_STATUSES if attempt else ())))
         return found[0] if found else None
 
-    def _venue_record(self, intent: dict | None) -> dict | None:
+    def _venue_record(self, intent: dict | None, *, strict: bool = False) -> dict | None:
+        """The paper venue's record of ``intent``'s order, or None when the venue has none.
+
+        With ``strict`` a failed read raises ``VenueRecordUnreadable``: a recovery must never take an order it
+        could not look up for one that never filled (releasing a filled buy, or reopening a sold holding)."""
         if not intent or not intent.get('client_order_id'):
             return None
         try:
             return self.venue.fetch_order(None, intent['symbol'], {'clientOrderId': intent['client_order_id']})
-        except Exception:
+        except ccxt.OrderNotFound:
             return None
+        except Exception as exc:
+            if strict:
+                raise VenueRecordUnreadable(type(exc).__name__) from exc
+            return None
+
+    def _explain_record(self, leg: str, intent: dict) -> str:
+        """What the paper venue's own record of ``intent`` shows, read now: the text the operator confirms."""
+        try:
+            record = self._venue_record(intent, strict=True)
+        except VenueRecordUnreadable as exc:
+            return (f'The paper venue record of the {leg} intent {intent["intent_id"][:8]} could not be read ({exc}), '
+                    'so its outcome is still unknown. Applying recovery is refused until the record can be read; '
+                    'nothing is booked or released meanwhile.')
+        return self._describe_record(leg, intent, record)
+
+    def _recovery_record(self, intent: dict | None) -> dict | None:
+        try:
+            return self._venue_record(intent, strict=True)
+        except VenueRecordUnreadable as exc:
+            raise storage.ConfigValidationError(f'The paper venue record could not be read ({exc}). Nothing was '
+                                                'booked or released; apply the recovery again once it can be '
+                                                'read.') from exc
 
     def _recover_cycle(self, cycle: dict) -> dict | None:
         state, symbol = cycle['state'], cycle['symbol']
@@ -465,11 +505,14 @@ class MicroManager:
                                reserved_quote='0')
                 return {**base, 'state': 'ABANDONED', 'explanation': 'The reservation was released: no order intent '
                         'had been sent, so nothing can have filled.'}
-            record = self._venue_record(intent)
-            explanation = self._describe_record('entry', intent, record)
+            explanation = self._explain_record('entry', intent)
             if state != 'ENTRY_UNKNOWN':
                 with storage.connection() as db:
                     transition(db, cycle, 'ENTRY_UNKNOWN', 'interrupted during the entry order', review_reason=explanation)
+            elif cycle.get('review_reason') != explanation:
+                with storage.connection() as db:
+                    transition(db, cycle, 'ENTRY_UNKNOWN', 'outcome still unknown; explained from the venue record',
+                               review_reason=explanation)
             return {**base, 'state': 'ENTRY_UNKNOWN', 'explanation': explanation, 'action': 'apply_recovery'}
         if state in ('EXIT_SUBMITTED', 'EXIT_UNKNOWN'):
             intent = self._intent(cycle['cycle_id'], 'SELL', attempt=True)
@@ -481,11 +524,14 @@ class MicroManager:
                     transition(db, cycle, 'HOLDING', 'exit order never left; the holding is unchanged')
                 return {**base, 'state': 'HOLDING', 'explanation': 'The exit order was never sent; the holding is '
                         'unchanged and will be managed when the bot starts.'}
-            record = self._venue_record(intent)
-            explanation = self._describe_record('exit', intent, record)
+            explanation = self._explain_record('exit', intent)
             if state != 'EXIT_UNKNOWN':
                 with storage.connection() as db:
                     transition(db, cycle, 'EXIT_UNKNOWN', 'interrupted during the exit order', review_reason=explanation)
+            elif cycle.get('review_reason') != explanation:
+                with storage.connection() as db:
+                    transition(db, cycle, 'EXIT_UNKNOWN', 'outcome still unknown; explained from the venue record',
+                               review_reason=explanation)
             return {**base, 'state': 'EXIT_UNKNOWN', 'explanation': explanation, 'action': 'apply_recovery'}
         if state == 'HOLDING':
             problem = self._ownership_problem(cycle)
@@ -905,7 +951,7 @@ class MicroManager:
         for cycle in open_cycles(self.engine.exchange_name, 'paper'):
             if cycle['state'] in BLOCKING_STATES:
                 blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
-                                 'explanation': cycle.get('review_reason') or cycle.get('last_reason') or 'review required'})
+                                 'explanation': self._blocking_explanation(cycle)})
             elif idle and cycle['state'] in TRANSIENT_STATES:
                 blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
                                  'explanation': f'Interrupted ({cycle.get("last_reason") or "mid-operation"}); its '
@@ -915,6 +961,18 @@ class MicroManager:
             blockers.append({'cycle_id': cycle['cycle_id'], 'symbol': cycle['symbol'], 'state': cycle['state'],
                              'explanation': cycle['late_fill_reason'], 'late_fill': True})
         return blockers
+
+    def _blocking_explanation(self, cycle: dict) -> str:
+        """An unknown outcome is explained by the venue record its recovery would book, read now."""
+        if cycle['state'] in ('ENTRY_UNKNOWN', 'EXIT_UNKNOWN'):
+            side, leg = ('BUY', 'entry') if cycle['state'] == 'ENTRY_UNKNOWN' else ('SELL', 'exit')
+            try:
+                intent = self._intent(cycle['cycle_id'], side, attempt=True)
+                if intent is not None:
+                    return self._explain_record(leg, intent)
+            except Exception:
+                pass
+        return cycle.get('review_reason') or cycle.get('last_reason') or 'review required'
 
     def apply_recovery(self, cycle_id: str, confirmation: str) -> dict:
         """Operator-confirmed: book exactly what the paper venue's record shows. Bot must be stopped."""
@@ -977,7 +1035,7 @@ class MicroManager:
 
     def _apply_entry_recovery(self, cycle: dict) -> dict:
         intent = self._intent(cycle['cycle_id'], 'BUY', attempt=True)
-        record = self._venue_record(intent)
+        record = self._recovery_record(intent)
         filled = None
         if record is not None:
             exact = (record.get('info') or {}).get('exact') or {}
@@ -995,7 +1053,7 @@ class MicroManager:
 
     def _apply_exit_recovery(self, cycle: dict) -> dict:
         intent = self._intent(cycle['cycle_id'], 'SELL', attempt=True)
-        record = self._venue_record(intent)
+        record = self._recovery_record(intent)
         filled = None
         if record is not None:
             exact = (record.get('info') or {}).get('exact') or {}
@@ -1410,8 +1468,8 @@ class MicroManager:
         self.metrics.observe('micro.exit_decision_ms', (time.monotonic() - started) * 1000)
         with self.lock:
             row = self.pairs.setdefault(symbol, {'symbol': symbol})
-            row['exit'] = {'estimate': estimate, 'verdict': verdict.as_dict(), 'depth_model': depth_model,
-                           'at': _now_iso()}
+            row['exit'] = {'cycle_id': cycle['cycle_id'], 'estimate': estimate, 'verdict': verdict.as_dict(),
+                           'depth_model': depth_model, 'at': _now_iso(), 'at_wall': time.time()}
         if verdict.new_peak is not None and (peak is None or verdict.new_peak > peak):
             gap = money.mul(self.budget_cap(), Decimal('0.0001'))
             if peak is None or verdict.new_peak - peak >= gap:
@@ -2176,19 +2234,30 @@ class MicroManager:
         for cycle in opened:
             row = self.pairs.get(cycle['symbol'], {})
             exit_view = row.get('exit') or {}
+            if exit_view.get('cycle_id') != cycle['cycle_id']:
+                exit_view = {}                      # an earlier cycle's last estimate is not this cycle's
             cycles.append({key: cycle[key] for key in (
                 'cycle_id', 'symbol', 'state', 'strategy', 'opened_at', 'owned_base', 'basis_quote', 'entry_debit',
                 'entry_price', 'entry_fee_status', 'entry_partial', 'carried_base', 'target_net', 'stop_net',
                 'max_hold_s', 'peak_est_net', 'realized_net', 'exit_count', 'last_reason', 'review_reason',
                 'reserved_quote')} | {
                 'age_s': round(time.time() - float(cycle['opened_wall']), 1) if cycle['opened_wall'] else None,
+                'pending_s': None if cycle['opened_wall'] else _seconds_since(cycle.get('created_at')),
                 'estimate': exit_view.get('estimate'), 'exit_verdict': exit_view.get('verdict'),
-                'depth_model': exit_view.get('depth_model')})
+                'depth_model': exit_view.get('depth_model'),
+                'estimate_age_s': round(time.time() - exit_view['at_wall'], 1) if exit_view.get('at_wall') else None})
+        books = self.books.status(time.monotonic())
         with self.lock:
             pairs = []
             for symbol in self.selected() + sorted(set(self.pairs) - set(self.selected())):
                 row = dict(self.pairs.get(symbol, {'symbol': symbol}))
                 row['selected'] = symbol in self.selected()
+                # The book as it is now, not as it was at the pair's last entry decision (a held pair is not
+                # re-decided, and nothing is decided while stopped).
+                live = books.get(symbol) or {}
+                row['book'] = ({key: live.get(key) for key in ('best_bid', 'best_ask', 'spread_bps', 'generation',
+                                                                'sequence', 'age_s', 'source', 'state')}
+                               if live.get('best_bid') is not None else {'state': live.get('state', 'missing')})
                 waiting = row.get('waiting') or {}
                 if waiting.get('since'):
                     waiting = {**waiting, 'waiting_s': round(time.time() - waiting['since'], 1)}
@@ -2210,7 +2279,7 @@ class MicroManager:
             'latch': latch, 'review_block': self.review_block(), 'recovery': list(self.recovery),
             'exit_all_pending_s': round(self.flatten_pending(), 1),
             'pairs': pairs, 'cycles': cycles, 'results': self.results(), 'counters': counters,
-            'books': self.books.status(time.monotonic()), 'last_tick': self.last_tick, 'last_error': self.last_error,
+            'books': books, 'last_tick': self.last_tick, 'last_error': self.last_error,
             'heuristic_note': 'Setup checks are transparent heuristics, not calibrated probabilities of profit.',
         }
 

@@ -214,3 +214,65 @@ test('micro stops and unknown outcomes are shown as blocking warnings with a rec
   const unavailable = microView({active: true, error: 'micro status unavailable: OperationalError'});
   assert.deepEqual(unavailable.warnings, ['micro status unavailable: OperationalError']);
 });
+
+test('the recovery panel and its confirmation show the venue record the recovery will book', () => {
+  const {microRecoveryPrompt} = require('../static/dashboard-core.js');
+  const state = microState();
+  const record = 'The paper venue reports the entry order paper-micro-1 as closed with 0.010023 filled for 24.968466803553 (fee 0.024968466803553 USDT). Applying recovery books exactly that.';
+  state.cycles.push({cycle_id: 'cyc_cccccccccccccccccccccccc', symbol: 'BTC/USDT', state: 'ENTRY_UNKNOWN', owned_base: '0', entry_debit: null,
+    review_reason: record, age_s: null, max_hold_s: 1800});
+  state.review_block = [{cycle_id: 'cyc_cccccccccccccccccccccccc', symbol: 'BTC/USDT', state: 'ENTRY_UNKNOWN', explanation: record}];
+  state.recovery = [{cycle_id: 'cyc_cccccccccccccccccccccccc', symbol: 'BTC/USDT', state: 'ENTRY_UNKNOWN', explanation: record, action: 'apply_recovery'},
+    {symbol: 'SOL/USDT', order_id: 'paper-micro-9', explanation: 'A venue order no journal intent explains <b>', action: 'review'},
+    {error: 'micro cycle table unreadable: OperationalError'}];
+  const view = microView(state);
+  assert.deepEqual(view.recovery.map(item => item.explanation), [record]);
+  const prompt = microRecoveryPrompt(view.recovery[0]);
+  assert.ok(prompt.includes('0.010023 filled for 24.968466803553'));        // the confirmation names what it books
+  assert.ok(prompt.includes('BTC/USDT') && prompt.includes('I HAVE REVIEWED THIS CYCLE'));
+  // Recovery findings without a cycle to apply (an orphan venue order, an unreadable table) are shown as notes.
+  assert.deepEqual(view.recoveryNotes, ['SOL/USDT: A venue order no journal intent explains <b>', 'micro cycle table unreadable: OperationalError']);
+});
+
+test('a cycle that owns nothing never shows an exit estimate, its prices or its verdict', () => {
+  const state = microState();
+  state.cycles = [{cycle_id: 'cyc_dddddddddddddddddddddddd', symbol: 'ETH/USDT', state: 'ENTRY_UNKNOWN', strategy: 'range_reversion', owned_base: '0',
+    entry_debit: null, target_net: '0.05', stop_net: '0.2', age_s: null, max_hold_s: 1800, review_reason: null, last_reason: 'BUY outcome uncertain',
+    estimate: {est_net_pnl: '0.0723', uncertainty: '0.0125', break_even_bid: '2496.86', target_bid: '2501.85'}, depth_model: 'book',
+    exit_verdict: {reason: 'take profit: net after uncertainty 0.0598 against target 0.0500'}}];
+  const [cycle] = microView(state).cycles;
+  assert.equal(cycle.estimate, 'No fresh estimate');
+  assert.equal(cycle.prices, 'entry — · break-even bid — · target bid —');
+  assert.equal(cycle.next, 'BUY outcome uncertain');
+});
+
+test('order-book age and exit estimates are shown with their real age, and as stale once stopped', () => {
+  const state = microState();
+  state.books = {'BTC/USDT': {age_s: 7200.2, state: 'stale', source: 'rest_depth', best_bid: '100', best_ask: '100.02', spread_bps: 2}};
+  state.pairs[0].book = {best_bid: '100', best_ask: '100.02', spread_bps: 2, age_s: 7200.2, state: 'stale', source: 'rest_depth'};
+  state.cycles[0].estimate_age_s = 7230;
+  const stopped = microView(state);
+  assert.equal(stopped.pairs[0].freshness, 'rest_depth · 2.0 h old (stale) · spread 2.0 bps');
+  assert.ok(!stopped.pairs[0].freshness.includes('0 s old'));
+  assert.equal(stopped.cycles[0].estimate_note, 'Stale: estimated 2.0 h ago; the bot is stopped, so it is not re-estimated');
+  assert.equal(stopped.cycles[0].estimate_stale, true);
+  state.running = true;
+  state.params = {micro_book_max_age_seconds: 10};
+  state.cycles[0].estimate_age_s = 4;
+  assert.equal(microView(state).cycles[0].estimate_note, 'Estimated 4 s ago');
+  assert.equal(microView(state).cycles[0].estimate_stale, false);
+  state.cycles[0].estimate_age_s = 45;
+  assert.equal(microView(state).cycles[0].estimate_note, 'Stale: estimated 45 s ago');
+});
+
+test('an unknown duration is never shown as zero seconds', () => {
+  const {microDuration} = require('../static/dashboard-core.js');
+  for (const value of [null, undefined, '']) assert.equal(microDuration(value), '—');
+  assert.equal(microDuration(0), '0 s');
+  assert.equal(microDuration(10800), '3.0 h');
+  const state = microState();
+  state.cycles[0] = {...state.cycles[0], state: 'ENTRY_UNKNOWN', owned_base: '0', entry_debit: null, age_s: null, pending_s: 10800};
+  assert.equal(microView(state).cycles[0].age, 'not booked · reserved 3.0 h ago');
+  state.cycles[0].pending_s = null;
+  assert.equal(microView(state).cycles[0].age, 'not booked');
+});

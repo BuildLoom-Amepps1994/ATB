@@ -31,6 +31,28 @@ def test_parse_keeps_decimal_strings_exact_and_floats_through_their_shortest_rep
     assert money.parse(-2, allow_negative=True) == D(-2)
 
 
+def test_a_float_subclass_parses_through_floats_own_repr():
+    class Labelled(float):
+        def __repr__(self):
+            return f'Labelled({float.__repr__(self)})'      # as NumPy's np.float64 repr does
+    assert money.parse(Labelled(0.0005), field='fee') == D('0.0005')
+    numpy = pytest.importorskip('numpy')
+    assert money.parse(numpy.float64(0.1)) == D('0.1')
+
+
+def test_the_magnitude_bound_does_not_depend_on_the_callers_decimal_context():
+    from decimal import localcontext
+    above = D('1000000000000000.00000000000001')               # just above MAX_ABS, 31 significant digits
+    for prec in (1, 28, 34):
+        with localcontext() as context:
+            context.prec = prec
+            with pytest.raises(money.MoneyError, match='out of range'):
+                money.parse(above)
+            with pytest.raises(money.MoneyError, match='out of range'):
+                money.parse(above.copy_negate(), allow_negative=True)     # unary minus would round too
+            assert money.parse(D('1e15')) == D('1e15')
+
+
 def test_parse_flags_for_sign_and_zero():
     with pytest.raises(money.MoneyError):
         money.parse('-1')

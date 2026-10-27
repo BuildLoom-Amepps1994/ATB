@@ -54,7 +54,11 @@ def parse(value, *, field: str = 'value', allow_zero: bool = True, allow_negativ
             raise MoneyError(f'{field} must be finite')
         # repr is the shortest string that round-trips this float; it adds no
         # binary noise, but it cannot restore digits the float already lost.
-        number = Decimal(repr(value))
+        # float's own repr, so a subclass's (NumPy's 'np.float64(...)') is not parsed.
+        try:
+            number = Decimal(float.__repr__(value))
+        except (InvalidOperation, ValueError):
+            raise MoneyError(f'{field} is not a valid number') from None
     elif isinstance(value, str):
         text = value.strip()
         if not text or len(text) > MAX_TEXT or not _NUMBER.fullmatch(text):
@@ -71,7 +75,7 @@ def parse(value, *, field: str = 'value', allow_zero: bool = True, allow_negativ
         exponent = number.adjusted()
         if exponent > MAX_EXPONENT or exponent < MIN_EXPONENT:
             raise MoneyError(f'{field} is out of range')
-    if abs(number) > max_abs:
+    if number.copy_abs() > max_abs:          # exact: abs() would round to the caller's decimal context
         raise MoneyError(f'{field} is out of range')
     if number == 0:
         if not allow_zero:

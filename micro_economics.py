@@ -47,7 +47,7 @@ from decimal import Decimal
 
 import money
 from money import BPS, ONE, ZERO, MoneyError
-from venue_rules import METADATA_STALE
+from venue_rules import METADATA_STALE, AccountCommission
 
 MICRO_MAX_ALL_IN_USDT = Decimal('25')     # absolute cap of the micro profile; never raised by code
 # Sizing obeys the smaller of this literal and the public name, so rebinding the
@@ -224,14 +224,20 @@ class CostModel:
         return _record(self)
 
 
-def cost_model(*, configured_fee_pct, configured_slippage_pct, latency_bps, rules) -> CostModel:
+def cost_model(*, configured_fee_pct, configured_slippage_pct, latency_bps, rules, account=None) -> CostModel:
     """The per-leg cost assumptions for one symbol.
 
     The modeled fee is the larger of the configured rate and the venue's public
-    taker schedule (the account's own rate needs a signed endpoint this code
-    never calls). An unknown public fee leaves the configured rate, and the
+    taker schedule. An unknown public fee leaves the configured rate, and the
     source says so. The configured slippage percent becomes the flat fallback,
     used only where depth is unknown.
+
+    ``account`` is this account's own rate for the symbol, a
+    :class:`venue_rules.AccountCommission` parsed from a supplied response of
+    the signed endpoint (no code here obtains one, and no caller passes one
+    yet). It must name the same exchange and symbol as ``rules``, and its taker
+    rate joins the maximum: a known account rate can raise the modeled fee,
+    never lower it below the configured or public rate.
     """
     configured_pct = money.parse(configured_fee_pct, field='configured fee percent')
     configured = money.div(configured_pct, HUNDRED)
@@ -243,6 +249,14 @@ def cost_model(*, configured_fee_pct, configured_slippage_pct, latency_bps, rule
     else:
         fee = max(configured, public)
         source = f'modeled: max(configured {_show(configured_pct)}%, public taker {_show(money.mul(public, HUNDRED))}%)'
+    if account is not None:
+        if not isinstance(account, AccountCommission):
+            raise MoneyError('account fee must be a parsed AccountCommission')
+        if (account.exchange, account.symbol) != (rules.exchange, rules.symbol):
+            raise MoneyError(f'account fee is for {account.exchange} {account.symbol}, not {rules.exchange} {rules.symbol}')
+        own = money.parse(account.taker, field='account taker fee')
+        fee = max(fee, own)
+        source = f'{source}; account taker {_show(money.mul(own, HUNDRED))}% joins the maximum'
 
     def currency(value):
         return value if value in FEE_CURRENCIES else 'unknown'

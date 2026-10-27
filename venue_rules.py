@@ -22,8 +22,9 @@ Sources and semantics (checked 2026-10-26; recheck when the venue changes):
   value outside these allows sells only: a holding can still be closed, but
   no entry opens on a side rule the code cannot read.
   ``makerCommission``/``takerCommission`` in ``exchangeInfo`` are the public
-  schedule, not this account's rate (that needs the signed ``/api/v3/tradeFee``
-  endpoint, which this code never calls).
+  schedule, not this account's rate. That needs the signed ``/api/v3/tradeFee``
+  endpoint, which this code never calls; :func:`parse_mexc_symbol_commission`
+  validates a response to it that a caller supplies.
 * Kraken through CCXT: ``TICK_SIZE`` precision, ``limits.amount.min = ordermin``,
   ``limits.cost.min = costmin``; fees are CCXT's published tier defaults.
 * A missing field is unknown, never zero. Unknown values are listed in
@@ -37,6 +38,7 @@ Sources and semantics (checked 2026-10-26; recheck when the venue changes):
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -234,3 +236,139 @@ def normalize(market: dict | None, *, exchange: str, symbol: str, loaded_at: flo
                       taker_fee=taker_fee, maker_fee=maker_fee, fee_source=fee_source,
                       buy_fee_currency=buy_fee_currency, sell_fee_currency=sell_fee_currency,
                       loaded_at=loaded_at, source=source, issues=tuple(dict.fromkeys(issues)))
+
+
+# ------------------------------------------------------------ account commission
+MAX_COMMISSION = Decimal('0.01')     # 1 % per leg, far above any MEXC spot rate: a larger value is malformed
+
+
+class CommissionError(ValueError):
+    """A symbol-commission response that cannot be used; the message says why."""
+
+
+@dataclass(frozen=True)
+class AccountCommission:
+    """This account's fee rates for one symbol, from a supplied MEXC ``GET /api/v3/tradeFee`` response.
+
+    Rates are fractions per leg (0.0005 is 0.05 %). Nothing here signs or
+    sends that request: the response comes from the caller.
+    """
+    exchange: str
+    symbol: str
+    maker: Decimal
+    taker: Decimal
+    rpi_taker: Decimal | None        # the RPI order rate, when the venue states one
+    venue_ms: int                    # the response's own timestamp, on the venue clock
+    received_at: float               # local wall-clock time the caller received the response
+    source: str = 'MEXC signed tradeFee (supplied response)'
+
+    def age_seconds(self, now) -> float | None:
+        """Seconds since the response was received, or None when that cannot be known (a future or unreadable time)."""
+        now, received = _wall_clock(now), _wall_clock(self.received_at)
+        if now is None or received is None or now < received:
+            return None
+        age = now - received
+        return age if math.isfinite(age) else None
+
+    def as_dict(self) -> dict:
+        return {key: money.text(value) if isinstance(value, Decimal) else value for key, value in self.__dict__.items()}
+
+
+def _wall_clock(value) -> float | None:
+    """A wall-clock reading as a finite float; None when missing, boolean, not a number or not finite."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _no_constant(name):
+    raise ValueError(f'{name} is not a number')
+
+
+def _unique_keys(pairs):
+    names = [name for name, _ in pairs]
+    if len(set(names)) != len(names):
+        raise ValueError('a key is repeated')      # json.loads keeps the last copy, so 'code' could be overridden
+    return dict(pairs)
+
+
+def _commission(value, name: str, *, allow_negative: bool) -> Decimal:
+    if value is None:
+        raise CommissionError(f'{name} is missing')
+    try:
+        rate = money.parse(value, field=name, allow_negative=allow_negative)
+    except money.MoneyError as exc:
+        raise CommissionError(str(exc)) from None
+    except (ArithmeticError, TypeError, ValueError):          # a hostile number type: still fail closed
+        raise CommissionError(f'{name} is not a valid number') from None
+    if rate.copy_abs() > MAX_COMMISSION:                      # exact: abs() would round to the caller's context
+        raise CommissionError(f'{name} is beyond 1 %, above any spot fee')
+    try:
+        # A JSON number arrives as a Decimal of any length; its stored form must read back, as a string's would.
+        money.from_text(money.text(rate), field=name, allow_negative=allow_negative)
+    except money.MoneyError:
+        raise CommissionError(f'{name} has more digits than a stored rate may') from None
+    return rate
+
+
+def parse_mexc_symbol_commission(response, *, symbol: str, received_at: float) -> AccountCommission:
+    """Validate a supplied response of MEXC's signed ``GET /api/v3/tradeFee`` for ``symbol``.
+
+    The documented response (checked 2026-10-27) is ``{"data": {"makerCommission":
+    0E-18, "takerCommission": 0.000500000000000000, "rpiTakerCommission": null},
+    "code": 0, "msg": "success", "timestamp": 1781149594924}``. It does not name
+    the symbol, so the caller passes the one it asked for. JSON text is parsed
+    with Decimal numbers, so no rate passes through a float.
+
+    Anything else fails closed with :class:`CommissionError`: JSON text that
+    repeats a key or holds a number Decimal cannot represent, a ``code`` that
+    is not the integer 0, no ``data`` object, a missing, malformed, negative or
+    implausible (above 1 %) taker rate, a maker rate outside -1 % to 1 % (a
+    rebate is negative), a rate whose stored form would not read back (more
+    digits than :data:`money.MAX_TEXT` allows a string), an RPI rate that is
+    stated but is not a valid taker rate, or a missing, non-integer or
+    non-positive timestamp. A repeated key can only be
+    seen in text: pass the response as received, not as a decoded dict.
+    """
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise CommissionError('the symbol the response answers is missing')
+    received = _wall_clock(received_at)
+    if received is None:
+        raise CommissionError('the time the response was received is missing')
+    if isinstance(response, (bytes, bytearray)):
+        try:
+            response = bytes(response).decode('utf-8')
+        except UnicodeDecodeError:
+            raise CommissionError('the response is not UTF-8 text') from None
+    if isinstance(response, str):
+        if len(response) > 4096:
+            raise CommissionError('the response is too long for a symbol commission')
+        try:
+            response = json.loads(response, parse_float=Decimal, parse_constant=_no_constant,
+                                  object_pairs_hook=_unique_keys)
+        except (ValueError, ArithmeticError, RecursionError):     # Decimal's InvalidOperation is an ArithmeticError
+            raise CommissionError('the response is not valid JSON') from None
+    if not isinstance(response, dict):
+        raise CommissionError('the response is not a JSON object')
+    code = response.get('code')
+    if type(code) is not int:                      # a bool is not a code
+        raise CommissionError('the response has no integer code')
+    if code != 0:
+        shown = code if abs(code) < 10 ** 12 else 'out of range'      # a huge int cannot even be formatted
+        raise CommissionError(f'the venue answered code {shown}, not 0')
+    data = response.get('data')
+    if not isinstance(data, dict):
+        raise CommissionError('the response has no data object')
+    taker = _commission(data.get('takerCommission'), 'takerCommission', allow_negative=False)
+    maker = _commission(data.get('makerCommission'), 'makerCommission', allow_negative=True)
+    rpi = data.get('rpiTakerCommission')
+    rpi_taker = None if rpi is None else _commission(rpi, 'rpiTakerCommission', allow_negative=False)
+    stamp = response.get('timestamp')
+    if type(stamp) is not int or stamp <= 0:
+        raise CommissionError('the response has no timestamp')
+    return AccountCommission(exchange='mexc', symbol=symbol, maker=maker, taker=taker, rpi_taker=rpi_taker,
+                             venue_ms=stamp, received_at=received)

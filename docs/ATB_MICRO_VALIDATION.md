@@ -340,6 +340,24 @@ after each change; they are not added to the totals above.
   architecture wording that said the parser refuses anything but the
   documented shape (it does not check `msg` or extra keys, and accepts rates
   as strings).
+* **Fact-check of the final report and pull request description** (written
+  from these documents): three checkers, each finding then checked by a
+  separate verifier. 18 findings survived and 3 were rejected. Two reached
+  these documents and are corrected here: two wall-clock runs were left out
+  (now under *Wall-clock smoke*, *Two runs not counted above*), and the
+  performance document's heading called `483d204` "before the reviews",
+  though it already has the module-review fixes. The rest were corrected in
+  the report and the description: an incomplete list of open gates; "Windows-only"
+  for the no-caller failure, whose cause, a virtual environment inside the
+  checkout, would fail on any system; "no test was skipped" (no pre-existing
+  test was); the names of the two smoke tests; the third review round's 16
+  findings (10 were document statements); the research result file's own
+  SHA-256 beside the protocol's; that no ETH research cycle reaches the
+  target (all close by profit protection); version 2's fill wording; the
+  clean-machine gate's edit step; which run built the hashed installer; the
+  two engine-wide changes legacy paths also get (a 300 s retry after a failed
+  catalogue refresh, and a submit-time check that the mode has not changed);
+  and the top-of-book size limit on safety exits without a depth book.
 
 ## Brief test matrix (items 1 to 30)
 
@@ -460,6 +478,17 @@ summary records the source at the start (`c043668` with an edited README,
 code files SHA-256 `2e863a39...e364ec`). It also reports the source as
 changed during the run, because a documentation-only commit (`d76f404`) was
 made while it ran; the code files' hash at the end was the same.
+
+**Two runs not counted above.** An earlier 20-minute run, 16:35 to 16:55 UTC
+on 26 October, ran on an uncommitted development tree that was still being
+committed while it ran. The harness then hashed the source when a run ended
+(`c4587f8` moved that to the start), so its summary records `fa45c70`, dirty,
+which is not the code it started on. It completed, 1200.0 s, 40 samples, no
+faults, PAPER throughout, no STALE_DATA, and closed the same mechanics-fixture
+cycle by take profit (net +0.0723 USDT); because its code cannot be
+identified, it is not counted. A run on `fb52624`, started at 23:10 UTC, was
+stopped by a session interruption after 34 samples (1020 s; no fault and no
+STALE_DATA in them) and wrote no summary; the third run above is its rerun.
 
 ## Research run
 

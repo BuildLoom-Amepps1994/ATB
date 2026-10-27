@@ -77,7 +77,7 @@ tick or per scan, averaged over the timed samples.
 | Protective tick, 1 position, stream | 6.29 / 7.12 / 10.34 | 9.24 / 13.04 / 15.66 | 6.41 / 10.58 / 11.27 | 8.53 / 10.58 / 13.05 | 100 | 0.0 |
 | Protective tick, 5 positions, stream | 10.70 / 15.80 / 16.77 | 14.60 / 21.75 / 23.47 | 11.37 / 16.25 / 21.59 | 14.10 / 21.30 / 24.33 | 100 | 0.0 |
 
-## Micro paths: before and after the reviews
+## Micro paths: before and after the integration and data reviews
 
 `before` is `483d204`, the manager before the integration and data reviews.
 The three later columns are `2f99435` and `d51ca7f`, whose micro managers
@@ -170,8 +170,9 @@ decision, otherwise every 30 s) is measured in the wall-clock smoke below.
 
 ## Wall-clock smoke: latency, requests and resources
 
-The four 20-minute runs of `scripts/micro_soak.py --fixture` described in
-`docs/ATB_MICRO_VALIDATION.md` ran the real engine thread on the real clock
+The four counted 20-minute runs of `scripts/micro_soak.py --fixture` described in
+`docs/ATB_MICRO_VALIDATION.md` (which also describes an earlier run on code it
+cannot identify and an interrupted run, neither used here) ran the real engine thread on the real clock
 against three fixture markets with a 0 ms round trip, streaming off. The
 first ran on `c043668`, before the idle-cadence fix; the second on `9535a55`;
 the third on `fb52624`, whose code is `20c7067`'s; the fourth on `ec3c59f`,

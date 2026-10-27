@@ -37,7 +37,18 @@ DEFAULTS = {
     'max_order_notional_usdt': 1000.0, 'max_asset_notional_usdt': 2500.0,
     'max_orders_per_minute': 6, 'daily_realized_loss_limit_pct': 3.0,
     'max_drawdown_pct': 10.0, 'streaming_quotes': False,
+    # Micro-trading mode (time_horizon 'micro', PAPER only). The budget is the
+    # maximum all-in quote debit of one entry, fees included; it can be set
+    # lower for research but never above micro_economics.MICRO_MAX_ALL_IN_USDT.
+    'micro_budget_usdt': 25.0, 'micro_max_cycles': 2, 'micro_target_net_bps': 20.0,
+    'micro_max_loss_bps': 120.0, 'micro_max_hold_minutes': 30, 'micro_cooldown_seconds': 60,
+    'micro_max_consecutive_losses': 4, 'micro_daily_loss_limit_usdt': 1.0, 'micro_latency_bps': 3.0,
+    'micro_book_max_age_seconds': 5,
 }
+MICRO_FIELDS = ('micro_budget_usdt', 'micro_max_cycles', 'micro_target_net_bps', 'micro_max_loss_bps',
+                'micro_max_hold_minutes', 'micro_cooldown_seconds', 'micro_max_consecutive_losses',
+                'micro_daily_loss_limit_usdt', 'micro_latency_bps', 'micro_book_max_age_seconds')
+HORIZON_CHOICES = ('rapid', 'balanced', 'swing', 'position', 'micro')
 BOUNDS = {
     'discovered_pairs': (0, 12), 'min_quote_volume': (1000000, 1000000000),
     'max_spread_pct': (0.05, 2.0), 'scan_seconds': (10, 3600),
@@ -51,14 +62,20 @@ BOUNDS = {
     'max_order_notional_usdt': (12, 10000000), 'max_asset_notional_usdt': (12, 10000000),
     'max_orders_per_minute': (1, 60), 'daily_realized_loss_limit_pct': (0.5, 20.0),
     'max_drawdown_pct': (1.0, 50.0),
+    # The upper bound of micro_budget_usdt is the absolute 25 USDT cap of the micro profile.
+    'micro_budget_usdt': (0.5, 25.0), 'micro_max_cycles': (1, 4), 'micro_target_net_bps': (5.0, 200.0),
+    'micro_max_loss_bps': (20.0, 400.0), 'micro_max_hold_minutes': (2, 240), 'micro_cooldown_seconds': (0, 3600),
+    'micro_max_consecutive_losses': (2, 20), 'micro_daily_loss_limit_usdt': (0.1, 25.0),
+    'micro_latency_bps': (0.0, 50.0), 'micro_book_max_age_seconds': (1, 30),
 }
 # Fields added after 1.3.0 whose default is the stricter choice. A saved
 # profile from before they existed adopts the default without a review latch.
 LATER_FIELDS = {'market_filters', 'max_order_notional_usdt', 'max_asset_notional_usdt',
                 'max_orders_per_minute', 'daily_realized_loss_limit_pct', 'max_drawdown_pct',
-                'streaming_quotes'}
+                'streaming_quotes', *MICRO_FIELDS}
 INTEGER_FIELDS = {'discovered_pairs', 'scan_seconds', 'max_positions', 'data_max_age_seconds',
-                  'protective_poll_seconds', 'max_orders_per_minute'}
+                  'protective_poll_seconds', 'max_orders_per_minute', 'micro_max_cycles', 'micro_max_hold_minutes',
+                  'micro_cooldown_seconds', 'micro_max_consecutive_losses', 'micro_book_max_age_seconds'}
 
 
 class ConfigValidationError(ValueError):
@@ -98,8 +115,13 @@ def validate_settings(data: dict, base: dict | None = None, allow_paper_start: b
         raise ConfigValidationError('streaming_quotes must be boolean.')
     if cfg['max_order_notional_usdt'] > cfg['max_asset_notional_usdt']:
         raise ConfigValidationError('The per-order notional cap cannot exceed the per-asset notional cap.')
-    if cfg['time_horizon'] not in ('rapid', 'balanced', 'swing', 'position'):
+    if cfg['time_horizon'] not in HORIZON_CHOICES:
         raise ConfigValidationError('Invalid strategy horizon.')
+    if cfg['time_horizon'] == 'micro':
+        if cfg['micro_budget_usdt'] > cfg['max_order_notional_usdt']:
+            raise ConfigValidationError('The micro budget cannot exceed the per-order notional cap.')
+        if cfg['micro_max_cycles'] > cfg['max_positions']:
+            raise ConfigValidationError('Concurrent micro cycles cannot exceed the maximum number of positions.')
     if cfg['max_position_pct'] > cfg['max_exposure_pct']:
         raise ConfigValidationError('Position size cannot exceed total exposure.')
     if cfg['max_meme_position_pct'] > cfg['max_position_pct'] or cfg['max_meme_exposure_pct'] > cfg['max_exposure_pct']:
@@ -398,7 +420,15 @@ def init_db():
             if column not in journal_columns:
                 db.execute(f'ALTER TABLE order_journal ADD COLUMN {column} {definition}')
         db.execute('CREATE INDEX IF NOT EXISTS orders_recent ON order_journal(exchange,mode,created_at)')
-        db.execute('PRAGMA user_version=3')
+        db.execute('CREATE INDEX IF NOT EXISTS orders_decision ON order_journal(decision_id)')
+        # Reconciliation looks intents up by the client order id a venue reports back.
+        db.execute('CREATE INDEX IF NOT EXISTS orders_client_id ON order_journal(exchange,mode,client_order_id)')
+        # Micro-trading cycles and the durable paper venue's own order records.
+        import micro
+        import micro_venue
+        micro.ensure_schema(db)
+        micro_venue.ensure_schema(db)
+        db.execute('PRAGMA user_version=4')
 
 
 JOURNAL_COLUMNS = (
@@ -540,12 +570,21 @@ def unresolved_orders(exchange: str | None = None) -> list[dict]:
     return rows(sql + (' AND exchange=?' if exchange else '') + ' ORDER BY created_at', (exchange,) if exchange else ())
 
 
+MICRO_DECISION_PREFIX = 'cyc_'
+
+
 def abandon_stale_paper_intents(exchange: str) -> int:
-    """A paper intent left open by a crash is rejected at startup (no side effects)."""
+    """A paper intent left open by a crash is rejected at startup (no side effects).
+
+    Micro-cycle intents (decision id ``cyc_...``) are left as they are: the
+    micro paper venue keeps durable order records, so their outcome is
+    recovered from that record with a read-only explanation, never guessed.
+    """
     with connection() as db:
         cursor = db.execute("UPDATE order_journal SET status='rejected',updated_at=?,final_at=?,note='abandoned at startup' "
-                            "WHERE exchange=? AND mode='paper' AND status NOT IN ('accounted','rejected','reconciled')",
-                            (_now(), _now(), exchange))
+                            "WHERE exchange=? AND mode='paper' AND status NOT IN ('accounted','rejected','reconciled') "
+                            "AND (decision_id IS NULL OR decision_id NOT LIKE ?)",
+                            (_now(), _now(), exchange, MICRO_DECISION_PREFIX + '%'))
         return cursor.rowcount
 
 
@@ -562,3 +601,7 @@ def reset_paper(exchange: str):
         db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (scope_key('paper_cash', exchange), str(paper_start)))
         db.execute("DELETE FROM meta WHERE (key LIKE 'last_entry.paper.%' OR key LIKE 'last_exit.paper.%' OR key LIKE 'manual_request.paper.%' OR key LIKE 'baseline.paper.%' OR key LIKE 'breached.paper.%' OR key LIKE 'peak_equity.paper.%' OR key LIKE 'drawdown_stop.paper.%' OR key LIKE 'realized_stop.paper.%' OR key LIKE 'realized_stop_cleared.paper.%' OR key LIKE 'slippage_breaker.paper.%') AND key LIKE ?", ('%.' + exchange,))
         db.execute("DELETE FROM order_journal WHERE mode='paper' AND exchange=?", (exchange,))
+        db.execute("DELETE FROM micro_cycle_events WHERE cycle_id IN (SELECT cycle_id FROM micro_cycles WHERE mode='paper' AND exchange=?)", (exchange,))
+        db.execute("DELETE FROM micro_cycles WHERE mode='paper' AND exchange=?", (exchange,))
+        db.execute('DELETE FROM paper_venue_orders WHERE exchange=?', (exchange,))
+        db.execute("DELETE FROM meta WHERE key LIKE 'micro.paper.%' AND key LIKE ?", ('%.' + exchange,))

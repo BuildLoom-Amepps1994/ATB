@@ -174,6 +174,8 @@ class QuoteFeed:
         ``timestamp`` is the exchange's (ms) when it sent one, ``_received_at``
         the local receipt time, ``quoteVolume`` absent: the book channel does
         not carry turnover, so callers keep REST for liquidity checks.
+        ``bidVolume``/``askVolume`` are the sizes sent in the same message as
+        the prices, or None when that message stated none.
         """
         if not self.healthy():
             return None
@@ -185,7 +187,8 @@ class QuoteFeed:
             if max_age is not None and not (0 <= age <= max_age):
                 return None
             quote['read'] = True
-            return {'symbol': symbol, 'bid': quote['bid'], 'ask': quote['ask'], 'timestamp': quote['timestamp'],
+            return {'symbol': symbol, 'bid': quote['bid'], 'ask': quote['ask'], 'bidVolume': quote['bid_volume'],
+                    'askVolume': quote['ask_volume'], 'timestamp': quote['timestamp'],
                     '_received_at': quote['received_at'], '_stream_sequence': quote['sequence'], '_source': 'stream'}
 
     def covers(self, symbols, *, max_age: float) -> bool:
@@ -448,7 +451,10 @@ class QuoteFeed:
                     if not previous.get('read'):
                         self.counters['coalesced'] += 1
                 self._sequence += 1
+                # A size belongs to the prices it came with: an update without one never keeps an older size.
                 self.quotes[symbol] = {'bid': bid, 'ask': ask, 'timestamp': int(raw_ts) if exchange_ts else None,
+                                       'bid_volume': _finite_positive(ticker.get('bidVolume')) or None,
+                                       'ask_volume': _finite_positive(ticker.get('askVolume')) or None,
                                        'exchange_ts': exchange_ts, 'received_at': received, 'sequence': self._sequence,
                                        'read': False}
                 self.counters['quotes'] += 1

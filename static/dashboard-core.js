@@ -134,7 +134,126 @@
     if (risk?.realized_stop) stops.push({action: 'clear_realized_stop', label: 'daily realised-loss stop'});
     return stops;
   }
-  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops};
+  // A decimal amount from the micro status (a string such as '24.9750'). Never hides a sign or a
+  // non-zero amount behind rounding: precision grows up to 8 places, then '<0.00000001' with its sign.
+  function microAmount(value, places = 4, signed = false) {
+    if (value === null || value === undefined || value === '') return 'unknown';
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 'unknown';
+    let digits = Math.max(0, Math.min(8, places)), text = Math.abs(n).toFixed(digits);
+    while (n !== 0 && Number(text) === 0 && digits < 8) text = Math.abs(n).toFixed(++digits);
+    const sign = n < 0 ? '-' : signed && n > 0 ? '+' : '';
+    return n !== 0 && Number(text) === 0 ? sign + '<0.00000001' : sign + text;
+  }
+  function microDuration(seconds) {
+    if (seconds === null || seconds === undefined || seconds === '') return '—';   // unknown, never "0 s"
+    const s = Number(seconds);
+    if (!Number.isFinite(s) || s < 0) return '—';
+    if (s < 90) return Math.round(s) + ' s';
+    if (s < 5400) return Math.round(s / 60) + ' min';
+    return (s / 3600).toFixed(1) + ' h';
+  }
+  const MICRO_STATES = {ENTRY_RESERVED: 'Entry reserved', ENTRY_SUBMITTED: 'Entry sent', ENTRY_UNKNOWN: 'Entry outcome unknown · review',
+    HOLDING: 'Holding', EXIT_SUBMITTED: 'Exit sent', EXIT_UNKNOWN: 'Exit outcome unknown · review', REVIEW: 'Review required'};
+  const MICRO_OWNING = ['HOLDING', 'EXIT_SUBMITTED', 'EXIT_UNKNOWN'];
+  // The confirmation for Apply recovery…: it repeats the venue record the recovery will book.
+  function microRecoveryPrompt(item) {
+    return 'Apply the recovery for ' + String(item?.symbol ?? '') + ' (' + String(item?.state ?? '') + ')? It books exactly what the paper venue record shows'
+      + ' (the bot must be stopped): ' + String(item?.explanation || 'no explanation is available; refresh the dashboard first.') + ' Type exactly: I HAVE REVIEWED THIS CYCLE';
+  }
+  const MICRO_CHECKS = {conflict: 'venue check', startup: 'start-up check', settle: 'interruption check'};
+  // Everything the micro panel shows, from /api/state's micro block, as plain strings for escaping.
+  // null hides the panel (micro not selected and nothing open). Estimates and confirmed figures stay apart.
+  function microView(micro, formatTime = seconds => new Date(seconds * 1000).toLocaleTimeString()) {
+    if (!micro || typeof micro !== 'object') return null;
+    const cycles = Array.isArray(micro.cycles) ? micro.cycles : [];
+    if (!micro.active && !cycles.length) return null;
+    if (micro.error) return {headline: 'Micro status unavailable', warnings: [String(micro.error)], budget: [], pairs: [], cycles: [], results: [], counters: [], recovery: [], recoveryNotes: [], holding: 0, latched: false, notes: []};
+    const warnings = [];
+    if (micro.latch) warnings.push('Micro stop latched: ' + String(micro.latch.reason || 'loss limit') + '. New micro entries are blocked until it is cleared with RESUME TRADING; open cycles keep their exits.');
+    const blockers = Array.isArray(micro.review_block) ? micro.review_block : [];
+    for (const item of blockers) warnings.push('Review required for ' + String(item.symbol) + ' (' + (MICRO_STATES[item.state] || String(item.state)) + '): ' + String(item.explanation || '') + ' New micro entries are blocked.');
+    if (micro.last_error) warnings.push('Latest micro problem: ' + String(micro.last_error));
+    if (!micro.active && cycles.length) warnings.push('Micro cycles are open while another strategy is selected; select Micro again to manage their exits.');
+    const b = micro.budget || {};
+    const budget = [
+      ['All-in cap per entry', microAmount(b.cap, 2) + ' USDT (fees included · absolute cap ' + microAmount(b.absolute_cap, 2) + ')'],
+      ['Micro allocation', microAmount(b.allocation, 2) + ' USDT over ' + String(b.max_cycles ?? '—') + ' cycle(s)'],
+      ['Reserved by entries in flight', microAmount(b.reserved) + ' USDT'],
+      ['Basis of open cycles', microAmount(b.committed_basis) + ' USDT'],
+    ];
+    const openBySymbol = new Map(cycles.map(cycle => [cycle.symbol, cycle]));
+    const pairs = (Array.isArray(micro.pairs) ? micro.pairs : []).map(row => {
+      const sizing = row.sizing || {}, book = row.book || {}, waiting = row.waiting || {}, decision = row.decision || {};
+      const open = openBySymbol.get(row.symbol);
+      const eligibility = !row.sizing ? 'Not checked yet'
+        : sizing.eligible ? 'Eligible · ' + microAmount(sizing.max_debit) + ' USDT all-in (' + microAmount(sizing.gross_quote) + ' order + ' + microAmount(sizing.fee_reserve) + ' fee reserve)'
+          : String(sizing.code || 'Not eligible') + ': ' + String(sizing.detail || '');
+      const minimum = sizing.minimum_feasible_budget != null ? microAmount(sizing.minimum_feasible_budget, 2) + ' USDT'
+        : sizing.minimum_feasible_detail ? String(sizing.minimum_feasible_detail) : '—';
+      const freshness = book.best_bid != null ? String(book.source || 'book') + ' · ' + microDuration(book.age_s) + ' old' + (book.state === 'stale' ? ' (stale)' : '')
+          + ' · spread ' + (book.spread_bps != null && Number.isFinite(Number(book.spread_bps)) ? Number(book.spread_bps).toFixed(1) : '—') + ' bps'
+        : 'No fresh order book';
+      const checks = (Array.isArray(decision.checks) ? decision.checks : []).map(check => (check.passed ? '✓ ' : '✗ ') + String(check.check || '') + (check.detail ? ': ' + String(check.detail) : ''));
+      return {symbol: String(row.symbol), selected: row.selected !== false,
+        state: open ? (MICRO_STATES[open.state] || String(open.state)) : 'Flat', eligibility, eligible: !!sizing.eligible, minimum, freshness,
+        waiting: open ? String(open.last_reason || '') : String(waiting.status || decision.status || 'Waiting for data') + (waiting.waiting_s != null ? ' · for ' + microDuration(waiting.waiting_s) : ''),
+        regime: String(row.regime || '—'), error: row.error ? String(row.error) : '', checks};
+    });
+    const maxBookAge = Number(micro.params?.micro_book_max_age_seconds);
+    const cycleRows = cycles.map(cycle => {
+      // Only a cycle that owns base has an exit estimate; anything else attached to it is not its own.
+      const owning = MICRO_OWNING.includes(cycle.state) && Number(cycle.owned_base) > 0;
+      const estimate = owning ? cycle.estimate || {} : {}, verdict = owning ? cycle.exit_verdict || {} : {};
+      const shown = estimate.est_net_pnl != null, age = cycle.estimate_age_s;
+      const known = age !== null && age !== undefined && age !== '' && Number.isFinite(Number(age));
+      const stale = shown && (!micro.running || (known && Number.isFinite(maxBookAge) && Number(age) > maxBookAge));
+      const estimateNote = !shown ? '' : stale
+        ? 'Stale: estimated ' + (known ? microDuration(age) + ' ago' : 'before the bot stopped') + (!micro.running ? '; the bot is stopped, so it is not re-estimated' : '')
+        : known ? 'Estimated ' + microDuration(age) + ' ago' : '';
+      return {symbol: String(cycle.symbol), cycle_id: String(cycle.cycle_id), state: MICRO_STATES[cycle.state] || String(cycle.state), strategy: String(cycle.strategy || '—'),
+        owned: microAmount(cycle.owned_base, 8), debit: cycle.entry_debit != null ? microAmount(cycle.entry_debit) + ' USDT (simulated fill)' : 'not filled',
+        estimate: shown ? microAmount(estimate.est_net_pnl, 4, true) + ' ± ' + microAmount(estimate.uncertainty, 4) + ' USDT (estimated, ' + String(estimate.depth_model || cycle.depth_model || 'model') + ')' : 'No fresh estimate',
+        prices: 'entry ' + (cycle.entry_price != null ? microAmount(cycle.entry_price, 2) : '—') + ' · break-even bid ' + (estimate.break_even_bid != null ? microAmount(estimate.break_even_bid, 2) : '—') + ' · target bid ' + (estimate.target_bid != null ? microAmount(estimate.target_bid, 2) : '—'),
+        estimate_note: estimateNote, estimate_stale: stale,
+        target: microAmount(cycle.target_net, 4, true) + ' / -' + microAmount(cycle.stop_net),
+        age: cycle.age_s != null ? microDuration(cycle.age_s) + ' of ' + microDuration(cycle.max_hold_s)
+          : 'not booked' + (cycle.pending_s != null ? ' · reserved ' + microDuration(cycle.pending_s) + ' ago' : ''),
+        next: cycle.review_reason ? String(cycle.review_reason) : verdict.reason ? String(verdict.reason) : String(cycle.last_reason || ''),
+        holding: cycle.state === 'HOLDING'};
+    });
+    const r = micro.results || {};
+    const results = [
+      ['Closed cycles', String(r.closed_cycles ?? 0) + ' (' + String(r.wins ?? 0) + ' up · ' + String(r.losses ?? 0) + ' down · ' + String(r.flat ?? 0) + ' flat)'],
+      ['Net result (simulated)', microAmount(r.realized_net_total, 4, true) + ' USDT' + (r.realized_unconfirmed_count ? ' · ' + r.realized_unconfirmed_count + ' unconfirmed' : '')],
+      ['Average per cycle', r.average_net != null ? microAmount(r.average_net, 4, true) + ' USDT' : '—'],
+      ['Worst / best cycle', (r.worst_loss != null ? microAmount(r.worst_loss, 4, true) : '—') + ' / ' + (r.best_gain != null ? microAmount(r.best_gain, 4, true) : '—')],
+      ['Maximum drawdown', microAmount(r.max_drawdown) + ' USDT'],
+      ['Fees paid', microAmount(r.fees_paid) + ' USDT' + (r.fees_share_of_gross_gains != null ? ' · ' + (Number(r.fees_share_of_gross_gains) * 100).toFixed(1) + '% of gains before fees' : '')],
+      ['Turnover', microAmount(r.turnover, 2) + ' USDT'],
+      ['Average hold', r.average_hold_s != null ? microDuration(r.average_hold_s) : '—'],
+      ['Exits near break-even', String(r.near_break_even_exits ?? 0)],
+    ];
+    const counters = Object.entries(micro.counters || {}).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([code, count]) => String(code) + ' ' + String(count));
+    const triggers = Object.entries(r.exit_triggers || {}).map(([trigger, count]) => String(trigger) + ' ' + String(count));
+    const recovery = blockers.map(item => ({cycle_id: String(item.cycle_id), symbol: String(item.symbol), state: MICRO_STATES[item.state] || String(item.state), explanation: String(item.explanation || '')}));
+    // What the recovery checks found that has no cycle to apply here (an orphan venue order, a released reservation),
+    // dated by its check: a pair's venue check is replaced by its next one; a start-up or interruption check is past.
+    const blocking = new Set(blockers.map(item => String(item.cycle_id)));
+    const recoveryNotes = [...new Set((Array.isArray(micro.recovery) ? micro.recovery : [])
+      .filter(item => item && typeof item === 'object' && !(item.cycle_id != null && blocking.has(String(item.cycle_id))))
+      .map(item => {
+        const text = (item.symbol ? String(item.symbol) + ': ' : '') + String(item.explanation || item.error || 'review required');
+        const at = Number(item.at);
+        return Number.isFinite(at) && at > 0 ? text + ' · ' + (Object.hasOwn(MICRO_CHECKS, String(item.source)) ? MICRO_CHECKS[item.source] : 'check') + ' at ' + String(formatTime(at)) : text;
+      }))];
+    const notes = [String(micro.paper_only_reason || 'PAPER only.'), String(r.note || ''), String(micro.heuristic_note || '')].filter(Boolean);
+    if (triggers.length) notes.push('Exit triggers: ' + triggers.join(' · '));
+    return {headline: !micro.active ? 'Micro cycles open (strategy changed)' : micro.running ? 'Running · PAPER micro cycles' : 'Stopped · Start bot begins PAPER micro cycles for the selected pairs',
+      warnings, budget, pairs, cycles: cycleRows, results, counters, recovery, recoveryNotes, notes,
+      holding: cycleRows.filter(cycle => cycle.holding).length, latched: !!micro.latch};
+  }
+  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops, microAmount, microDuration, microView, microRecoveryPrompt};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CryptoPilotUI = api;
 })(typeof window === 'undefined' ? globalThis : window);

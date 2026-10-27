@@ -116,6 +116,8 @@ def test_browser_readiness_uses_loopback_http_without_tls_or_proxies(monkeypatch
     monkeypatch.setattr(ssl, 'create_default_context', unexpected_tls)
     monkeypatch.setenv('HTTP_PROXY', 'http://127.0.0.1:1')
     monkeypatch.setenv('ALL_PROXY', 'http://127.0.0.1:1')
+    for name in ('NO_PROXY', 'no_proxy'):          # conftest's bypass-all would hide a launcher that used them
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(launcher.webbrowser, 'open', lambda url: opened.append(url) or True)
     with HTTPServer(('127.0.0.1', 0), Handler) as server:
         worker = threading.Thread(target=server.handle_request, daemon=True)

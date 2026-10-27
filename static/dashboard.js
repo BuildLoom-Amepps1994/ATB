@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops} = CryptoPilotUI;
+const {escapeHtml: esc, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops, microView, microRecoveryPrompt} = CryptoPilotUI;
 let state = null, online = false, chartSymbol = 'BTC/USDT', chartTF = '1h', chartData = [], btData = [];
 let lastSuccess = 0, pollTimer = null, modalFocus = null;
 let orderDraft = null, orderFocus = null;
@@ -46,6 +46,10 @@ function updateControls() {
   $('killBtn').classList.toggle('selected', engaged);
   $('clearStopBtn').hidden = !latchedStops(s.risk).length;
   $('clearStopBtn').disabled = !online || busy.has('risk');
+  const micro = microView(s.micro);
+  $('microFlattenBtn').disabled = !online || busy.has('micro') || !micro?.holding;
+  $('microClearBtn').hidden = !micro?.latched; $('microClearBtn').disabled = !online || busy.has('micro');
+  for (const button of document.querySelectorAll('[data-recover]')) button.disabled = !idle || pending;
   $('confirmLive').disabled = !idle || pending || settingsReview || !$('eligible').checked || $('liveConfirm').value !== 'ENABLE LIVE TRADING';
   const orderReady = idle && !pending && !(s.mode === 'live' && (!s.connected || s.live_halted));
   $('orderBuy').disabled = !orderReady || (s.mode === 'live' && settingsReview);
@@ -78,13 +82,32 @@ function feedNote(f) {
 }
 
 function readSettings() {
-  return {exchange: $('exchange').value, watchlist: $('symbols').value.split(/[\s,;]+/).map(x => x.trim().toUpperCase()).filter(Boolean), auto_discovery: $('autoDiscovery').checked, market_filters: $('marketFilters').checked, streaming_quotes: $('streamingQuotes').checked, time_horizon: $('timeHorizon').value, scan_seconds: +$('scanSeconds').value, protective_poll_seconds: +$('protectiveSeconds').value, risk_pct: +$('riskPct').value, max_position_pct: +$('maxPositionPct').value, max_exposure_pct: +$('maxExposurePct').value, max_portfolio_risk_pct: +$('maxPortfolioRisk').value, data_max_age_seconds: +$('dataMaxAge').value, max_positions: +$('maxPositions').value, max_meme_position_pct: +$('maxMemePosition').value, max_meme_exposure_pct: +$('maxMemeExposure').value, daily_loss_limit_pct: +$('dailyLossPct').value, min_quote_volume: +$('minVolume').value, max_order_notional_usdt: +$('maxOrderNotional').value, max_asset_notional_usdt: +$('maxAssetNotional').value, max_orders_per_minute: +$('maxOrdersPerMinute').value, daily_realized_loss_limit_pct: +$('dailyRealizedLoss').value, max_drawdown_pct: +$('maxDrawdown').value};
+  return {exchange: $('exchange').value, watchlist: $('symbols').value.split(/[\s,;]+/).map(x => x.trim().toUpperCase()).filter(Boolean), auto_discovery: $('autoDiscovery').checked, market_filters: $('marketFilters').checked, streaming_quotes: $('streamingQuotes').checked, time_horizon: $('timeHorizon').value, scan_seconds: +$('scanSeconds').value, protective_poll_seconds: +$('protectiveSeconds').value, risk_pct: +$('riskPct').value, max_position_pct: +$('maxPositionPct').value, max_exposure_pct: +$('maxExposurePct').value, max_portfolio_risk_pct: +$('maxPortfolioRisk').value, data_max_age_seconds: +$('dataMaxAge').value, max_positions: +$('maxPositions').value, max_meme_position_pct: +$('maxMemePosition').value, max_meme_exposure_pct: +$('maxMemeExposure').value, daily_loss_limit_pct: +$('dailyLossPct').value, min_quote_volume: +$('minVolume').value, max_order_notional_usdt: +$('maxOrderNotional').value, max_asset_notional_usdt: +$('maxAssetNotional').value, max_orders_per_minute: +$('maxOrdersPerMinute').value, daily_realized_loss_limit_pct: +$('dailyRealizedLoss').value, max_drawdown_pct: +$('maxDrawdown').value, ...Object.fromEntries(Object.entries(MICRO_FIELDS).map(([key, id]) => [key, +$(id).value]))};
 }
+const MICRO_FIELDS = {micro_budget_usdt: 'microBudgetUsdt', micro_max_cycles: 'microMaxCycles', micro_target_net_bps: 'microTargetNetBps', micro_max_loss_bps: 'microMaxLossBps', micro_max_hold_minutes: 'microMaxHoldMinutes', micro_cooldown_seconds: 'microCooldownSeconds', micro_max_consecutive_losses: 'microMaxConsecutiveLosses', micro_daily_loss_limit_usdt: 'microDailyLossLimit', micro_latency_bps: 'microLatencyBps', micro_book_max_age_seconds: 'microBookMaxAge'};
 function syncExchangeGuide() { $('apiGuide').href = $('exchange').value === 'mexc' ? 'https://www.mexc.com/user/openapi' : 'https://www.kraken.com/u/security/api'; }
 function fillSettings(c) {
   const fields = {exchange: 'exchange', time_horizon: 'timeHorizon', scan_seconds: 'scanSeconds', protective_poll_seconds: 'protectiveSeconds', risk_pct: 'riskPct', max_position_pct: 'maxPositionPct', max_exposure_pct: 'maxExposurePct', max_portfolio_risk_pct: 'maxPortfolioRisk', data_max_age_seconds: 'dataMaxAge', max_positions: 'maxPositions', max_meme_position_pct: 'maxMemePosition', max_meme_exposure_pct: 'maxMemeExposure', daily_loss_limit_pct: 'dailyLossPct', min_quote_volume: 'minVolume', max_order_notional_usdt: 'maxOrderNotional', max_asset_notional_usdt: 'maxAssetNotional', max_orders_per_minute: 'maxOrdersPerMinute', daily_realized_loss_limit_pct: 'dailyRealizedLoss', max_drawdown_pct: 'maxDrawdown'};
   for (const [key, id] of Object.entries(fields)) $(id).value = c[key];
+  for (const [key, id] of Object.entries(MICRO_FIELDS)) if (c[key] !== undefined) $(id).value = c[key];
+  $('microSettings').open = c.time_horizon === 'micro';
   $('symbols').value = c.watchlist.join(', '); $('autoDiscovery').checked = c.auto_discovery; $('marketFilters').checked = c.market_filters !== false; $('streamingQuotes').checked = c.streaming_quotes === true; syncExchangeGuide();
+}
+function renderMicro(s) {
+  const view = microView(s.micro);
+  $('microPanel').hidden = !view;
+  if (!view) return;
+  $('microHeadline').textContent = view.headline;
+  $('microWarnings').hidden = !view.warnings.length; $('microWarnings').textContent = view.warnings.join(' ');
+  const tiles = rows => rows.map(([label, value]) => `<div><small>${esc(label)}</small><b>${esc(value)}</b></div>`).join('');
+  $('microBudgetGrid').innerHTML = tiles(view.budget);
+  $('microResults').innerHTML = tiles(view.results);
+  $('microCounters').textContent = view.counters.length ? 'Why entries waited (checks so far): ' + view.counters.join(' · ') : '';
+  $('microNotes').innerHTML = view.notes.map(note => `<p class="micro">${esc(note)}</p>`).join('');
+  $('microRecovery').innerHTML = view.recovery.map(item => `<div class="note"><p><b>${esc(item.symbol)} · ${esc(item.state)}</b>: ${esc(item.explanation)}</p><button class="small" data-recover="${esc(item.cycle_id)}">Apply recovery…</button></div>`).join('')
+    + view.recoveryNotes.map(note => `<div class="note"><p><b>Recovery check</b>: ${esc(note)}</p></div>`).join('');
+  $('microPairs').innerHTML = view.pairs.length ? view.pairs.map(p => `<tr><td><strong>${esc(p.symbol)}</strong>${p.selected ? '' : '<br><span class="amber">Removed from the watchlist · exits only</span>'}</td><td>${esc(p.state)}<br><small>${esc(p.regime)}</small></td><td class="${p.eligible ? 'green' : 'amber'}">${esc(p.eligibility)}</td><td>${esc(p.minimum)}</td><td>${esc(p.freshness)}</td><td>${esc(p.waiting)}${p.error ? '<br><span class="amber">' + esc(p.error) + '</span>' : ''}${p.checks.length ? '<details><summary>All checks</summary><ul class="checks">' + p.checks.map(line => `<li>${esc(line)}</li>`).join('') + '</ul></details>' : ''}</td></tr>`).join('') : '<tr><td colspan="6" class="empty">No micro data yet. Start the bot with the Micro strategy selected.</td></tr>';
+  $('microCycles').innerHTML = view.cycles.length ? view.cycles.map(c => `<tr><td><strong>${esc(c.symbol)}</strong><br><small>${esc(c.strategy)}</small></td><td>${esc(c.state)}</td><td>${esc(c.owned)}</td><td>${esc(c.debit)}</td><td>${esc(c.estimate)}<br><small>${esc(c.prices)}</small>${c.estimate_note ? `<br><small class="${c.estimate_stale ? 'amber' : 'micro'}">${esc(c.estimate_note)}</small>` : ''}</td><td>${esc(c.target)}</td><td>${esc(c.age)}</td><td>${esc(c.next)}</td></tr>`).join('') : '<tr><td colspan="8" class="empty">No open micro cycles.</td></tr>';
 }
 function render(s) {
   $('settingsRecovery').hidden = !s.settings_health?.review_required;
@@ -127,6 +150,7 @@ function render(s) {
     }
     $(id).value = value;
   }
+  renderMicro(s);
   updateControls();
 }
 const refreshState = singleFlight(async (fill = false) => {
@@ -254,6 +278,23 @@ $('clearStopBtn').onclick = async () => {
   if (phrase === null) return;
   for (const stop of stops) await action('risk', '/risk', {action: stop.action, confirmation: phrase}, `Cleared the ${stop.label}.`);
 };
+$('microFlattenBtn').onclick = () => {
+  if (!confirm('Sell every micro holding now at the current order book? This is a simulated (PAPER) exit. Unsellable remainders stay recorded.')) return;
+  action('micro', '/micro', {action: 'flatten'}, 'Exit requested for every micro holding.');
+};
+$('microClearBtn').onclick = () => {
+  const phrase = prompt('Clear the micro stop? New micro entries can resume. Review the losing cycles first. Type exactly: RESUME TRADING');
+  if (phrase === null) return;
+  action('micro', '/micro', {action: 'clear_stop', confirmation: phrase}, 'Micro stop cleared.');
+};
+$('microRecovery').addEventListener('click', event => {
+  const button = event.target.closest('[data-recover]');
+  if (!button) return;
+  const item = microView(state?.micro)?.recovery.find(entry => entry.cycle_id === button.dataset.recover);
+  const phrase = prompt(microRecoveryPrompt(item));
+  if (phrase === null) return;
+  action('micro', '/micro', {action: 'apply_recovery', cycle_id: button.dataset.recover, confirmation: phrase}, 'Recovery applied.');
+});
 $('connectBtn').onclick = async () => {
   if (busy.has('connect')) return;
   const key = $('apiKey').value.trim(), secret = $('apiSecret').value.trim();

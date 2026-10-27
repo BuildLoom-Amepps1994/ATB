@@ -280,6 +280,38 @@ def risk_action(req: RiskAction):
     return ensure_ok(work)
 
 
+class MicroAction(StrictModel):
+    action: str = Field(pattern='^(flatten|clear_stop|apply_recovery)$')
+    confirmation: str = Field(default='', max_length=40)
+    cycle_id: str = Field(default='', max_length=28, pattern='^(|cyc_[0-9a-f]{24})$')
+
+
+@app.get('/api/micro')
+def micro_status():
+    """PAPER micro-cycle status: budget, pairs, cycles, results and recovery. Local only."""
+    return ensure_ok(engine.micro.status)
+
+
+@app.get('/api/micro/decisions')
+def micro_decisions(limit: int = 50):
+    return ensure_ok(lambda: {'decisions': engine.micro.recent_decisions(max(1, min(int(limit), 300)))})
+
+
+@app.post('/api/micro')
+def micro_action(req: MicroAction):
+    """Risk-reducing exit of every micro holding, the micro stop, and operator-confirmed recovery."""
+    def work():
+        if req.action == 'flatten':
+            return engine.micro.flatten()
+        if req.action == 'clear_stop':
+            engine.micro.clear_latch(req.confirmation)
+            return {'ok': True}
+        if not req.cycle_id:
+            raise storage.ConfigValidationError('Choose the micro cycle to recover.')
+        return engine.micro.apply_recovery(req.cycle_id, req.confirmation)
+    return ensure_ok(work)
+
+
 @app.get('/api/decisions')
 def decisions(symbol: str | None = None, limit: int = 50):
     """Recent decision records (entries, holds and abstentions with reasons). Local only."""

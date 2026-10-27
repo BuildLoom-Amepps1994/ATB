@@ -21,6 +21,8 @@ MODULES = (
     'app.py', 'credentials.py', 'decision.py', 'feed.py', 'launcher.py', 'market_data.py',
     'observability.py', 'orders.py', 'paper_exchange.py', 'recovery.py', 'risk.py',
     'storage.py', 'strategy.py', 'trader.py', 'updater.py',
+    'micro.py', 'micro_book.py', 'micro_economics.py', 'micro_policy.py', 'micro_strategy.py',
+    'micro_venue.py', 'money.py', 'venue_rules.py',
 )
 METADATA_FILES = ('requirements-lock.txt',)
 REQUIRED_ASSETS = ('static/index.html', 'static/dashboard.js', 'static/dashboard-core.js')

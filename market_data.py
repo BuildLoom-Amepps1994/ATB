@@ -26,7 +26,7 @@ class MarketData:
     so protective price checks never wait behind queued candle downloads.
     """
 
-    PRIORITY_METHODS = ('fetch_ticker', 'fetch_tickers', 'fetch_bids_asks')
+    PRIORITY_METHODS = ('fetch_ticker', 'fetch_tickers', 'fetch_bids_asks', 'fetch_order_book')
 
     def __init__(self, client, *, clock=time.time, monotonic=time.monotonic, wait=None,
                  concurrency: int = 1):
@@ -100,14 +100,15 @@ class MarketData:
                 priority.urgent = urgent
             return getattr(self.client, method)(*args, **kwargs)
 
-    def read(self, method, *args, **kwargs):
+    def read(self, method, *args, attempts: int = 3, **kwargs):
         if not method.startswith(('fetch_', 'load_')):
             raise ValueError('Only exchange reads may be retried')
+        attempts = max(1, int(attempts))
         transient = tuple(c for name in ('NetworkError','ExchangeNotAvailable','RateLimitExceeded')
                           if isinstance(c := getattr(ccxt,name,None),type))
         throttled = tuple(c for name in ('RateLimitExceeded','DDoSProtection')
                           if isinstance(c := getattr(ccxt,name,None),type))
-        for attempt in range(3):
+        for attempt in range(attempts):
             # Breaker state is shared; the network call itself runs unlocked
             # inside its request slot.
             with self.lock:
@@ -126,7 +127,7 @@ class MarketData:
                         raise
                     if not transient or not isinstance(exc,transient):
                         raise
-                    if attempt == 2:
+                    if attempt == attempts - 1:
                         self.failures[method] += 1
                         if self.failures[method] >= 3:
                             # A broken candle endpoint must not disable quotes
@@ -162,6 +163,15 @@ class MarketData:
 
     def ticker(self,symbol):
         result = self.read('fetch_ticker',symbol)
+        return self._received(result, self.clock())
+
+    def order_book(self, symbol, limit=20):
+        """A public depth snapshot (MEXC REST depth weight 3 at limit<=100), stamped on receipt.
+
+        Validation is the caller's (``micro_book.from_ccxt_order_book``): this
+        only reads, so a malformed book is refused there, never repaired here.
+        """
+        result = self.read('fetch_order_book', symbol, int(limit))
         return self._received(result, self.clock())
 
     def tickers(self,symbols):

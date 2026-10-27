@@ -2,7 +2,7 @@
 // Run with Node 22+ (24 LTS recommended): node --test tests/test_dashboard.js. No exchange/network access.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast} = require('../static/dashboard-core.js');
+const {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, microAmount, microView} = require('../static/dashboard-core.js');
 
 test('untrusted server strings and validation details are safe for display', () => {
   assert.equal(escapeHtml('<img src=x onerror="alert(1)">\''), '&lt;img src=x onerror=&quot;alert(1)&quot;&gt;&#39;');
@@ -145,4 +145,150 @@ test('every element the dashboard script looks up exists in the page', () => {
   const used = [...new Set([...script.matchAll(/\$\('([A-Za-z0-9_-]+)'\)/g)].map(match => match[1]))];
   assert.ok(used.length > 50);
   assert.deepEqual(used.filter(id => !ids.has(id)), []);
+});
+
+test('micro amounts never hide a sign or a non-zero value behind rounding', () => {
+  assert.equal(microAmount('-0.00003'), '-0.00003');
+  assert.equal(microAmount('0'), '0.0000');
+  assert.equal(microAmount('1e-12'), '<0.00000001');
+  assert.equal(microAmount('-1e-12'), '-<0.00000001');
+  assert.equal(microAmount('0.004', 4, true), '+0.0040');
+  assert.equal(microAmount('-0.0001', 4, true), '-0.0001');
+  assert.equal(microAmount(null), 'unknown');
+  assert.equal(microAmount('not a number'), 'unknown');
+});
+
+const microState = () => ({
+  active: true, running: false, paper_only: true, paper_only_reason: 'The micro-trading mode is PAPER only in this build.',
+  budget: {cap: '25', absolute_cap: '25', allocation: '50', reserved: '0', committed_basis: '24.97', max_cycles: 2},
+  latch: null, review_block: [], last_error: null, counters: {NO_ECONOMIC_EDGE: 7, SPREAD: 2},
+  pairs: [
+    {symbol: 'BTC/USDT', selected: true, regime: 'ranging', waiting: {code: 'NO_ECONOMIC_EDGE', status: 'Required move exceeds the expected range', waiting_s: 120},
+     sizing: {eligible: true, max_debit: '24.9750', gross_quote: '24.95', fee_reserve: '0.0250', minimum_feasible_budget: '1.01'},
+     book: {best_bid: '100', best_ask: '100.01', spread_bps: 1, age_s: 0.4, source: 'rest_depth'},
+     decision: {checks: [{check: 'spread', passed: true, detail: '1.0 bps'}, {check: 'edge', passed: false, detail: '<b>needs 30 bps</b>'}]}},
+    {symbol: 'PEPE/USDT', selected: false, sizing: {eligible: false, code: 'BUDGET_BELOW_VENUE_MINIMUM', detail: 'Venue minimum 30 USDT', minimum_feasible_budget: '30.05'}},
+  ],
+  cycles: [{cycle_id: 'cyc_aaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'ETH/USDT', state: 'HOLDING', strategy: 'range_reversion', owned_base: '0.0099',
+            entry_debit: '24.97', target_net: '0.05', stop_net: '0.2', age_s: 300, max_hold_s: 1800,
+            estimate: {est_net_pnl: '-0.00003', depth_model: 'book', uncertainty: '0.0125', break_even_bid: '2506.77',
+                       target_bid: '2511.78'}, entry_price: '2500.51', exit_verdict: {reason: 'hold'}}],
+  results: {closed_cycles: 3, wins: 1, losses: 2, flat: 0, realized_net_total: '-0.0123', average_net: '-0.0041', worst_loss: '-0.02',
+            best_gain: '0.015', max_drawdown: '0.03', fees_paid: '0.15', fees_share_of_gross_gains: 10, turnover: '150',
+            average_hold_s: 600, near_break_even_exits: 1, exit_triggers: {take_profit: 1, stop_loss: 2}, note: 'PAPER simulated fills.'},
+});
+
+test('the micro panel separates estimates from simulated fills and explains ineligible pairs', () => {
+  assert.equal(microView(null), null);
+  assert.equal(microView({active: false, cycles: []}), null);
+  const view = microView(microState());
+  assert.match(view.headline, /Stopped/);
+  assert.equal(view.holding, 1);
+  assert.match(view.budget[0][1], /25\.00 USDT \(fees included/);
+  const [btc, pepe] = view.pairs;
+  assert.match(btc.eligibility, /^Eligible · 24\.9750 USDT all-in \(24\.9500 order \+ 0\.0250 fee reserve\)/);
+  assert.match(btc.waiting, /for 2 min$/);
+  assert.equal(btc.checks.length, 2);
+  assert.match(btc.checks[1], /^✗ edge: <b>/);           // plain text: the renderer escapes it
+  assert.equal(pepe.selected, false);
+  assert.match(pepe.eligibility, /^BUDGET_BELOW_VENUE_MINIMUM: Venue minimum 30 USDT/);
+  assert.equal(pepe.minimum, '30.05 USDT');
+  const [eth] = view.cycles;
+  assert.equal(eth.estimate, '-0.00003 ± 0.0125 USDT (estimated, book)');
+  assert.equal(eth.prices, 'entry 2500.51 · break-even bid 2506.77 · target bid 2511.78');
+  assert.equal(eth.debit, '24.9700 USDT (simulated fill)');
+  assert.equal(view.results[1][1], '-0.0123 USDT');
+  assert.ok(view.notes.some(note => /PAPER only/.test(note)));
+  assert.deepEqual(view.counters, ['NO_ECONOMIC_EDGE 7', 'SPREAD 2']);
+});
+
+test('micro stops and unknown outcomes are shown as blocking warnings with a recovery action', () => {
+  const state = microState();
+  state.latch = {reason: '4 consecutive losing micro cycles'};
+  state.review_block = [{cycle_id: 'cyc_bbbbbbbbbbbbbbbbbbbbbbbb', symbol: 'ETH/USDT', state: 'EXIT_UNKNOWN', explanation: 'The paper venue reports the exit order as closed.'}];
+  const view = microView(state);
+  assert.equal(view.latched, true);
+  assert.ok(view.warnings.some(text => /Micro stop latched: 4 consecutive/.test(text) && /RESUME TRADING/.test(text)));
+  assert.ok(view.warnings.some(text => /Review required for ETH\/USDT \(Exit outcome unknown/.test(text)));
+  assert.deepEqual(view.recovery.map(item => item.cycle_id), ['cyc_bbbbbbbbbbbbbbbbbbbbbbbb']);
+  const unavailable = microView({active: true, error: 'micro status unavailable: OperationalError'});
+  assert.deepEqual(unavailable.warnings, ['micro status unavailable: OperationalError']);
+});
+
+test('the recovery panel and its confirmation show the venue record the recovery will book', () => {
+  const {microRecoveryPrompt} = require('../static/dashboard-core.js');
+  const state = microState();
+  const record = 'The paper venue reports the entry order paper-micro-1 as closed with 0.010023 filled for 24.968466803553 (fee 0.024968466803553 USDT). Applying recovery books exactly that.';
+  state.cycles.push({cycle_id: 'cyc_cccccccccccccccccccccccc', symbol: 'BTC/USDT', state: 'ENTRY_UNKNOWN', owned_base: '0', entry_debit: null,
+    review_reason: record, age_s: null, max_hold_s: 1800});
+  state.review_block = [{cycle_id: 'cyc_cccccccccccccccccccccccc', symbol: 'BTC/USDT', state: 'ENTRY_UNKNOWN', explanation: record}];
+  state.recovery = [{cycle_id: 'cyc_cccccccccccccccccccccccc', symbol: 'BTC/USDT', state: 'ENTRY_UNKNOWN', explanation: record, action: 'apply_recovery'},
+    {symbol: 'SOL/USDT', order_id: 'paper-micro-9', explanation: 'A venue order no journal intent explains <b>', action: 'review'},
+    {error: 'micro cycle table unreadable: OperationalError'}];
+  const view = microView(state);
+  assert.deepEqual(view.recovery.map(item => item.explanation), [record]);
+  const prompt = microRecoveryPrompt(view.recovery[0]);
+  assert.ok(prompt.includes('0.010023 filled for 24.968466803553'));        // the confirmation names what it books
+  assert.ok(prompt.includes('BTC/USDT') && prompt.includes('I HAVE REVIEWED THIS CYCLE'));
+  // Recovery findings without a cycle to apply (an orphan venue order, an unreadable table) are shown as notes.
+  assert.deepEqual(view.recoveryNotes, ['SOL/USDT: A venue order no journal intent explains <b>', 'micro cycle table unreadable: OperationalError']);
+});
+
+test('recovery check notes are dated: a pair\'s latest venue check, or what a start-up or interruption check found then', () => {
+  const state = microState();
+  state.recovery = [
+    {cycle_id: 'cyc_eeeeeeeeeeeeeeeeeeeeeeee', symbol: 'ETH/USDT', state: 'HOLDING', source: 'startup', at: 1767225600,
+     explanation: 'The exit order was never sent; the holding is unchanged and will be managed when the bot starts.'},
+    {symbol: 'BTC/USDT', order_id: 'paper-micro-9', action: 'review', source: 'conflict', at: 1767226500,
+     explanation: 'The paper venue holds an order no journal intent explains (orphan) <b>'},
+    {cycle_id: 'cyc_ffffffffffffffffffffffff', symbol: 'SOL/USDT', state: 'ABANDONED', source: 'settle', at: 1767226000,
+     explanation: 'The reservation was released: no order intent had been sent, so nothing can have filled.'}];
+  const utc = seconds => new Date(seconds * 1000).toISOString().slice(11, 19) + ' UTC';
+  assert.deepEqual(microView(state, utc).recoveryNotes, [
+    'ETH/USDT: The exit order was never sent; the holding is unchanged and will be managed when the bot starts. · start-up check at 00:00:00 UTC',
+    'BTC/USDT: The paper venue holds an order no journal intent explains (orphan) <b> · venue check at 00:15:00 UTC',   // plain text: the renderer escapes it
+    'SOL/USDT: The reservation was released: no order intent had been sent, so nothing can have filled. · interruption check at 00:06:40 UTC']);
+});
+
+test('a cycle that owns nothing never shows an exit estimate, its prices or its verdict', () => {
+  const state = microState();
+  state.cycles = [{cycle_id: 'cyc_dddddddddddddddddddddddd', symbol: 'ETH/USDT', state: 'ENTRY_UNKNOWN', strategy: 'range_reversion', owned_base: '0',
+    entry_debit: null, target_net: '0.05', stop_net: '0.2', age_s: null, max_hold_s: 1800, review_reason: null, last_reason: 'BUY outcome uncertain',
+    estimate: {est_net_pnl: '0.0723', uncertainty: '0.0125', break_even_bid: '2496.86', target_bid: '2501.85'}, depth_model: 'book',
+    exit_verdict: {reason: 'take profit: net after uncertainty 0.0598 against target 0.0500'}}];
+  const [cycle] = microView(state).cycles;
+  assert.equal(cycle.estimate, 'No fresh estimate');
+  assert.equal(cycle.prices, 'entry — · break-even bid — · target bid —');
+  assert.equal(cycle.next, 'BUY outcome uncertain');
+});
+
+test('order-book age and exit estimates are shown with their real age, and as stale once stopped', () => {
+  const state = microState();
+  state.books = {'BTC/USDT': {age_s: 7200.2, state: 'stale', source: 'rest_depth', best_bid: '100', best_ask: '100.02', spread_bps: 2}};
+  state.pairs[0].book = {best_bid: '100', best_ask: '100.02', spread_bps: 2, age_s: 7200.2, state: 'stale', source: 'rest_depth'};
+  state.cycles[0].estimate_age_s = 7230;
+  const stopped = microView(state);
+  assert.equal(stopped.pairs[0].freshness, 'rest_depth · 2.0 h old (stale) · spread 2.0 bps');
+  assert.ok(!stopped.pairs[0].freshness.includes('0 s old'));
+  assert.equal(stopped.cycles[0].estimate_note, 'Stale: estimated 2.0 h ago; the bot is stopped, so it is not re-estimated');
+  assert.equal(stopped.cycles[0].estimate_stale, true);
+  state.running = true;
+  state.params = {micro_book_max_age_seconds: 10};
+  state.cycles[0].estimate_age_s = 4;
+  assert.equal(microView(state).cycles[0].estimate_note, 'Estimated 4 s ago');
+  assert.equal(microView(state).cycles[0].estimate_stale, false);
+  state.cycles[0].estimate_age_s = 45;
+  assert.equal(microView(state).cycles[0].estimate_note, 'Stale: estimated 45 s ago');
+});
+
+test('an unknown duration is never shown as zero seconds', () => {
+  const {microDuration} = require('../static/dashboard-core.js');
+  for (const value of [null, undefined, '']) assert.equal(microDuration(value), '—');
+  assert.equal(microDuration(0), '0 s');
+  assert.equal(microDuration(10800), '3.0 h');
+  const state = microState();
+  state.cycles[0] = {...state.cycles[0], state: 'ENTRY_UNKNOWN', owned_base: '0', entry_debit: null, age_s: null, pending_s: 10800};
+  assert.equal(microView(state).cycles[0].age, 'not booked · reserved 3.0 h ago');
+  state.cycles[0].pending_s = null;
+  assert.equal(microView(state).cycles[0].age, 'not booked');
 });

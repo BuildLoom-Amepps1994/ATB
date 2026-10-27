@@ -10,3 +10,16 @@ settings.json
 instance.lock
 .env*
 node_modules/
+# Profile and runtime state that must never be committed or archived
+settings.*.json
+settings-*.tmp
+*.sqlite3-wal
+*.sqlite3-shm
+logs/
+*.log
+events.jsonl*
+# Research data collected on an operator's machine and soak profiles
+research/data/
+soak/
+# Local agent worktrees
+.claude/

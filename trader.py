@@ -15,6 +15,9 @@ import ccxt
 import credentials
 import decision
 import feed
+import micro
+import micro_policy
+import micro_venue
 import observability
 import orders
 import paper_exchange
@@ -30,7 +33,9 @@ KNOWN_MEMES = {'DOGE', 'SHIB', 'PEPE', 'BONK', 'FLOKI', 'WIF', 'BRETT', 'POPCAT'
                'MOG', 'TURBO', 'FARTCOIN', 'PNUT', 'BOME', 'PENGU', 'NEIRO', 'BABYDOGE'}
 
 HORIZONS = {'rapid': ('1m', '5m'), 'balanced': ('1h', '4h'),
-            'swing': ('4h', '1d'), 'position': ('1d', '1w')}
+            'swing': ('4h', '1d'), 'position': ('1d', '1w'),
+            # PAPER-only micro cycles (micro.py): 1m features, 5m context.
+            'micro': ('1m', '5m')}
 TIMEFRAME_SECONDS = {'1m': 60, '5m': 300, '1h': 3600, '4h': 14400,
                      '1d': 86400, '1w': 604800}
 
@@ -64,6 +69,7 @@ class TradingEngine:
         self.data = MarketData(self.public, wait=self._retry_wait,
                                concurrency=self._public_concurrency(self.public))
         self.markets_loaded_at = 0.0
+        self.markets_retry_at = 0.0
         self._halt_pending = None
         self.private = self.api_key = self.api_secret = None
         self.credential_source = 'none'
@@ -103,6 +109,17 @@ class TradingEngine:
         # A simulated order has no exchange-side effect; a crash mid-paper-order
         # leaves nothing to reconcile, so its intent is closed at startup.
         storage.abandon_stale_paper_intents(self.exchange_name)
+        # Micro-cycle intents are kept above: the durable micro paper venue
+        # still holds their outcome, which is explained read-only here and
+        # booked only after the operator applies the recovery. Nothing is sent.
+        self.micro = micro.MicroManager(self)
+        try:
+            self.micro.recover_on_startup()
+        except Exception as exc:
+            try:
+                self.micro._engage_latch(f'startup recovery check failed ({type(exc).__name__})')
+            except Exception:
+                pass
         self._restore_from_keyring()
         observability.event('engine.start', mode=self.mode, exchange=self.exchange_name,
                             live_halted=self.live_halted, kill_switch=self.risk.kill_switch()['engaged'])
@@ -376,6 +393,9 @@ class TradingEngine:
                 storage.audit('info', 'Trading mode: PAPER (simulation).')
                 observability.event('mode.changed', mode='paper', exchange=self.exchange_name)
             elif mode == 'live':
+                refusal = micro_policy.live_refusal('live', horizon=self.cfg.get('time_horizon'))
+                if refusal:
+                    raise storage.ConfigValidationError(refusal + ' Choose another strategy before enabling live trading.')
                 if storage.settings_health()['review_required']:
                     raise storage.ConfigValidationError('Review and explicitly save the recovered settings before enabling live trading.')
                 if confirmation != 'ENABLE LIVE TRADING' or eligible is not True:
@@ -404,7 +424,21 @@ class TradingEngine:
         with self.lock:
             self._require_idle()
             revised = storage.validate_settings(data, base=self.cfg)
+            refusal = micro_policy.live_refusal(self.mode, horizon=revised.get('time_horizon'))
+            if refusal:
+                raise storage.ConfigValidationError(refusal + ' Return to paper mode before choosing it.')
             changed_exchange = revised['exchange'] != self.exchange_name
+            # Micro cycles, their stop latch and their review blocks are kept per exchange. Open cycles are
+            # managed only under the micro strategy on their own exchange, so neither change may strand them.
+            if (not micro_policy.is_micro(horizon=revised.get('time_horizon'))
+                    and micro.open_cycles(revised['exchange'], 'paper')):
+                raise storage.ConfigValidationError(f'Micro cycles are still open on {revised["exchange"].upper()}. Exit '
+                                                    'all micro positions (and apply any pending recovery) before '
+                                                    'choosing another strategy.')
+            if changed_exchange and micro.open_cycles(self.exchange_name, 'paper'):
+                raise storage.ConfigValidationError(f'Micro cycles are still open on {self.exchange_name.upper()}. Exit '
+                                                    'all micro positions (and apply any pending recovery) before '
+                                                    'changing exchanges.')
             if changed_exchange and self.mode != 'paper':
                 raise storage.ConfigValidationError('Return to paper mode before changing exchanges.')
             candidate_public = candidate_data = None
@@ -417,6 +451,7 @@ class TradingEngine:
             # The kill switch is kept per exchange; an engaged one must not be
             # left behind when the operator moves to the other exchange.
             carried_switch = self.risk.kill_switch() if changed_exchange else None
+            carried_latch = self.micro.latch() if changed_exchange else None    # the same for the micro stop
             storage.save_settings(revised)
             changed_keys = sorted(key for key in revised if revised.get(key) != self.cfg.get(key))
             self.cfg = revised
@@ -437,9 +472,15 @@ class TradingEngine:
                 self.last_quote_basis.clear()
                 self.last_received_at.clear()
                 self.market_rows, self.discovered = [], []
-                self.last_universe_update = self.markets_loaded_at = 0
+                self.last_universe_update = self.markets_loaded_at = self.markets_retry_at = 0
                 self.live_halted = self._durable_live_block()
                 self._restore_from_keyring()
+                # The micro explanations and per-pair memory belong to the exchange they were made for.
+                self.micro.reset_memory()
+                try:
+                    self.micro.recover_on_startup()
+                except Exception as exc:
+                    self.micro._engage_latch(f'recovery check after the exchange change failed ({type(exc).__name__})')
             self.risk_block = None
             target_switch = self.risk.kill_switch() if carried_switch and carried_switch['engaged'] else None
             # Carried when the target is released, or when it allows exits that the carried one blocks.
@@ -447,6 +488,9 @@ class TradingEngine:
                                               or (target_switch['allow_exits'] and not carried_switch['allow_exits'])):
                 self.risk.engage_kill_switch(f'Carried over from {changed_from.upper()}: {carried_switch.get("reason") or "kill switch"}',
                                              allow_exits=carried_switch['allow_exits'])
+            if carried_latch is not None and self.micro.latch() is None:
+                self.micro._engage_latch(f'Carried over from {changed_from.upper()}: '
+                                         f'{carried_latch.get("reason") or "micro stop"}')
             self.manual_order_context = str(uuid.uuid4())
             storage.audit('info', 'Trading configuration validated and saved.')
             observability.event('settings.saved', changed=changed_keys, exchange=self.exchange_name)
@@ -457,6 +501,7 @@ class TradingEngine:
             if self._busy() or self.mode != 'paper':
                 raise storage.ConfigValidationError('Stop the bot, wait for active operations, and switch to paper mode before resetting.')
             storage.reset_paper(self.exchange_name)
+            self.micro.reset_memory()
             self.risk_block = None
             self.manual_order_context = str(uuid.uuid4())
             observability.event('paper.reset', exchange=self.exchange_name)
@@ -464,6 +509,9 @@ class TradingEngine:
     def start(self):
         with self.lock:
             self._require_idle()
+            refusal = micro_policy.live_refusal(self.mode, horizon=self.cfg.get('time_horizon'))
+            if refusal:
+                raise storage.ConfigValidationError(refusal)
             if self.mode == 'live':
                 if storage.settings_health()['review_required']:
                     raise storage.ConfigValidationError('Review and explicitly save the recovered settings before starting live trading.')
@@ -479,6 +527,7 @@ class TradingEngine:
             if self._marks_fresh(positions):
                 cash = self._cash(self.mode)
                 self._daily_allowed(self.mode, self._equity(self.mode, cash, positions))
+            self.micro.cancel_flatten('a new run started')
             with self.lock:
                 if generation != self.stop_generation:
                     return
@@ -536,6 +585,15 @@ class TradingEngine:
         next_scan = 0.0
         try:
             while not self.stop_event.is_set():
+                if micro_policy.is_micro(horizon=self.cfg.get('time_horizon')):
+                    # Positions outside the micro cycles keep their stored exits;
+                    # the micro manager runs its own exits, context and entries.
+                    self._monitor_if_due()
+                    delay = self.micro.tick() if not self.stop_event.is_set() else 0.0
+                    delay = max(.05, min(delay, self._next_monitor - time.monotonic()))
+                    if self.stop_event.wait(delay):
+                        break
+                    continue
                 exited = self._monitor_if_due()
                 if time.monotonic() >= next_scan and not self.stop_event.is_set():
                     self.scan_once(allow_orders=True, exited_symbols=exited)
@@ -550,6 +608,13 @@ class TradingEngine:
         except Exception as exc:
             self._ledger_failure(f'Trading worker stopped: {type(exc).__name__}; inspect local portfolio and monitoring status')
         finally:
+            try:
+                # Still "running" here, so no stopped-mode micro action can start until this is done.
+                self.micro.cancel_flatten('the bot stopped')
+                self.micro.settle_stranded()
+            except Exception as exc:
+                storage.audit('error', f'Micro check after the worker stopped failed ({type(exc).__name__}); restart the '
+                                       'app to explain unfinished cycles.')
             with self.lock:
                 self.running = self.stopping = False
             self._stop_feed()
@@ -569,7 +634,8 @@ class TradingEngine:
         """
         if symbols is None:
             held = [p['symbol'] for p in self._active_positions(self.mode)]
-            symbols = held + list(self.cfg['watchlist']) + list(self.discovered)
+            discovered = [] if micro_policy.is_micro(horizon=self.cfg.get('time_horizon')) else list(self.discovered)
+            symbols = held + list(self.cfg['watchlist']) + discovered
         catalogue = self._catalogue()
         listed = [symbol for symbol in dict.fromkeys(symbols) if not catalogue or symbol in catalogue]
         return listed[:40]
@@ -676,7 +742,11 @@ class TradingEngine:
             return set()
         interval = max(2.0, min(60.0, float(self.cfg.get('protective_poll_seconds', 5))))
         self._next_monitor = time.monotonic() + interval
+        # A micro cycle owns its position and its exits; the stored stop and
+        # target of that row are display values the legacy monitor never acts on.
         positions = self._active_positions(self.mode)
+        micro_owned = self.micro.owned_symbols() if positions and self.mode == 'paper' else set()
+        positions = [p for p in positions if p['symbol'] not in micro_owned]
         exited, failures, observed = set(), 0, 0
         with self.lock:
             self.last_monitor, self.monitor_error = now(), None
@@ -768,20 +838,29 @@ class TradingEngine:
         return not any(base.endswith(suffix) and len(base) - len(suffix) >= 2
                        for suffix in ('3L', '3S', '5L', '5S', 'UP', 'DOWN', 'BULL', 'BEAR'))
 
-    def _fetch_markets(self):
+    CATALOGUE_RETRY_SECONDS = 300.0
+
+    def _fetch_markets(self, attempts: int = 3):
         """Load the public catalogue once, then refresh it hourly.
 
         A failed refresh keeps the previous catalogue rather than trading on
-        nothing; a listing change is still caught at the exchange.
+        nothing; a listing change is still caught at the exchange. ``attempts``
+        bounds the refresh's retries (the micro mode makes one attempt while it
+        holds a position).
         """
-        if self.markets_loaded_at and time.monotonic() - self.markets_loaded_at < 3600:
+        now = time.monotonic()
+        if self.markets_loaded_at and (now - self.markets_loaded_at < 3600 or now < self.markets_retry_at):
             return self.data.markets()
         try:
-            markets = self.data.read('load_markets', True) if self.markets_loaded_at else self.data.markets()
+            markets = (self.data.read('load_markets', True, attempts=attempts) if self.markets_loaded_at
+                       else self.data.markets())
         except Exception as exc:
             if not self.markets_loaded_at:
                 raise
-            storage.audit('warning', f'Market catalogue refresh unavailable: {type(exc).__name__}; the previous catalogue remains in use.')
+            # Not retried on every pass: a failing refresh can take the client timeout times its retries.
+            self.markets_retry_at = time.monotonic() + self.CATALOGUE_RETRY_SECONDS
+            storage.audit('warning', f'Market catalogue refresh unavailable: {type(exc).__name__}; the previous catalogue '
+                                     f'remains in use and the refresh is retried in {self.CATALOGUE_RETRY_SECONDS:g} s.')
             return self._catalogue()
         self.markets_loaded_at = time.monotonic()
         return markets
@@ -984,11 +1063,15 @@ class TradingEngine:
         except Exception:
             pass
 
-    def _ledger_failure(self, description: str, *, intent_id: str | None = None, mode: str | None = None):
+    def _ledger_failure(self, description: str, *, intent_id: str | None = None, mode: str | None = None,
+                        contain: bool = False):
         """Stop on an order or ledger outcome that needs review; a live one halts durably.
 
         Every caller that has an order intent passes its id, so the failure
         line correlates with the journal row and the submit/fill events.
+        ``contain`` (PAPER micro cycles only) records the failure without
+        stopping the worker: the affected cycle blocks every new micro entry
+        through its own state, and every other open cycle keeps its exits.
         """
         mode = mode or self.mode
         if mode == 'live':
@@ -996,7 +1079,11 @@ class TradingEngine:
         else:
             with self.lock:
                 self.risk_block = self.last_error = description
-                self.stop_event.set()
+                if not contain:
+                    self.stop_event.set()
+            if contain:
+                storage.audit('error', f'{description}. New micro entries are blocked until it is recovered; open '
+                                       'cycles keep their exits.')
             self.risk.record_failure('ledger')
         observability.event('ledger.failure', level='error', description=description, intent_id=intent_id, mode=mode)
 
@@ -1102,7 +1189,7 @@ class TradingEngine:
 
     def _submit(self, client, symbol: str, side: str, *, quantity=None, cost=None,
                 authorization: risk.Authorization | None = None, intended_price: float | None = None,
-                decision_id: str | None = None):
+                decision_id: str | None = None, venue_params: dict | None = None):
         """Durable intent precedes exactly one submission; reads alone may repeat.
 
         Paper and live orders share this path; only ``client`` differs. Nothing
@@ -1119,6 +1206,22 @@ class TradingEngine:
             storage.audit('error', f'{side} {symbol} refused: no valid risk authorization for this order.')
             observability.event('risk.unauthorized_submit', level='error', symbol=symbol, side=side)
             return None, None
+        # Last boundary before any order: a micro order is PAPER only and goes to
+        # the micro paper venue, and that venue takes nothing but micro orders.
+        kind = authorization.request.kind
+        micro_client = isinstance(client, micro_venue.MicroPaperVenue)
+        refusal = (micro_policy.live_refusal(mode, kind=kind)
+                   or micro_policy.live_refusal(mode, horizon=self.cfg.get('time_horizon')))
+        if refusal is None and micro_policy.is_micro(kind=kind) != micro_client:
+            refusal = 'A micro order must use the micro paper venue, and that venue accepts only micro orders.'
+        if refusal is None and authorization.request.mode != mode:
+            refusal = 'The trading mode changed after this order was authorized.'
+        if refusal:
+            self.metrics.incr('micro.refused_at_submit')
+            storage.audit('error', f'{side} {symbol} refused before submission: {refusal}')
+            observability.event('micro.refused_at_submit', level='error', symbol=symbol, side=side, order_kind=kind,
+                                mode=mode)
+            return None, None
         started = time.perf_counter()
         try:
             if not self._may_execute():
@@ -1128,6 +1231,8 @@ class TradingEngine:
             client_id = storage.client_order_id(intent)
             if client is self.paper:
                 params = {'clientOrderId': client_id, 'reference_price': intended_price}
+            elif micro_client:
+                params = {**(venue_params or {}), 'clientOrderId': client_id}
             else:
                 params = orders.order_params(self.exchange_name, client_id)
             with observability.bind(intent_id=intent, decision_id=decision_id, mode=mode):
@@ -1199,7 +1304,7 @@ class TradingEngine:
             except Exception:
                 pass
             self._ledger_failure(f'{side} {symbol}: unfilled order could not be journaled; review required',
-                                 intent_id=intent)
+                                 intent_id=intent, contain=micro_client)
             return None, None
         except Exception as exc:
             # A documented exchange rejection confirms no order was accepted.
@@ -1222,7 +1327,7 @@ class TradingEngine:
                 except Exception:
                     pass
             self._ledger_failure(f'{side} {symbol}: {type(exc).__name__}; order or journal outcome requires review',
-                                 intent_id=intent)
+                                 intent_id=intent, contain=micro_client)
             return None, None
 
     def _fill_details(self, order: dict, symbol: str) -> tuple[float, float, float, float, float, float, float]:
@@ -1310,7 +1415,7 @@ class TradingEngine:
                    positions: list[dict], cash: float | None, quantity: float | None = None,
                    stop_fraction: float | None = None, signal_close: float | None = None,
                    atr: float | None = None, spread: float | None = None, reason: str = '',
-                   decision_id: str | None = None) -> risk.Authorization:
+                   decision_id: str | None = None, sizing: dict | None = None) -> risk.Authorization:
         """Build the request for the risk gate from the engine's current marks.
 
         Every production caller observes a ticker immediately before pricing
@@ -1328,7 +1433,7 @@ class TradingEngine:
                                     notional=float(notional), price=float(price), quantity=quantity,
                                     signal_close=signal_close, atr=atr, stop_fraction=stop_fraction,
                                     quote_age_seconds=self._price_age(symbol), spread_pct=spread,
-                                    reason=reason, decision_id=decision_id)
+                                    reason=reason, decision_id=decision_id, sizing=sizing)
         with self.metrics.timer('risk.authorize_ms'):
             authorization = self.risk.authorize(request, positions=positions, cash=cash, equity=equity,
                                                 marks_fresh=self._marks_fresh(positions),
@@ -1969,6 +2074,14 @@ class TradingEngine:
         with self.lock:
             if self._busy():
                 raise error('Stop the bot and wait for active operations before placing a manual trade.')
+            if self.mode == 'paper' and symbol in self.micro.owned_symbols():
+                raise error('A micro cycle owns this pair. Use Exit all micro positions instead of a manual order.')
+            if self.mode == 'paper' and side == 'BUY' and symbol in self.micro.late_fill_symbols():
+                raise error('A late micro fill on this pair is not booked yet. Apply its recovery before a manual buy.')
+            if (side == 'BUY' and micro_policy.is_micro(horizon=self.cfg.get('time_horizon'))
+                    and symbol in self.cfg['watchlist']):
+                raise error('This pair is selected for micro cycles; a manual buy would block them. '
+                            'Remove it from the watchlist first.')
             if self.mode == 'live' and confirmation != f'PLACE LIVE {side}':
                 raise error(f'Type PLACE LIVE {side} to confirm this real-money order.')
             if ((expected_context and expected_context != self.manual_order_context)
@@ -2332,6 +2445,11 @@ class TradingEngine:
     def snapshot(self) -> dict:
         """Only local state and cached balances. Polling never contacts an exchange."""
         current_feed = self.feed
+        try:
+            micro_status = (self.micro.status() if self.micro.active() or self.micro.owned_symbols()
+                            else {'active': False, 'paper_only': True})
+        except Exception as exc:
+            micro_status = {'active': self.micro.active(), 'error': f'micro status unavailable: {type(exc).__name__}'}
         with self.lock:
             mode, exchange = self.mode, self.exchange_name
             positions = self._active_positions(mode)
@@ -2387,6 +2505,7 @@ class TradingEngine:
                         'state': 'off', 'enabled': bool(self.cfg.get('streaming_quotes'))},
                     'unresolved_orders': len(unresolved), 'unresolved_probe': list(self.unresolved_probe),
                     'legacy_live_records': storage.legacy_live_records(),
+                    'micro': micro_status,
                     'trades': storage.rows('SELECT * FROM trades WHERE exchange=? AND mode=? ORDER BY id DESC LIMIT 70',
                                            (exchange, mode)),
                     'audit': storage.rows('SELECT * FROM audit ORDER BY id DESC LIMIT 55')}

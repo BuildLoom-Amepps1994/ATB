@@ -204,6 +204,7 @@ class MicroManager:
         self.context: dict[str, dict] = {}          # symbol -> features, regime and bar time
         self.rules_cache: dict[str, venue_rules.VenueRules] = {}
         self.rules_loaded_at: float | None = None
+        self._rules_stamp: float | None = None       # the engine's markets_loaded_at the rules were built from
         self.pairs: dict[str, dict] = {}             # dashboard rows per pair
         self.counters: Counter = Counter()           # dominant waiting reason codes
         self.waiting_since: dict[str, float] = {}
@@ -235,6 +236,7 @@ class MicroManager:
             self.books = micro_book.BookTracker(max_age_s=30.0)
             self.context.clear()
             self.rules_cache.clear()
+            self._rules_stamp = None
             self.pairs.clear()
             self._decided_bar.clear()
             self._next_book.clear()
@@ -279,20 +281,27 @@ class MicroManager:
     def owned_symbols(self) -> set[str]:
         """Pairs whose ledger position belongs to the micro cycles: open cycles, and a closed
         cycle's retained remainder that is still in the ledger (the next cycle carries it).
+        Only the newest closed remainder of a pair counts, and only while the ledger holds
+        exactly that quantity, so a later position bought outside the cycles is never claimed.
         The legacy monitor and the manual ticket leave these alone. Fails closed: when the
         cycle table cannot be read, every paper position counts as micro-owned."""
         exchange = self.engine.exchange_name
         try:
             # One statement on one connection: the legacy monitor calls this on every protective tick.
-            rows = storage.rows("SELECT DISTINCT c.symbol FROM micro_cycles c WHERE c.exchange=? AND c.mode='paper' "
-                                "AND (c.state NOT IN ('CLOSED','ABANDONED') OR (c.state='CLOSED' "
-                                "AND c.residual_base IS NOT NULL AND c.residual_base NOT IN ('0', '') "
-                                "AND EXISTS (SELECT 1 FROM positions p WHERE p.exchange=c.exchange AND p.mode=c.mode "
-                                "AND p.symbol=c.symbol)))", (exchange,))
+            rows = storage.rows("SELECT c.symbol, NULL AS residual_base, NULL AS qty FROM micro_cycles c "
+                                "WHERE c.exchange=? AND c.mode='paper' AND c.state NOT IN ('CLOSED','ABANDONED') "
+                                "UNION ALL SELECT c.symbol, c.residual_base, p.qty FROM micro_cycles c "
+                                "JOIN positions p ON p.exchange=c.exchange AND p.mode=c.mode AND p.symbol=c.symbol "
+                                "WHERE c.exchange=? AND c.mode='paper' AND c.cycle_id=(SELECT r.cycle_id FROM "
+                                "micro_cycles r WHERE r.exchange=c.exchange AND r.mode=c.mode AND r.symbol=c.symbol "
+                                "AND r.state='CLOSED' AND r.residual_base IS NOT NULL AND r.residual_base NOT IN ('0', '') "
+                                "ORDER BY r.closed_wall DESC, r.rowid DESC LIMIT 1)", (exchange, exchange))
+            return {row['symbol'] for row in rows if row['residual_base'] is None
+                    or math.isclose(float(row['qty']), float(_dec(row['residual_base'], money.ZERO)),
+                                    rel_tol=1e-9, abs_tol=1e-12)}
         except Exception:
             return {row['symbol'] for row in storage.rows("SELECT symbol FROM positions WHERE exchange=? AND mode='paper'",
                                                           (exchange,))}
-        return {row['symbol'] for row in rows}
 
     def rules(self, symbol: str) -> venue_rules.VenueRules:
         cached = self.rules_cache.get(symbol)
@@ -1027,16 +1036,26 @@ class MicroManager:
     # -------------------------------------------------------------- data
     def _refresh_catalogue(self, *, holding: bool = False) -> None:
         engine = self.engine
-        before = engine.markets_loaded_at
-        if holding and before and self.rules_loaded_at is not None:
+        self._adopt_catalogue()          # a reload made outside this pass (a chart, a backtest, a manual order)
+        if holding and engine.markets_loaded_at and self.rules_loaded_at is not None:
             if time.time() - self.rules_loaded_at < CATALOGUE_HOLD_REFRESH_S:
                 return
             engine._fetch_markets(attempts=1)
         else:
             engine._fetch_markets()
-        if engine.markets_loaded_at != before or self.rules_loaded_at is None:
-            # The catalogue was (re)loaded: rules derived from it are rebuilt.
+        self._adopt_catalogue()
+        if self.rules_loaded_at is None:
             self.rules_loaded_at = time.time()
+            self.rules_cache.clear()
+
+    def _adopt_catalogue(self) -> None:
+        """Rebuild the rules whenever the engine's catalogue is not the load they were built from, whoever
+        reloaded it, and age them from that load."""
+        engine = self.engine
+        loaded = engine.markets_loaded_at
+        if loaded and loaded != self._rules_stamp:
+            self._rules_stamp = loaded
+            self.rules_loaded_at = time.time() - max(0.0, time.monotonic() - loaded)
             self.rules_cache.clear()
 
     def _poll_interval(self, count: int) -> float:
@@ -1308,6 +1327,9 @@ class MicroManager:
     # ------------------------------------------------------------- exits
     def _manage_exits(self, params, *, only_due: bool = False) -> None:
         engine = self.engine
+        # Positions outside the micro cycles keep their stored-exit checks at every point the held cycles are
+        # re-checked (between pairs, around the catalogue refresh); the monitor returns at once until it is due.
+        engine._monitor_if_due()
         cycles = [c for c in open_cycles(engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
         interval = self._poll_interval(len(cycles))
         for cycle in cycles:
@@ -1533,6 +1555,11 @@ class MicroManager:
                         raise ValueError('the carried remainder changed before booking')
                 elif carried_base > 0:
                     raise ValueError('the carried remainder disappeared before booking')
+                if carried_base > 0:
+                    # This cycle now owns the remainder: the closed cycles that retained it no longer do.
+                    db.execute("UPDATE micro_cycles SET residual_base='0', residual_basis='0' WHERE exchange=? "
+                               "AND mode='paper' AND symbol=? AND state='CLOSED' AND cycle_id<>?",
+                               (engine.exchange_name, symbol, cycle['cycle_id']))
                 owned = money.add(acquisition.owned_base, carried_base)
                 basis = money.add(acquisition.basis, carried_basis)
                 price = float(fill['average'])

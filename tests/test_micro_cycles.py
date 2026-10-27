@@ -1658,6 +1658,54 @@ def test_without_a_holding_a_failing_catalogue_refresh_keeps_its_retries_and_wai
     assert len(reloads) == 3
 
 
+class _Answer:
+    """A canned HTTP response for the real exchange clients (the request itself never leaves the process)."""
+
+    def __init__(self, body):
+        self.text = json.dumps(body)
+        self.content = self.text.encode()
+        self.headers = {'Content-Type': 'application/json'}
+        self.status_code, self.reason, self.encoding = 200, 'OK', None
+
+    def raise_for_status(self):
+        pass
+
+
+def test_the_stated_delay_of_a_held_cycle_catalogue_attempt_covers_every_request_of_one_load():
+    """One attempt is one ``load_markets(reload=True)`` call of the real client, whose requests run in a row."""
+    import re
+    import types
+    import market_data
+    worst = {}
+    for name in ('mexc', 'kraken'):
+        client = trader.TradingEngine._new_exchange(name)          # the production options (no network here)
+        client.enableRateLimit = False
+        urls = []
+
+        def request(method, url, *args, _urls=urls, **kwargs):
+            _urls.append(url.split('?')[0])
+            now_ms = int(time.time() * 1000)
+            if '/api/v3/time' in url:
+                return _Answer({'serverTime': now_ms})
+            if '/api/v3/exchangeInfo' in url:
+                return _Answer({'timezone': 'CST', 'serverTime': now_ms, 'symbols': []})
+            if 'contract' in url:
+                return _Answer({'success': True, 'code': 0, 'data': []})
+            return _Answer({'error': [], 'result': {}})                   # Kraken's public Assets and AssetPairs
+        client.session.request = request
+        held = types.SimpleNamespace(markets_loaded_at=time.monotonic() - micro.CATALOGUE_HOLD_REFRESH_S,
+                                     markets_retry_at=0.0, data=market_data.MarketData(client),
+                                     CATALOGUE_RETRY_SECONDS=trader.TradingEngine.CATALOGUE_RETRY_SECONDS,
+                                     _catalogue=lambda: {})
+        assert isinstance(trader.TradingEngine._fetch_markets(held, attempts=1), dict)   # the held cycle's attempt
+        assert urls, name
+        worst[name] = len(urls) * client.timeout / 1000          # each request may take the whole client timeout
+    assert worst['mexc'] == 3 * 18.0                             # server time, spot markets, contract markets
+    doc = ' '.join((ROOT / 'docs' / 'ATB_MICRO_ARCHITECTURE.md').read_text(encoding='utf-8').split())
+    stated = re.search(r'can delay an exit check by at most (.+?)(?:\. |$)', doc).group(1)
+    assert max(float(n) for n in re.findall(r'(\d+(?:\.\d+)?) s\b', stated)) >= max(worst.values()), stated
+
+
 def test_a_loss_limit_reached_just_before_a_crash_latches_at_the_next_start(world, monkeypatch):
     w = world(micro_daily_loss_limit_usdt=0.1, micro_cooldown_seconds=0)
     held = w.run_until_state('HOLDING')
@@ -1769,7 +1817,11 @@ def test_owned_symbols_are_open_cycles_and_closed_residuals_still_in_the_ledger_
     with storage.connection() as db:
         db.execute("UPDATE micro_cycles SET state='CLOSED', residual_base='0.000001' WHERE cycle_id=?",
                    (held['cycle_id'],))
+        db.execute("UPDATE positions SET qty=0.000001 WHERE symbol='ETH/USDT'")
     assert w.engine.micro.owned_symbols() == {'ETH/USDT'}                 # a closed remainder still in the ledger
+    with storage.connection() as db:
+        db.execute("UPDATE positions SET qty=0.008 WHERE symbol='ETH/USDT'")
+    assert w.engine.micro.owned_symbols() == set()                        # the ledger holds something else
     with storage.connection() as db:
         db.execute("UPDATE micro_cycles SET residual_base='0' WHERE cycle_id=?", (held['cycle_id'],))
     assert w.engine.micro.owned_symbols() == set()                        # nothing left: the legacy monitor's again
@@ -1821,3 +1873,130 @@ def test_a_sizing_failure_or_a_missing_book_reports_its_own_cause_not_an_unnamed
     assert all('No fresh order book' in reasons for _, _, reasons, _ in stale)
     assert not any('does not name its symbol' in reason for _, _, reasons, _ in seen for reason in reasons)
     assert w.cycles() == []
+
+
+def _carry_a_residual_then_sell_it_all(w) -> tuple[dict, dict]:
+    """ETH's first sale fills 97 % (the rest is below the market minimum); the next cycle carries that rest
+    and sells everything."""
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    venue = w.venue()
+    original = venue.create_order
+
+    def eth_sale_fills_97_percent(symbol, *args, **kwargs):
+        if symbol == 'ETH/USDT':
+            venue.partial_next = Decimal('0.97')
+        return original(symbol, *args, **kwargs)
+    venue.create_order = eth_sale_fills_97_percent
+    assert w.run(120, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    venue.create_order = original
+    first = micro.load_cycle(held['cycle_id'])
+    assert Decimal(first['residual_base']) > 0
+
+    def later_closed():
+        return any(c['cycle_id'] != first['cycle_id'] and c['state'] == 'CLOSED' for c in w.cycles(symbol='ETH/USDT'))
+    assert w.run(300, until=later_closed)
+    later = [c for c in w.cycles(symbol='ETH/USDT') if c['cycle_id'] != first['cycle_id']][0]
+    assert Decimal(later['carried_base']) == Decimal(first['residual_base']) and Decimal(later['residual_base']) == 0
+    assert storage.rows("SELECT qty FROM positions WHERE symbol='ETH/USDT' AND mode='paper'") == []
+    return first, later
+
+
+def _manual_eth_position_is_the_legacy_monitors(w) -> None:
+    w.engine.running = False
+    w.engine.update_config(micro_settings(watchlist=['BTC/USDT'], micro_cooldown_seconds=0))
+    assert w.engine.manual_trade('ETH/USDT', 'BUY', 20)['status'] == 'filled'
+    assert 'ETH/USDT' not in w.engine.micro.owned_symbols()          # not the micro cycles' position
+    position = storage.rows("SELECT qty, stop FROM positions WHERE symbol='ETH/USDT' AND mode='paper'")[0]
+    w.set_closes('ETH/USDT', float(position['stop']) * 0.97)          # through the manual position's stored stop
+    w.go()
+    for _ in range(4):
+        w.clock.advance(15)
+        w.engine._monitor_if_due(force=True)
+    assert storage.rows("SELECT qty FROM positions WHERE symbol='ETH/USDT' AND mode='paper'") == []
+
+
+def test_a_residual_that_a_later_cycle_carried_and_sold_is_no_longer_recorded_on_the_earlier_cycle(world):
+    w = world(micro_cooldown_seconds=0)
+    first, _ = _carry_a_residual_then_sell_it_all(w)
+    earlier = micro.load_cycle(first['cycle_id'])
+    assert (earlier['residual_base'], earlier['residual_basis']) == ('0', '0')     # the later cycle took it over
+    assert w.engine.micro.status()['results']['residuals'] == []
+    assert_ledger_consistent(w)                                                   # its basis is not counted twice
+    _manual_eth_position_is_the_legacy_monitors(w)
+
+
+def test_owned_symbols_never_claim_a_later_position_for_a_residual_the_ledger_no_longer_holds(world):
+    w = world(micro_cooldown_seconds=0)
+    first, _ = _carry_a_residual_then_sell_it_all(w)
+    # A database written before carried residuals were cleared keeps the earlier record.
+    with storage.connection() as db:
+        db.execute('UPDATE micro_cycles SET residual_base=?, residual_basis=? WHERE cycle_id=?',
+                   (first['residual_base'], first['residual_basis'], first['cycle_id']))
+    assert w.engine.micro.owned_symbols() == set()
+    _manual_eth_position_is_the_legacy_monitors(w)
+
+
+def _five_pairs_and_one_outside_them(minute: int) -> list[SeriesMarket]:
+    others = [SeriesMarket(f'C{i}/USDT', minute - 300, flat(900, base=10.0 + i), market=fine_market(f'C{i}/USDT'))
+              for i in range(4)]
+    outside = SeriesMarket('L/USDT', minute - 300, flat(900, base=100.0), market=fine_market('L/USDT'))
+    return [SeriesMarket('ETH/USDT', minute - 300, mechanics(), market=fine_market('ETH/USDT'))] + others + [outside]
+
+
+def test_a_position_outside_the_micro_cycles_keeps_its_stop_checks_between_micro_pairs(world):
+    download_s = 4.0
+    w = world(_five_pairs_and_one_outside_them, watchlist=['ETH/USDT', 'C0/USDT', 'C1/USDT', 'C2/USDT', 'C3/USDT'])
+    w.run(3)                                                          # the micro manager has its context
+    w.engine.running = False
+    w.engine.stop_event.set()
+    assert w.engine.manual_trade('L/USDT', 'BUY', 20)['status'] == 'filled'   # a pair outside the watchlist
+    w.go()
+    assert 'L/USDT' not in w.engine.micro.owned_symbols()
+    w.engine.data.concurrency = 1                                     # sequential candle downloads (Kraken-like)
+    w.clock.advance(60 - w.clock.time() % 60 + 5)                     # just after a close: every pair's bars are due
+    w.engine._monitor_if_due(force=True)                              # the worker loop's call before the tick
+    position = [p for p in w.engine._active_positions('paper') if p['symbol'] == 'L/USDT'][0]
+    w.set_closes('L/USDT', float(position['stop']) * 0.97)            # the price falls through its stored stop now
+    dropped = w.clock.time()
+    sold, real_sell, real_fetch = [], w.engine._sell, w.exchange.fetch_ohlcv
+
+    def sell(position, *args, **kwargs):
+        if position['symbol'] == 'L/USDT':
+            sold.append(w.clock.time())
+        return real_sell(position, *args, **kwargs)
+
+    def slow_fetch(*args, **kwargs):
+        w.clock.advance(download_s)
+        return real_fetch(*args, **kwargs)
+    w.engine._sell, w.exchange.fetch_ohlcv = sell, slow_fetch
+    w.engine.micro.tick()                                             # one pass of the micro branch of the loop
+    w.engine._monitor_if_due()
+    interval = max(2.0, min(60.0, float(w.engine.cfg.get('protective_poll_seconds', 5))))
+    # Within one protective interval plus one pair's two candle reads, not after the whole pass.
+    assert sold and sold[0] - dropped <= interval + 2 * download_s, (sold, dropped)
+    assert not [p for p in w.engine._active_positions('paper') if p['symbol'] == 'L/USDT']
+
+
+def test_a_catalogue_reload_made_outside_the_micro_pass_rebuilds_the_rules_from_its_load_time(world):
+    w = world()
+    w.run(2)
+    w.engine.running = False
+    w.engine.stop_event.set()
+    w.clock.advance(3 * 3600)
+    w.engine.history('ETH/USDT', '1m')                    # a chart while stopped reloads the hour-old catalogue
+    loaded_wall = w.clock.time() - (w.clock.monotonic() - w.engine.markets_loaded_at)
+    w.go()
+    w.tick()
+    mgr = w.engine.micro
+    assert mgr.rules_loaded_at == pytest.approx(loaded_wall, abs=1.0)    # aged from that load, not from before Stop
+    assert mgr.rules('ETH/USDT').loaded_at == pytest.approx(loaded_wall, abs=1.0)
+    count = len(w.cycles())
+    assert w.run(10, until=lambda: len(w.cycles()) > count)               # entries are not refused as stale data
+    held = w.run_until_state('HOLDING')
+    # While a cycle is held: a reload made by another caller (a scan, a manual order) is also adopted.
+    w.clock.advance(3601)
+    w.engine._fetch_markets()
+    loaded_wall = w.clock.time() - (w.clock.monotonic() - w.engine.markets_loaded_at)
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'HOLDING'
+    w.tick()
+    assert mgr.rules_loaded_at == pytest.approx(loaded_wall, abs=1.0)

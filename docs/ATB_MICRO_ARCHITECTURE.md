@@ -133,7 +133,8 @@ Invariants:
   base that left; `allocated + residual = basis` exactly. A sellable rest stays
   `HOLDING`, and its stop counts the loss the partial sale already realized; an
   unsellable rest closes the cycle and stays in the ledger as residual, carried
-  by the next cycle on that pair.
+  by the next cycle on that pair. Once that cycle's entry is booked, the closed
+  cycle no longer records the residual.
 * **Fresh opportunity for a rebuy.** After a close the pair waits a cooldown
   (doubling with consecutive losses) and needs a completed bar newer than the
   exit.
@@ -184,7 +185,9 @@ While running, three checks keep the ledger and the venue record in step:
 ## Data path and cadence
 
 * The catalogue is the engine's (`_fetch_markets`, hourly refresh); rules are
-  rebuilt when it reloads and are considered stale after two hours.
+  rebuilt whenever it has reloaded, also when another caller (a chart, a
+  backtest, a manual order, a scan) reloaded it, and are aged from that load:
+  they are considered stale after two hours.
 * Order books: REST depth (`MarketData.order_book`, 20 levels, a priority
   method so it never queues behind candle downloads) per pair, at most every
   `max(1 s, 3 × rateLimit × pairs)`; every 3 s for a pair whose setup is
@@ -203,6 +206,10 @@ While running, three checks keep the ledger and the venue record in step:
   cache keeps the previous frame for two seconds after a close; a venue may
   publish late) is marked not current: entries treat it as stale data and it
   is read again after 5 s, so a decision never acts on the previous bar.
+* Positions outside the micro cycles (a legacy or manual position) get their
+  stored-exit check (`_monitor_if_due`, every `protective_poll_seconds`) at
+  every point where held cycles are re-checked, so it never waits for a whole
+  pass.
 * Safety exits (stop loss, maximum hold, regime shift) do not need depth: with
   no fresh book they use the top of book from the stream or one
   `fetch_bids_asks` / ticker read. The paper venue fills such a sale at the
@@ -215,14 +222,19 @@ While running, three checks keep the ledger and the venue record in step:
   an hour before entries refuse it as stale), and then makes a single attempt
   instead of the client's three; a failed refresh waits 300 s before the next.
   So a slow or failing catalogue endpoint can delay an exit check by at most
-  one client timeout (18 s), and only once the catalogue is that old while
-  cycles keep overlapping. Without a holding the refresh keeps its retries.
+  one attempt, whose requests run one after another with the 18 s client
+  timeout each: three on MEXC (server time, spot markets, contract markets),
+  so up to 54 s, and two on Kraken (assets, pairs), so up to 36 s, and only
+  once the catalogue is that old while cycles keep overlapping. Without a
+  holding the refresh keeps its retries.
 * Each book also refreshes the engine's marks, which the risk gate's
   freshness checks read. A closed cycle's residual that no open cycle reads is
   re-quoted every `min(30 s, data_max_age_seconds / 3)` (30 s at the default 120 s) on a schedule of its own, so
   the 30 s idle cadence of a pair that is still selected cannot delay it. The
   legacy monitor leaves micro-owned pairs alone, and a stale mark would make
-  the gate refuse every entry.
+  the gate refuse every entry. A pair is micro-owned while a cycle is open on
+  it, or while the ledger holds exactly the newest residual a closed cycle of
+  the pair retains.
 * MEXC limits (public documentation, checked 2026-10-26): 300 IP weight per
   10 s, depth weight 3 at the default limit; the engine's rate limiter and
   `MarketData` pacing apply to every read.

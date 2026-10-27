@@ -144,7 +144,8 @@ import importlib.util, ipaddress, json, socket, sys
 real_getaddrinfo, real_getnameinfo, asked = socket.getaddrinfo, socket.getnameinfo, []
 
 def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    asked.append(['getaddrinfo', host, bool(flags & socket.AI_NUMERICHOST)])
+    shown = host.decode('ascii', 'replace') if isinstance(host, bytes) else host
+    asked.append(['getaddrinfo', shown, bool(flags & socket.AI_NUMERICHOST)])
     return real_getaddrinfo(host, port, family, type, proto, flags | socket.AI_NUMERICHOST)
 
 def getnameinfo(sockaddr, flags):
@@ -166,7 +167,7 @@ def method(name):                         # a socket method resolves a host name
 
 def resolver(function):
     def lookup(host):
-        asked.append([function, host, False])
+        asked.append([function, host.decode('ascii', 'replace') if isinstance(host, bytes) else host, False])
         raise socket.herror(1, 'the resolver was asked')
     return lookup
 
@@ -200,6 +201,20 @@ for spelling in ('[127.0.0.1]', '127.0.0.2%lo'):        # C would resolve these:
             sock.connect_ex((spelling, 1))
         except socket.gaierror:
             pass
+
+def unanswered(lookup, *args):
+    try:
+        lookup(*args)
+    except socket.gaierror as error:
+        return ['gaierror', error.errno]
+    except OSError as error:
+        return [type(error).__name__]
+    return ['answered']
+
+# glibc hands an empty name to the resolver, which can ask a DNS server for the root name.
+empty = [unanswered(socket.getaddrinfo, '', 443), unanswered(socket.getaddrinfo, b'', 443),
+         unanswered(socket.getaddrinfo, '', 443, 0, socket.SOCK_STREAM, 0, socket.AI_PASSIVE),
+         unanswered(socket.gethostbyname_ex, ''), unanswered(socket.gethostbyname_ex, b'')]
 print(json.dumps({'answers': {
     'bound': bound, 'connect_ex': connected, 'literals': literals,
     'ipv6': socket.getaddrinfo('localhost', 443, socket.AF_INET6, socket.SOCK_STREAM)[0][4][0],
@@ -210,6 +225,7 @@ print(json.dumps({'answers': {
     'reverse': [socket.gethostbyaddr(a) for a in ('127.0.0.2', '::1', '0.0.0.0', 'localhost')],
     'nameinfo': [socket.getnameinfo(s, serv) for s in (('127.0.0.2', 443), ('::1', 443, 0, 0), ('0.0.0.0', 443))],
     'name_required': socket.getnameinfo(('127.0.0.1', 443), serv | socket.NI_NAMEREQD),
+    'empty': empty,
 }, 'asked': asked}))
 '''
     guard = os.path.abspath(offline_net.__file__)
@@ -224,12 +240,34 @@ print(json.dumps({'answers': {
                     ['localhost', [], ['0.0.0.0']], ['localhost', [], ['127.0.0.1']]],
         'nameinfo': [['localhost', '443']] * 3,
         'name_required': ['localhost', '443'],
+        'empty': [['gaierror', socket.EAI_NONAME]] * 5,
     }
+    assert not [entry for entry in report['asked'] if entry[1] == ''], report['asked']
     assert report['asked'] and all(numeric for _, _, numeric in report['asked']), report['asked']
     called = [(function, host) for function, host, _ in report['asked']]
     assert {'bind', 'connect', 'connect_ex', 'sendto'} <= {function for function, _ in called}
     assert ('sendmsg' in {function for function, _ in called}) == hasattr(socket.socket, 'sendmsg')
     assert ('getaddrinfo', '127.0.0.1') in called and ('getaddrinfo', '::1') in called
+
+
+def test_an_empty_host_gets_no_lookup_but_keeps_its_wildcard_meaning():
+    # getaddrinfo and gethostbyname_ex would hand '' to the resolver; the C socket functions read it as the wildcard.
+    for host in ('', b''):
+        with pytest.raises(socket.gaierror) as refused:
+            socket.getaddrinfo(host, 443)
+        assert refused.value.errno == socket.EAI_NONAME
+        with pytest.raises(socket.gaierror) as refused:
+            socket.gethostbyname_ex(host)
+        assert refused.value.errno == socket.EAI_NONAME
+    with pytest.raises(socket.gaierror):
+        socket.getaddrinfo('', 443, 0, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+    assert socket.gethostbyname('') == '0.0.0.0'
+    assert {entry[4][0] for entry in socket.getaddrinfo(None, 443, socket.AF_INET)} == {'127.0.0.1'}
+    assert socket.getaddrinfo('127.0.0.1', 443, socket.AF_INET)[0][4][0] == '127.0.0.1'
+    assert socket.gethostbyname_ex('127.0.0.1')[2] == ['127.0.0.1']
+    with socket.socket() as sock:
+        sock.bind(('', 0))
+        assert sock.getsockname()[0] == '0.0.0.0'
 
 
 def test_the_socket_methods_get_the_loopback_literal_of_their_family():

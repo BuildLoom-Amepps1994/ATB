@@ -12,11 +12,13 @@ is 127.0.0.1 (``::1`` when IPv6 is asked for), a loopback or unspecified
 address is named ``localhost``, a local literal is parsed numerically, and
 the socket methods are given the literal in place of the name ``localhost``,
 which they would otherwise resolve in C (and get no answer for a bracketed
-or zoned spelling, which C would also resolve). The resolver reads the hosts file
-first and asks a DNS server only for what that file lacks, which on many
-machines includes ``localhost`` over IPv6 and every loopback address but
-127.0.0.1. Other names (``localhost.localdomain``, ``ip6-localhost``,
-``[localhost]``) are refused.
+or zoned spelling, which C would also resolve). An empty host name gets no
+answer from ``getaddrinfo`` or ``gethostbyname_ex``, which would hand it to the
+resolver; the socket methods and ``gethostbyname`` read it as the wildcard
+address. The resolver reads the hosts file first and asks a DNS server only for
+what that file lacks, which on many machines includes ``localhost`` over IPv6
+and every loopback address but 127.0.0.1. Other names
+(``localhost.localdomain``, ``ip6-localhost``, ``[localhost]``) are refused.
 
 uvloop and winloop are blocked from import, so uvicorn's default loop is
 asyncio's. Their libuv loops resolve and connect in C, where these checks do
@@ -181,8 +183,10 @@ def install() -> None:
     def getaddrinfo(host, port=None, family=0, type=0, proto=0, flags=0):
         if not local_host(host):
             _refuse('a name lookup for', host)
-        if host is None or _text(host) == '':                      # the wildcard or this host's own addresses
+        if host is None:                                           # loopback, or the wildcard with AI_PASSIVE
             return real_getaddrinfo(host, port, family, type, proto, flags)
+        if _text(host) == '':                                      # the resolver would be asked for it
+            _no_name('')
         if not _is_name(host):                                     # a local literal: parsed, never resolved
             return real_getaddrinfo(host, port, family, type, proto, flags | socket.AI_NUMERICHOST)
         address = '::1' if family == socket.AF_INET6 else '127.0.0.1'
@@ -205,7 +209,7 @@ def install() -> None:
             _refuse('a name lookup for', host)
         if _is_name(host):
             return _LOCAL_NAME, [], ['127.0.0.1']
-        if not _plain(_text(host)):
+        if not _plain(_text(host)) or _text(host) == '':        # C resolves '' here, unlike in gethostbyname
             _no_name(_text(host))
         return real_gethostbyname_ex(host)
 

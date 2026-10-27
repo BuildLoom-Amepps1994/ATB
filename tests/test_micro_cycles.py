@@ -1807,6 +1807,57 @@ def test_a_held_cycle_defers_the_catalogue_refresh_then_makes_one_attempt_after_
     assert [kind for kind, _ in events].count('catalogue') == 2
 
 
+def test_after_a_held_cycle_catalogue_attempt_the_held_cycle_is_checked_before_a_slow_outside_position(world):
+    """A manual position outside the watchlist whose quote reads time out must not add its monitor run to the
+    catalogue attempt the held cycle already waited for; it is checked right after the held cycle instead."""
+    import ccxt
+    w = world(_five_pairs_and_one_outside_them, watchlist=['ETH/USDT'], micro_max_hold_minutes=240)
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    w.engine.running = False
+    w.engine.stop_event.set()
+    assert w.engine.manual_trade('L/USDT', 'BUY', 20)['status'] == 'filled'
+    w.go()
+    w.set_closes('ETH/USDT', float(Decimal(held['entry_price'])))    # no exit of its own meanwhile
+    w.engine.data.wait = lambda seconds: False
+    w.tick()
+    timeout_s = 18.0
+    events = []
+    real_load, real_book = w.exchange.load_markets, w.exchange.fetch_order_book
+    real_quotes, real_ticker = w.exchange.fetch_bids_asks, w.exchange.fetch_ticker
+
+    def slow_failing(kind):
+        events.append((kind, w.clock.monotonic()))
+        w.clock.advance(timeout_s)                                    # the client timeout, then a transport error
+        raise ccxt.RequestTimeout('timed out')
+
+    def load(reload=False):
+        return slow_failing('catalogue') if reload else real_load(reload)
+
+    def book(symbol, *args, **kwargs):
+        events.append((symbol, w.clock.monotonic()))
+        return real_book(symbol, *args, **kwargs)
+
+    def quotes(symbols=None, params=None):
+        return slow_failing('L/USDT quotes') if symbols and 'L/USDT' in symbols else real_quotes(symbols, params)
+
+    def ticker(symbol, params=None):
+        return slow_failing('L/USDT ticker') if symbol == 'L/USDT' else real_ticker(symbol, params)
+    w.exchange.load_markets, w.exchange.fetch_order_book = load, book
+    w.exchange.fetch_bids_asks, w.exchange.fetch_ticker = quotes, ticker
+    w.clock.advance(3601)
+    w.engine.micro.rules_loaded_at -= micro.CATALOGUE_HOLD_REFRESH_S   # the held cycle's one attempt is due
+    w.engine._monitor_if_due()                                        # the worker loop's call before the tick
+    events.clear()
+    w.tick()
+    kinds = [kind for kind, _ in events]
+    attempt = kinds.index('catalogue')
+    after = [(kind, round(at - events[attempt][1], 1)) for kind, at in events[attempt:]]
+    # The fixture clock also moves with real time, so the bounds leave half a timeout for a slow runner.
+    assert after[1][0] == 'ETH/USDT' and after[1][1] < timeout_s * 1.5, after     # the held cycle: one attempt
+    assert after[2][0] == 'L/USDT quotes' and after[2][1] < timeout_s * 1.5, after   # then the outside position
+    assert micro.load_cycle(held['cycle_id'])['state'] == 'HOLDING'
+
+
 def test_without_a_holding_a_failing_catalogue_refresh_keeps_its_retries_and_waits_before_the_next(world):
     import ccxt
     w = world()
@@ -1849,9 +1900,12 @@ def test_the_stated_delay_of_a_held_cycle_catalogue_attempt_covers_every_request
     import re
     import types
     import market_data
-    worst = {}
+    worst, pacing = {}, {}
     for name in ('mexc', 'kraken'):
         client = trader.TradingEngine._new_exchange(name)          # the production options (no network here)
+        # ccxt paces each request from the previous one's start, so a slow request absorbs the next one's
+        # pacing: only the wait before the first request adds to the attempt, at most one rate-limit interval.
+        pacing[name] = client.rateLimit / 1000 if client.enableRateLimit else 0.0
         client.enableRateLimit = False
         urls = []
 
@@ -1874,9 +1928,30 @@ def test_the_stated_delay_of_a_held_cycle_catalogue_attempt_covers_every_request
         assert urls, name
         worst[name] = len(urls) * client.timeout / 1000          # each request may take the whole client timeout
     assert worst['mexc'] == 3 * 18.0                             # server time, spot markets, contract markets
-    doc = ' '.join((ROOT / 'docs' / 'ATB_MICRO_ARCHITECTURE.md').read_text(encoding='utf-8').split())
-    stated = re.search(r'can delay an exit check by at most (.+?)(?:\. |$)', doc).group(1)
-    assert max(float(n) for n in re.findall(r'(\d+(?:\.\d+)?) s\b', stated)) >= max(worst.values()), stated
+    assert worst['kraken'] == 2 * 18.0                           # assets, asset pairs
+    assert pacing['mexc'] <= 0.1 and pacing['kraken'] == 1.0     # MEXC's is within "about"; Kraken's is stated
+
+    def doc(name):
+        return ' '.join((ROOT / 'docs' / name).read_text(encoding='utf-8').split())
+
+    def found(pattern, text, where):
+        match = re.search(pattern, text)
+        assert match, (where, pattern)
+        return match.group(1)
+    row = r'\| {} \|(.+?)\| (?:\d+ \| |$)'
+    validation = doc('ATB_MICRO_VALIDATION.md')
+    statements = {  # the architecture, the accepted-risk register and the validation record state one bound
+        'architecture': found(r'can delay an exit check by at most (.+?)(?:\. |$)', doc('ATB_MICRO_ARCHITECTURE.md'),
+                              'architecture'),
+        'register item 12': found(row.format(12), doc('ATB_MICRO_RELEASE_GATES.md'), 'register item 12'),
+        'validation review': found(r'register item 12 for its remainder(.+?)(?:\. |$)', validation, 'validation review'),
+        'validation row 25': found(row.format(25), validation, 'validation row 25'),
+    }
+    for where, stated in statements.items():
+        assert float(found(r'MEXC\b.*?(\d+(?:\.\d+)?) s\b', stated, where)) == worst['mexc'], (where, stated)
+        assert float(found(r'Kraken\b.*?(\d+(?:\.\d+)?) s\b', stated, where)) == worst['kraken'], (where, stated)
+        assert float(found(r'Kraken\b.*?(\d+(?:\.\d+)?) s of pacing before the first request', stated,
+                           where)) == pacing['kraken'], (where, stated)
 
 
 def test_a_loss_limit_reached_just_before_a_crash_latches_at_the_next_start(world, monkeypatch):
@@ -2167,6 +2242,53 @@ def test_owned_symbols_never_claim_a_later_position_for_a_residual_the_ledger_no
                    (first['residual_base'], first['residual_basis'], first['cycle_id']))
     assert w.engine.micro.owned_symbols() == set()
     _manual_eth_position_is_the_legacy_monitors(w)
+
+
+def test_owned_symbols_cost_does_not_grow_with_the_closed_cycle_history(world, monkeypatch):
+    """The legacy monitor, every micro tick and the dashboard snapshot ask for the micro-owned pairs while
+    they hold the storage lock. Weeks of closed and abandoned cycles must not make that slower: the cost is
+    counted in SQLite virtual-machine steps, which do not depend on the machine's speed."""
+    import contextlib
+    w = world()
+    w.run_until_state('HOLDING', symbol='ETH/USDT')
+    exchange, steps, cap = w.engine.exchange_name, [0], 2_000_000
+    real_connection = storage.connection
+
+    @contextlib.contextmanager
+    def counted():
+        with real_connection() as db:
+            def step():
+                steps[0] += 1
+                return 1 if steps[0] == cap else 0       # far past any bound: interrupt rather than wait
+            db.set_progress_handler(step, 1)
+            yield db
+
+    def owned_and_steps():
+        steps[0] = 0
+        return w.engine.micro.owned_symbols(), steps[0]
+    monkeypatch.setattr(storage, 'connection', counted)
+    owned, short_history = owned_and_steps()
+    assert owned == {'ETH/USDT'}
+    history, pairs = 3000, ('ETH/USDT', 'BTC/USDT', 'C0/USDT', 'C1/USDT', 'C2/USDT')
+    start = time.time() - 30 * 86400
+    with real_connection() as db:
+        db.executemany('INSERT INTO micro_cycles(cycle_id, exchange, mode, symbol, state, created_at, updated_at, '
+                       'opportunity_key, budget_cap, closed_wall, residual_base) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                       [(f'cyc_hist{index:020d}', exchange, 'paper', pairs[index % 5],
+                         'ABANDONED' if index % 4 == 0 else 'CLOSED', 'x', 'x', f'history|{index}', '25',
+                         start + 60 * index, '0.5' if index == 3 else '0') for index in range(history)])
+    owned, long_history = owned_and_steps()
+    assert owned == {'ETH/USDT'}
+    assert long_history <= 2 * short_history, (short_history, long_history)   # the held cycle's own position
+    # Positions outside every open cycle: the oldest closed C1 cycle retains 0.5 C1, and C0 has no remainder.
+    with real_connection() as db:
+        for symbol, qty in (('C0/USDT', 2.0), ('C1/USDT', 0.5)):
+            db.execute("INSERT INTO positions(exchange, mode, symbol, qty, entry_price, cost, highest, stop, target, "
+                       "opened_at) VALUES (?, 'paper', ?, ?, 10, ?, 10, 9, 11, '2026-10-26T00:00:00+00:00')",
+                       (exchange, symbol, qty, 10 * qty))
+    owned, outside = owned_and_steps()
+    assert owned == {'ETH/USDT', 'C1/USDT'}
+    assert outside <= long_history + 2 * 20 * history, (long_history, outside)   # at most one pass each
 
 
 def _five_pairs_and_one_outside_them(minute: int) -> list[SeriesMarket]:

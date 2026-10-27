@@ -301,18 +301,24 @@ class MicroManager:
         cycle table cannot be read, every paper position counts as micro-owned."""
         exchange = self.engine.exchange_name
         try:
-            # One statement on one connection: the legacy monitor calls this on every protective tick.
-            rows = storage.rows("SELECT c.symbol, NULL AS residual_base, NULL AS qty FROM micro_cycles c "
-                                "WHERE c.exchange=? AND c.mode='paper' AND c.state NOT IN ('CLOSED','ABANDONED') "
-                                "UNION ALL SELECT c.symbol, c.residual_base, p.qty FROM micro_cycles c "
-                                "JOIN positions p ON p.exchange=c.exchange AND p.mode=c.mode AND p.symbol=c.symbol "
-                                "WHERE c.exchange=? AND c.mode='paper' AND c.cycle_id=(SELECT r.cycle_id FROM "
-                                "micro_cycles r WHERE r.exchange=c.exchange AND r.mode=c.mode AND r.symbol=c.symbol "
+            # One statement on one connection: the legacy monitor calls this on every protective tick, and its
+            # cost must not grow with the closed history. The open cycles come from the one-open-cycle index
+            # (DISTINCT lets the planner read it in order); the remainders are looked up per ledger position,
+            # and only for a position no open cycle already owns.
+            rows = storage.rows("SELECT DISTINCT c.symbol, 1 AS open, NULL AS residual_base, NULL AS qty "
+                                "FROM micro_cycles c WHERE c.exchange=? AND c.mode='paper' "
+                                "AND c.state NOT IN ('CLOSED','ABANDONED') "
+                                "UNION ALL SELECT p.symbol, 0, (SELECT r.residual_base FROM micro_cycles r "
+                                "WHERE r.exchange=p.exchange AND r.mode=p.mode AND r.symbol=p.symbol "
                                 "AND r.state='CLOSED' AND r.residual_base IS NOT NULL AND r.residual_base NOT IN ('0', '') "
-                                "ORDER BY r.closed_wall DESC, r.rowid DESC LIMIT 1)", (exchange, exchange))
-            return {row['symbol'] for row in rows if row['residual_base'] is None
-                    or math.isclose(float(row['qty']), float(_dec(row['residual_base'], money.ZERO)),
-                                    rel_tol=1e-9, abs_tol=1e-12)}
+                                "ORDER BY r.closed_wall DESC, r.rowid DESC LIMIT 1), p.qty FROM positions p "
+                                "WHERE p.exchange=? AND p.mode='paper' AND NOT EXISTS (SELECT 1 FROM micro_cycles o "
+                                "WHERE o.exchange=p.exchange AND o.mode=p.mode AND o.symbol=p.symbol "
+                                "AND o.state NOT IN ('CLOSED','ABANDONED'))", (exchange, exchange))
+            return {row['symbol'] for row in rows if row['open'] or (
+                row['residual_base'] is not None
+                and math.isclose(float(row['qty']), float(_dec(row['residual_base'], money.ZERO)),
+                                 rel_tol=1e-9, abs_tol=1e-12))}
         except Exception:
             return {row['symbol'] for row in storage.rows("SELECT symbol FROM positions WHERE exchange=? AND mode='paper'",
                                                           (exchange,))}
@@ -1438,9 +1444,6 @@ class MicroManager:
     # ------------------------------------------------------------- exits
     def _manage_exits(self, params, *, only_due: bool = False) -> None:
         engine = self.engine
-        # Positions outside the micro cycles keep their stored-exit checks at every point the held cycles are
-        # re-checked (between pairs, around the catalogue refresh); the monitor returns at once until it is due.
-        engine._monitor_if_due()
         cycles = [c for c in open_cycles(engine.exchange_name, 'paper') if c['state'] == 'HOLDING']
         interval = self._poll_interval(len(cycles))
         for cycle in cycles:
@@ -1449,6 +1452,10 @@ class MicroManager:
             if only_due and time.monotonic() < self._next_book.get(cycle['symbol'], 0.0):
                 continue
             self._manage_exit(cycle, params, interval=interval)
+        # Positions outside the micro cycles keep their stored-exit checks at every point the held cycles are
+        # re-checked (between pairs, around the catalogue refresh); the monitor returns at once until it is due.
+        # It runs after the held cycles, so they never wait for its reads on top of a slow catalogue attempt.
+        engine._monitor_if_due()
 
     def _manage_exit(self, cycle: dict, params, *, operator: bool = False, interval: float = 1.0,
                      ignore_backoff: bool = False) -> None:

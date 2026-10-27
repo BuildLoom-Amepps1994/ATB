@@ -213,7 +213,9 @@ While running, three checks keep the ledger and the venue record in step:
 * Positions outside the micro cycles (a legacy or manual position) get their
   stored-exit check (`_monitor_if_due`, every `protective_poll_seconds`) at
   every point where held cycles are re-checked, so it never waits for a whole
-  pass.
+  pass. It runs on the same worker right after the held cycles' own checks, so
+  after a slow catalogue attempt the held cycles are checked first and these
+  positions right after them.
 * Safety exits (stop loss, maximum hold, regime shift) do not need depth: with
   no fresh book they use the top of book from the stream when it states a bid
   size, otherwise one `fetch_bids_asks` / ticker read. The paper venue fills
@@ -228,9 +230,10 @@ While running, three checks keep the ledger and the venue record in step:
   So a slow or failing catalogue endpoint can delay an exit check by at most
   one attempt, whose requests run one after another with the 18 s client
   timeout each: three on MEXC (server time, spot markets, contract markets),
-  so up to 54 s, and two on Kraken (assets, pairs), so up to 36 s, and only
-  once the catalogue is that old while cycles keep overlapping. Without a
-  holding the refresh keeps its retries.
+  so up to 54 s, and two on Kraken (assets, pairs), so up to 36 s plus up to
+  1 s of pacing before the first request, and only once the catalogue is that
+  old while cycles keep overlapping. Without a holding the refresh keeps its
+  retries.
 * Each book also refreshes the engine's marks, which the risk gate's
   freshness checks read. A closed cycle's residual that no open cycle reads is
   re-quoted every `min(30 s, data_max_age_seconds / 3)` (30 s at the default 120 s) on a schedule of its own, so

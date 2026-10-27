@@ -460,6 +460,47 @@ def test_break_even_and_target_bids_walk_the_bids_so_a_thin_top_cannot_hide_the_
     assert result.sellable_base == deep.sellable_base and result.break_even_bid > deep.break_even_bid
 
 
+def scaled(book, best):
+    """``book`` with every level moved by the same factor, so its best bid is ``best``."""
+    factor = money.div(best, book.best_bid)
+    return replace(book, bids=tuple((money.mul(price, factor), quantity) for price, quantity in book.bids),
+                   asks=tuple((money.mul(price, factor), quantity) for price, quantity in book.asks))
+
+
+def test_a_held_cycle_shows_the_break_even_and_target_bids_its_estimated_net_reaches():
+    """Bought on a deep book, then the bids thin: the bids shown are where selling into the bids nets 0 and the
+    target, the same walk that prices est_net and so the stop and take-profit, never the single-price figure."""
+    result = size()
+    owned = money.add(result.sellable_base, result.predicted_residual_base)
+    thin = Book(bids=THIN_TOP_BIDS, asks=((D('100.01'), D('1000')),))
+    now = exit_estimate(owned, result.max_debit, thin)
+    assert now.depth_model == 'book' and not now.depth_exhausted and now.est_net_pnl < 0
+    at_even = exit_estimate(owned, result.max_debit, scaled(thin, now.break_even_bid))
+    assert at_even.est_net_pnl >= 0, (now.break_even_bid, at_even.est_net_pnl)
+    below = exit_estimate(owned, result.max_debit, scaled(thin, money.sub(now.break_even_bid, D('0.01'))))
+    assert below.est_net_pnl < 0                              # the exact bid, not a figure padded above it
+    at_target = exit_estimate(owned, result.max_debit, scaled(thin, now.target_bid))
+    assert at_target.est_net_pnl >= D('0.05'), (now.target_bid, at_target.est_net_pnl)
+    # Sized on the thin book itself, the held cycle shows the bids its sizing showed.
+    bought_thin = size(book_=thin)
+    assert (now.break_even_bid, now.target_bid) == (bought_thin.break_even_bid, bought_thin.target_bid)
+    # A crash that exhausts the visible bids: the conservative estimate prices the bids shown too.
+    crash = Book(bids=((D('60'), D('0.1')), (D('59'), D('0.1'))), asks=((D('61'), D('1')),))
+    fallen = exit_estimate(D('0.25'), D('25'), crash)
+    assert fallen.depth_exhausted
+    assert exit_estimate(D('0.25'), D('25'), scaled(crash, fallen.break_even_bid)).est_net_pnl >= 0
+    assert exit_estimate(D('0.25'), D('25'), scaled(crash, fallen.target_bid)).est_net_pnl >= D('0.05')
+    # On a deep book the best bid absorbs the sale: the single-price figures, unchanged.
+    deep = exit_estimate(owned, result.max_debit, deep_book())
+    keep = money.mul(deep.sellable_base, D('0.9997'), D('0.999'))
+    assert deep.break_even_bid == money.q_up(money.div(deep.allocated_basis, keep), D('0.01'))
+    assert deep.target_bid == money.q_up(money.div(money.add(deep.allocated_basis, D('0.05')), keep), D('0.01'))
+    ticker = Book(bids=((D('99.99'), None),), asks=((D('100.01'), None),), depth_known=False)
+    flat = exit_estimate(owned, result.max_debit, ticker)
+    keep = money.mul(flat.sellable_base, D('0.9977'), D('0.999'))
+    assert flat.break_even_bid == money.q_up(money.div(flat.allocated_basis, keep), D('0.01'))
+
+
 # ------------------------------------------------ 10. partial-close conservation
 def test_partial_closes_conserve_ownership_basis_and_cash_exactly():
     entry = me.account_entry(filled_base=D('0.24958519'), gross_quote=D('24.97'), quote_fee=D('0.02497'),

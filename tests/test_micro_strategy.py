@@ -1013,6 +1013,22 @@ def test_a_stop_counts_the_loss_already_realized_by_a_partial_exit():
     assert exit_for(estimate('-0.19'), realized=D('0.05')).action == 'hold'
 
 
+def test_a_stop_fired_by_a_realized_loss_names_the_cycle_net_in_its_reason():
+    """The reason is stored as the trade's reason and shown beside the rest's estimate: it must say what fired."""
+    rest = exit_for(estimate('-0.09'), realized=D('-0.12'))
+    assert rest.reason == ('stop loss: cycle net -0.2100 (estimated -0.0900 on the rest plus -0.1200 already '
+                           'realized) at or below the stop -0.2000')
+    stop = next(c for c in rest.checks if c['check'] == 'stop_loss')
+    assert stop['detail'] == rest.reason.removeprefix('stop loss: ')
+    # A small estimated gain on the rest is not described as an estimated loss.
+    gain = exit_for(estimate('0.01'), realized=D('-0.25'))
+    assert 'estimated +0.0100 on the rest plus -0.2500 already realized' in gain.reason
+    assert 'estimated net at or below' not in gain.reason
+    # Without a realized loss the estimate alone fired it, and the reason says so.
+    for realized in (None, D('0'), D('0.05')):
+        assert exit_for(estimate('-0.20'), realized=realized).reason == 'stop loss: estimated net at or below the stop'
+
+
 def test_without_an_estimate_the_exit_cannot_be_evaluated():
     missing = exit_for(None, peak=D('0.02'))
     assert (missing.action, missing.trigger, missing.needs_depth, missing.new_peak) == \

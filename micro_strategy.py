@@ -1010,7 +1010,14 @@ def evaluate_exit(*, estimate: dict | None, depth_model: str, target_net: Decima
     cycle_net = money.add(est_net, min(realized, money.ZERO)) if est_net is not None and realized is not None \
         else est_net
     stop_fired = cycle_net is not None and stop is not None and cycle_net <= -stop
-    record('stop_loss', stop_fired, 'estimated net at or below the stop' if stop_fired else (
+    stop_detail = 'estimated net at or below the stop'
+    if stop_fired and realized is not None and realized < 0:
+        # The rest's estimate alone may be above the stop: say that the cycle net, with the realized loss, fired it.
+        stop_detail = (f'cycle net {money.display(cycle_net, 4, signed=True)} (estimated '
+                       f'{money.display(est_net, 4, signed=True)} on the rest plus '
+                       f'{money.display(realized, 4, signed=True)} already realized) at or below the stop '
+                       f'{money.display(-stop, 4)}')
+    record('stop_loss', stop_fired, stop_detail if stop_fired else (
         'stop not reached' if cycle_net is not None and stop is not None else 'est_net or stop unknown'),
         est_net=est_net, realized_net=realized, cycle_net=cycle_net, stop_net=stop)
     record('max_hold', timed_out, hold_detail, held_s=held, max_hold_s=limit)

@@ -247,8 +247,8 @@ class ExitEstimate:
     uncertainty: Decimal              # quote amount: notional * uncertainty_bps / 1e4
     depth_model: str                  # 'book' | 'flat_fallback' | 'unavailable'
     depth_exhausted: bool
-    break_even_bid: Decimal | None
-    target_bid: Decimal | None
+    break_even_bid: Decimal | None    # best bid where this estimate's sale nets 0, up to the tick
+    target_bid: Decimal | None        # best bid where this estimate's sale nets target_net, up to the tick
     residual_base: Decimal            # owned - sellable (kept, never deleted)
     labels: dict                      # {'proceeds': 'estimated', 'fees': 'modeled', ...}
     def as_dict(self) -> dict
@@ -258,6 +258,8 @@ def estimate_exit(*, owned_base: Decimal, basis_quote: Decimal, rules: VenueRule
     # sellable = q_down(owned, amount_step). Book with known depth: bid walk.
     # Unknown depth (ticker top of book): best_bid * (1 - fallback_slippage - latency), depth_model 'flat_fallback'.
     # Never charge the spread twice (bid prices already contain it) and never add flat slippage to a depth walk.
+    # break_even_bid / target_bid: keep = min(sellable * factor * (1 - fee), net_proceeds / best_bid),
+    # so the bids shown are never more optimistic than est_net (a thin best bid with depth far below it).
 
 @dataclass(frozen=True)
 class Realized:

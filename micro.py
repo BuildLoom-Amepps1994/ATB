@@ -1597,7 +1597,7 @@ class MicroManager:
             return False
         intent_row = storage.order_intent(intent)
         booked = self._book_exit(cycle, intent_row, self._final_answer(symbol, intent_row, order), trigger=trigger,
-                                 reason=reason)
+                                 reason=reason, book=book)
         if booked:
             self.exit_backoff.pop(cycle['cycle_id'], None)
         return booked
@@ -1766,7 +1766,7 @@ class MicroManager:
         return True
 
     def _book_exit(self, cycle: dict, intent: dict | None, order: dict, *, trigger: str, reason: str,
-                   recovery: bool = False) -> bool:
+                   recovery: bool = False, book=None) -> bool:
         engine = self.engine
         symbol = cycle['symbol']
         started = time.monotonic()
@@ -1783,11 +1783,11 @@ class MicroManager:
                                    intent_id=(intent or {}).get('intent_id'), contain=True)
             return False
         order_id = order.get('id')
-        rules = self.rules(symbol)
         residual = realized.residual_base
-        step = rules.amount_step
-        sellable_rest = money.q_down(residual, step) if step is not None else residual
-        rest_sellable = bool(sellable_rest > 0 and (rules.min_amount is None or sellable_rest >= rules.min_amount))
+        # The rule _sell applies, with the rest priced at the lower of the fill price and the best bid when a
+        # book is known: a rest that no sale could ever be sent for closes the cycle now as residual.
+        rest_price = fill['average'] if book is None else min(fill['average'], book.best_bid)
+        rest_sellable = self._sellable(symbol, residual, rest_price)
         try:
             with storage.connection() as db:
                 db.execute('BEGIN IMMEDIATE')

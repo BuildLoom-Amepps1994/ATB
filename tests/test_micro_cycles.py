@@ -826,6 +826,72 @@ def test_after_a_partial_stop_sale_the_stop_counts_the_realized_loss_and_sells_t
     assert_ledger_consistent(w)
 
 
+def _first_sale_fills(w: World, fraction: str) -> tuple[dict, dict]:
+    """A HOLDING ETH cycle whose first sale fills only ``fraction``: (the cycle after that sale, the sale's trade)."""
+    held = w.run_until_state('HOLDING')
+    w.venue().partial_next = Decimal(fraction)
+    assert w.run(120, until=lambda: int(micro.load_cycle(held['cycle_id'])['exit_count'] or 0) >= 1)
+    sales = [t for t in w.trades() if t['side'] == 'SELL']
+    assert len(sales) == 1
+    return micro.load_cycle(held['cycle_id']), sales[0]
+
+
+def test_a_partial_exit_whose_rest_is_below_the_minimum_order_cost_closes_at_once_and_keeps_it_as_residual(world,
+                                                                                                         monkeypatch):
+    w = world()
+    mgr = w.engine.micro
+    closes, real_after_close = [], mgr._after_close
+    monkeypatch.setattr(mgr, '_after_close', lambda cycle: (closes.append(cycle['cycle_id']), real_after_close(cycle)))
+    # 97 % fills: the rest passes the minimum amount, but its value (about 0.75 USDT) is below the 1 USDT market minimum.
+    after, sale = _first_sale_fills(w, '0.97')
+    rules = mgr.rules('ETH/USDT')
+    rest = Decimal(after['owned_base'])
+    assert rest >= rules.min_amount and money.mul(rest, Decimal(repr(sale['price']))) < rules.market_min_cost()
+    # No sale of that rest can ever be sent: the cycle closes now and keeps it as its residual, as _sell would.
+    assert (after['state'], int(after['exit_count'])) == ('CLOSED', 1)
+    assert (after['residual_base'], after['residual_basis']) == (after['owned_base'], after['basis_quote'])
+    assert Decimal(after['residual_basis']) > 0 and closes == [after['cycle_id']]
+    assert money_close(_eth_position()[0]['qty'], rest, Decimal('1e-12'))
+    assert [i['status'] for i in w.intents(after['cycle_id']) if i['side'] == 'SELL'] == ['accounted']
+    assert 'ETH/USDT' in mgr.owned_symbols() and 'ETH/USDT' not in mgr.open_symbols()
+    assert {'symbol': 'ETH/USDT', 'base': after['residual_base'],
+            'basis': after['residual_basis']} in mgr.status()['results']['residuals']
+    assert_ledger_consistent(w)
+
+
+def test_a_partial_exit_whose_rest_can_still_be_sold_keeps_it_managed_until_it_is_sold(world):
+    w = world()
+    # 94 % fills: the rest (about 1.5 USDT) is above the 1 USDT market minimum.
+    after, sale = _first_sale_fills(w, '0.94')
+    rest = Decimal(after['owned_base'])
+    assert money.mul(rest, Decimal(repr(sale['price']))) >= w.engine.micro.rules('ETH/USDT').market_min_cost()
+    assert (after['state'], after['residual_base']) == ('HOLDING', '0')
+    assert w.run(60, until=lambda: micro.load_cycle(after['cycle_id'])['state'] == 'CLOSED')
+    closed = micro.load_cycle(after['cycle_id'])
+    assert (int(closed['exit_count']), closed['residual_base']) == (2, '0') and _eth_position() == []
+    assert_ledger_consistent(w)
+
+
+@pytest.mark.parametrize('best_bid, state', [(None, 'HOLDING'), ('2300', 'CLOSED')])
+def test_a_partial_exit_prices_its_rest_at_the_lower_of_the_fill_price_and_the_known_best_bid(world, best_bid, state):
+    import types
+    w = world()
+    held = w.run_until_state('HOLDING')
+    rest = Decimal('0.00042')                # 1.05 USDT at the 2500 fill price, 0.966 USDT at a 2300 best bid
+    sold = Decimal(held['owned_base']) - rest
+    gross = money.mul(sold, Decimal('2500'))
+    record = {'id': 'paper-rest-pricing', 'filled': float(sold), 'cost': float(gross),
+              'fee': {'cost': float(money.mul(gross, Decimal('0.0005'))), 'currency': 'USDT'}}
+    with storage.connection() as db:
+        cycle = micro.transition(db, micro.load_cycle(held['cycle_id']), 'EXIT_SUBMITTED', 'test sale')
+    known = {} if best_bid is None else {'book': types.SimpleNamespace(best_bid=Decimal(best_bid))}
+    assert w.engine.micro._book_exit(cycle, None, record, trigger='test', reason='rest pricing', **known)
+    after = micro.load_cycle(held['cycle_id'])
+    assert after['state'] == state and Decimal(after['owned_base']) == rest
+    assert Decimal(after['residual_base']) == (rest if state == 'CLOSED' else 0)
+    assert_ledger_consistent(w)
+
+
 # ===================================================================== item 21
 def test_a_pair_removed_from_the_selection_keeps_its_holding_managed(world):
     w = world()

@@ -1076,7 +1076,13 @@ class MicroManager:
         snapshot = micro_book.from_ccxt_order_book(raw, exchange=engine.exchange_name, symbol=symbol,
                                                    received_wall=float(received_wall), received_mono=received_mono,
                                                    clock_offset_s=engine._clock_offset(), max_levels=BOOK_LEVELS)
+        resets = self.books.resets(symbol)
         snapshot = self.books.accept(snapshot)
+        if self.books.resets(symbol) > resets:
+            observability.event('micro.book_sequence_restart', level='warning', symbol=symbol,
+                                sequence=snapshot.venue_sequence)
+            storage.audit('warning', f'{symbol}: the venue restarted its order-book update ids; '
+                                     f'books are read again from id {snapshot.venue_sequence}.')
         self.metrics.observe('micro.book_fetch_ms', (received_mono - started) * 1000)
         self._mark(symbol, snapshot)
         return snapshot
@@ -1118,15 +1124,32 @@ class MicroManager:
         return self.books.latest(symbol, now_mono=time.monotonic(), max_age_s=max_age)
 
     def _ticker_snapshot(self, symbol: str):
-        """Top of book from the stream or a REST quote; depth unknown, for safety exits only."""
+        """Top of book from the stream or a REST quote; depth unknown, for safety exits only.
+
+        The paper venue sells against a top-of-book quote only up to its stated
+        bid size, so a stream quote that states none gives way to the REST book
+        ticker, which carries its own size, price and time (never a REST size on
+        a stream price). If that read fails, the stream quote still prices the
+        exit decision.
+        """
         engine = self.engine
+        streamed = None
         try:
             ticker = engine._quote(symbol, None)
-            if not isinstance(ticker, dict):
-                quotes = engine.data.quotes([symbol])
-                ticker = quotes.get(symbol) if isinstance(quotes, dict) else None
-            if not isinstance(ticker, dict):
-                return None
+            if isinstance(ticker, dict):
+                streamed = self._quote_snapshot(symbol, ticker)
+                if streamed is not None and streamed.bids[0][1] is not None:
+                    return streamed
+            quotes = engine.data.quotes([symbol])
+            ticker = quotes.get(symbol) if isinstance(quotes, dict) else None
+        except Exception:
+            ticker = None
+        return (self._quote_snapshot(symbol, ticker) if isinstance(ticker, dict) else None) or streamed
+
+    def _quote_snapshot(self, symbol: str, ticker: dict):
+        """A fresh one-level snapshot of ``ticker`` (and the engine mark it feeds), or None."""
+        engine = self.engine
+        try:
             received = ticker.get('_received_at')
             received = float(received) if isinstance(received, (int, float)) and not isinstance(received, bool) else time.time()
             snapshot = micro_book.from_ticker(ticker, exchange=engine.exchange_name, symbol=symbol,

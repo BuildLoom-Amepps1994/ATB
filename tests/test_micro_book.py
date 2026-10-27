@@ -513,23 +513,23 @@ def test_invalidate_on_reconnect_stops_serving_and_starts_the_evidence_over():
     tracker = BookTracker(max_age_s=5)
     tracker.accept(seq(1000, mono=100.0))
     tracker.accept(seq(5, mono=100.0, symbol='BTC/USDT'))
-    tracker.invalidate('ETH/USDT', reason='stream reconnect')
+    tracker.invalidate('ETH/USDT', reason='stream reconnect', now_mono=100.0)
     assert tracker.latest('ETH/USDT', now_mono=100.1) is None
     assert tracker.latest('BTC/USDT', now_mono=100.1) is not None
     assert tracker.status(100.1)['ETH/USDT']['invalidated'] == 'stream reconnect'
     # a venue that restarted its counters cannot lock the symbol out after a reconnect
     again = tracker.accept(seq(3, mono=100.5))
     assert again.generation == 2 and tracker.latest('ETH/USDT', now_mono=100.6) is again
-    tracker.invalidate()
+    tracker.invalidate(now_mono=100.5)
     assert tracker.latest('ETH/USDT', now_mono=100.6) is None and tracker.latest('BTC/USDT', now_mono=100.6) is None
-    tracker.invalidate('NEVER/SEEN')        # nothing to invalidate is not an error
+    tracker.invalidate('NEVER/SEEN', now_mono=100.6)        # nothing to invalidate is not an error
 
 
 def test_a_book_received_before_an_invalidation_is_refused_after_it():
     tracker = BookTracker(max_age_s=5)
     tracker.accept(seq(1000, mono=100.0))
     late = seq(990, mono=99.0, bid='1999')      # an older response another thread hands over after the reconnect
-    tracker.invalidate('ETH/USDT', reason='stream reconnect')
+    tracker.invalidate('ETH/USDT', reason='stream reconnect', now_mono=100.0)
     error = refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, late)
     assert 'invalidated' in str(error)
     # whatever its venue evidence says: it was received before the reconnect
@@ -543,11 +543,92 @@ def test_a_book_received_before_an_invalidation_is_refused_after_it():
     # the fence is the newest receipt the tracker had seen, whichever symbol it was for
     tracker.accept(seq(7, mono=100.8, symbol='BTC/USDT'))
     in_flight = seq(4, mono=100.7)              # received after ETH's last book, but before BTC's and the invalidation
-    tracker.invalidate('ETH/USDT', reason='stream reconnect')
+    tracker.invalidate('ETH/USDT', reason='stream reconnect', now_mono=100.6)
     refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, in_flight)
-    tracker.invalidate()                        # every symbol gets the fence
+    tracker.invalidate(now_mono=100.6)          # every symbol gets the fence
     refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(8, mono=100.8, symbol='BTC/USDT'))
     assert tracker.accept(seq(1, mono=100.9, symbol='BTC/USDT')).generation == 2
+
+
+def test_an_invalidation_fences_every_receipt_up_to_its_own_time_including_unseen_symbols():
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(10, mono=100.0))
+    in_flight = seq(11, mono=100.4)            # stamped after the last accepted receipt, still in flight at the reconnect
+    tracker.invalidate('ETH/USDT', reason='stream reconnect', now_mono=100.5)
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, in_flight)
+    assert tracker.latest('ETH/USDT', now_mono=100.6) is None
+    fresh = tracker.accept(seq(3, mono=100.6))
+    assert tracker.latest('ETH/USDT', now_mono=100.7) is fresh
+    # a symbol the tracker had never seen when it was named is fenced too
+    tracker.invalidate('BTC/USDT', reason='stream reconnect', now_mono=100.7)
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(5, mono=100.65, symbol='BTC/USDT'))
+    assert tracker.accept(seq(5, mono=100.8, symbol='BTC/USDT')).generation == 1
+    # an invalidation of every symbol also fences the symbols first seen after it
+    tracker.invalidate(reason='stream reconnect', now_mono=101.0)
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(1, mono=100.9, symbol='SOL/USDT'))
+    assert tracker.accept(seq(1, mono=101.1, symbol='SOL/USDT')).generation == 1
+    # the invalidation time is on the receipts' monotonic clock, and the caller must give it
+    with pytest.raises(TypeError):
+        tracker.invalidate('ETH/USDT')
+    for bad in (float('nan'), float('inf'), None, True, WALL):
+        with pytest.raises(ValueError):
+            tracker.invalidate('ETH/USDT', now_mono=bad)
+    assert tracker.latest('SOL/USDT', now_mono=101.2) is not None          # a refused call changed nothing
+
+
+def test_a_venue_counter_restart_is_accepted_once_rising_lower_ids_outlast_the_age_limit():
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(7_000_000_023, mono=100.0))
+    # the venue restarted its lastUpdateId counter: every later id is lower than the one accepted
+    for n, mono in ((264, 101.0), (270, 103.0), (281, 105.9)):
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(n, mono=mono))
+    # still lower, still rising, and refused for longer than the age limit with nothing accepted in between
+    restarted = tracker.accept(seq(290, mono=106.5))
+    assert tracker.latest('ETH/USDT', now_mono=106.6) is restarted and restarted.generation == 2
+    row = tracker.status(106.6)['ETH/USDT']
+    assert row['sequence_resets'] == 1 and row['state'] == 'fresh' and row['sequence'] == 290
+    assert tracker.sequence_resets == 1
+    # the new counter is the evidence from now on: an older id of it is out of order again
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(289, mono=107.0))
+    assert tracker.accept(seq(291, mono=107.5)).generation == 3
+    assert tracker.status(107.6)['ETH/USDT']['sequence_resets'] == 1
+    # only the id counter restarts: a book the venue's own clock places earlier is still refused
+    def btc(n, ts_ms, mono):
+        return book(depth([['2000.10', '1']], [['2000.20', '1']], nonce=n, timestamp=ts_ms, symbol='BTC/USDT'),
+                    mono=mono, symbol='BTC/USDT')
+    tracker.accept(btc(5_000, WALL_MS - 1_000, 110.0))
+    for n, mono in ((10, 111.0), (20, 116.5)):
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, btc(n, WALL_MS - 9_000, mono))
+    assert tracker.accept(btc(30, WALL_MS - 500, 117.0)).venue_sequence == 30
+    assert tracker.sequence_resets == 2
+
+
+def test_a_lagging_or_stuck_replica_is_still_refused_as_out_of_order():
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(1000, mono=100.0))
+    # one lower id from a lagging replica, even long after the last accepted book
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(990, mono=200.0))
+    # a replica stuck on one id never rises, however long it answers
+    for mono in (203.0, 206.0, 260.0):
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(990, mono=mono))
+    # ids that fall back come from two sources, not one restarted counter: the run starts over
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(980, mono=261.0))
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(985, mono=265.0))
+    # an accepted book ends the run too
+    assert tracker.accept(seq(1001, mono=266.0)).generation == 2
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(995, mono=267.0))
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(996, mono=271.0))
+    # a lower id handed over late cannot stretch the run back in time: one received before the run's last refusal
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(994, mono=266.5))
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(997, mono=271.8))     # 4.8 s since the run began
+    # ... or one received before the stored book
+    tracker.accept(seq(1002, mono=280.0))
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(990, mono=273.0))
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(991, mono=279.0))
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(992, mono=281.0))      # the run begins here
+    refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(993, mono=285.5))
+    row = tracker.status(286.0)['ETH/USDT']
+    assert row['sequence_resets'] == 0 and row['sequence'] == 1002 and tracker.sequence_resets == 0
 
 
 def test_generation_is_a_local_count_of_accepted_snapshots_never_venue_evidence():

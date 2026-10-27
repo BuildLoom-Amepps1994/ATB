@@ -53,6 +53,7 @@ mode.
 | A cycle closes | Cooldown for the pair (longer after consecutive losses), then a new cycle needs a newer completed bar than the exit, so the same signal can never be bought twice. |
 | A pair is removed from the list while held | Its exits keep running until it is sold; no new entry. |
 | The book is stale, crossed, empty or out of order | Entries wait; exits fall back to the top-of-book quote for loss and time exits only. |
+| The venue restarts its order-book update ids | Its books are refused as out of order until lower, rising ids have kept arriving for more than 30 s; then they are accepted again without restarting the app, and *Activity & safeguards* records it. |
 | The candle data does not yet contain the bar that just closed | Entries wait (*Data not fresh*); the candles are read again after 5 s. A decision never acts on the previous bar. |
 | A safety exit has no depth book | It sells at the top-of-book quote when that quote's stated size covers the whole holding; otherwise it retries with back-off until a depth book returns. |
 

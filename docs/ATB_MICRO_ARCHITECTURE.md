@@ -211,12 +211,12 @@ While running, three checks keep the ledger and the venue record in step:
   every point where held cycles are re-checked, so it never waits for a whole
   pass.
 * Safety exits (stop loss, maximum hold, regime shift) do not need depth: with
-  no fresh book they use the top of book from the stream or one
-  `fetch_bids_asks` / ticker read. The paper venue fills such a sale at the
-  top-of-book bid only when that level's stated size covers the whole sale
-  (the record says `book_source` and `depth_known: false`); a larger sale is
-  retried with back-off until a depth book returns (a real venue would walk
-  deeper levels).
+  no fresh book they use the top of book from the stream when it states a bid
+  size, otherwise one `fetch_bids_asks` / ticker read. The paper venue fills
+  such a sale at the top-of-book bid only when that level's stated size covers
+  the whole sale (the record says `book_source` and `depth_known: false`); a
+  larger sale is retried with back-off until a depth book returns (a real
+  venue would walk deeper levels).
 * Holdings are checked before the hourly catalogue refresh in each pass. While
   a cycle is held the refresh waits until the catalogue is 1.5 hours old (half
   an hour before entries refuse it as stale), and then makes a single attempt

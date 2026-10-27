@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import credentials
+import feed
 import micro
 import money
 import observability
@@ -610,6 +611,62 @@ def test_a_stop_loss_exit_needs_no_profit_no_entry_signal_and_no_depth_book(worl
     assert sale['info']['book_source'] == 'ticker' and sale['info']['depth_known'] is False
     decision = next(r for r in w.engine.micro.status()['pairs'] if r['symbol'] == 'ETH/USDT').get('decision') or {}
     assert decision.get('action') != 'enter'
+    assert_ledger_consistent(w)
+
+
+def live_quote_feed(w: World, *, sizes: bool):
+    """A real QuoteFeed, live, that ``pump`` feeds the fixture's best bid and ask (with or without their sizes)."""
+    stream = feed.QuoteFeed('mexc', ['ETH/USDT', 'BTC/USDT'], clock=w.clock.time, heartbeat_seconds=60.0)
+    stream.state = 'live'
+
+    def pump():
+        now = w.clock.time()
+        updates = {}
+        for symbol in ('ETH/USDT', 'BTC/USDT'):
+            top = w.exchange.series[symbol].book(w.clock.minute(), now_ms=int(now * 1000), sequence=0)
+            update = {'bid': top['bids'][0][0], 'ask': top['asks'][0][0], 'timestamp': int(now * 1000)}
+            if sizes:
+                update.update(bidVolume=top['bids'][0][1], askVolume=top['asks'][0][1])
+            updates[symbol] = update
+        stream._ingest(updates, now)
+    return stream, pump
+
+
+def stop_loss_with_a_live_stream_and_no_depth(w: World, *, sizes: bool) -> dict | None:
+    held = w.run_until_state('HOLDING')
+    w.engine.feed, pump = live_quote_feed(w, sizes=sizes)
+    pump()
+    w.set_closes('ETH/USDT', float(Decimal(held['entry_price'])) * 0.985)        # a 150 bps drop
+    w.exchange.fail_books.add('ETH/USDT')                                         # depth unavailable from now on
+    w.exchange.calls.clear()
+    for _ in range(int(10 * 60 / STEP_S)):
+        w.clock.advance(STEP_S)
+        pump()
+        w.tick()
+        if w.cycles('CLOSED', 'ETH/USDT'):
+            return w.cycles('CLOSED', 'ETH/USDT')[-1]
+    return None
+
+
+def test_a_stop_loss_with_a_live_stream_and_no_depth_book_sells_against_the_streamed_size(world):
+    w = world()
+    closed = stop_loss_with_a_live_stream_and_no_depth(w, sizes=True)
+    assert closed is not None, [(c['state'], c['last_reason']) for c in w.cycles('HOLDING')]
+    assert closed['last_exit_trigger'] in ('stop_loss', 'regime_shift') and closed['realized_status'] == 'confirmed'
+    sale = [r for r in w.venue().records('ETH/USDT') if r['side'] == 'sell'][-1]
+    assert sale['info']['book_source'] == 'stream_ticker' and sale['info']['depth_known'] is False
+    assert_ledger_consistent(w)
+
+
+def test_a_stop_loss_with_a_live_stream_that_states_no_size_sells_on_the_rest_book_ticker(world):
+    w = world()
+    closed = stop_loss_with_a_live_stream_and_no_depth(w, sizes=False)
+    assert closed is not None, [(c['state'], c['last_reason']) for c in w.cycles('HOLDING')]
+    assert closed['last_exit_trigger'] in ('stop_loss', 'regime_shift') and closed['realized_status'] == 'confirmed'
+    assert any(call[0] == 'fetch_bids_asks' for call in w.exchange.calls)        # the REST quote states its size
+    sale = [r for r in w.venue().records('ETH/USDT') if r['side'] == 'sell'][-1]
+    assert sale['info']['book_source'] == 'ticker' and sale['info']['depth_known'] is False
+    assert not [i for i in w.intents(closed['cycle_id']) if i['status'] == 'rejected']
     assert_ledger_consistent(w)
 
 
@@ -1799,6 +1856,66 @@ def test_a_residual_on_a_pair_that_left_the_selection_keeps_a_fresh_mark(world):
     assert fresh and fresh[0]['state'] != 'ABANDONED', fresh[0]['last_reason'] if fresh else 'no BTC entry'
     refusals = [c['last_reason'] for c in w.cycles() if 'stale or missing price' in (c['last_reason'] or '')]
     assert refusals == []
+
+
+def offset_depth_ids(w: World, symbol: str, offset: dict) -> None:
+    """The venue's depth ids for ``symbol`` carry ``offset['ids']``; setting it to 0 stands for a counter restart."""
+    real = w.exchange.fetch_order_book
+
+    def fetch(name, limit=None, params=None):
+        book = real(name, limit, params)
+        if name == symbol:
+            book['nonce'] += offset['ids']
+        return book
+    w.exchange.fetch_order_book = fetch
+
+
+def test_a_venue_id_restart_while_held_recovers_the_book_the_profit_exit_and_the_next_entry(world):
+    w = world()
+    offset = {'ids': 7_000_000_000}
+    offset_depth_ids(w, 'ETH/USDT', offset)
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    offset['ids'] = 0                                    # the venue restarted its lastUpdateId counter
+    assert w.run(60, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    closed = micro.load_cycle(held['cycle_id'])
+    assert closed['last_exit_trigger'] == 'take_profit', closed['last_exit_trigger']   # depth came back
+    row = w.engine.micro.books.status(w.clock.monotonic())['ETH/USDT']
+    assert row['sequence_resets'] == 1 and row['sequence'] < 7_000_000_000
+    assert any('restarted its order-book update ids' in a['message'] for a in storage.rows('SELECT * FROM audit'))
+    # the pair enters again without a process restart
+    assert w.run(120, until=lambda: any(c['state'] in micro.OWNING_STATES and c['cycle_id'] != held['cycle_id']
+                                        for c in w.cycles(symbol='ETH/USDT')))
+    assert w.engine.micro.books.status(w.clock.monotonic())['ETH/USDT']['sequence_resets'] == 1
+    assert_ledger_consistent(w)
+
+
+def test_a_venue_id_restart_on_a_residual_pair_does_not_block_entries_on_other_pairs(world):
+    w = world(two_setups, micro_cooldown_seconds=0, data_max_age_seconds=30)
+    offset = {'ids': 7_000_000_000}
+    offset_depth_ids(w, 'ETH/USDT', offset)
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    venue = w.venue()
+    original = venue.create_order
+
+    def eth_sale_fills_97_percent(symbol, *args, **kwargs):
+        if symbol == 'ETH/USDT':
+            venue.partial_next = Decimal('0.97')            # the rest is below the 1 USDT market minimum
+        return original(symbol, *args, **kwargs)
+    venue.create_order = eth_sale_fills_97_percent
+    assert w.run(120, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    venue.create_order = original
+    assert 'ETH/USDT' in w.engine.micro.owned_symbols()
+    offset['ids'] = 0                                    # the venue restarted its lastUpdateId counter
+    w.engine.running = False
+    w.engine.update_config(micro_settings(watchlist=['BTC/USDT'], micro_cooldown_seconds=0,
+                                          data_max_age_seconds=30))
+    w.go()
+    count = len(w.cycles(symbol='BTC/USDT'))
+    assert w.run(120, until=lambda: any(c['state'] in micro.OWNING_STATES
+                                        for c in w.cycles(symbol='BTC/USDT')[count:])), \
+        [(c['state'], c['last_reason']) for c in w.cycles(symbol='BTC/USDT')[count:]]
+    assert w.engine.micro.books.status(w.clock.monotonic())['ETH/USDT']['sequence_resets'] == 1
+    assert w.engine._fresh('ETH/USDT')                   # the residual's mark is kept fresh again
 
 
 def test_recovery_explanations_follow_the_selected_exchange(world):

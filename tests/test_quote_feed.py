@@ -106,6 +106,23 @@ def test_crossed_or_incomplete_quotes_are_rejected():
         stream.stop()
 
 
+def test_a_stream_quote_keeps_only_the_sizes_sent_with_its_prices():
+    # a safety exit with no depth book may sell at the top of book only against a stated size
+    now = [1_000.0]
+    stream = feed.QuoteFeed('mexc', ['BTC/USDT', 'ETH/USDT'], clock=lambda: now[0], metrics=observability.Metrics())
+    stream.state = 'live'
+    stream._ingest({'BTC/USDT': {**quote(100., 100.1, 1_000_000), 'bidVolume': 0.5, 'askVolume': '2'},
+                    'ETH/USDT': {**quote(10., 10.01), 'bidVolume': 0, 'askVolume': 'lots'}}, now[0])
+    btc = stream.ticker('BTC/USDT')
+    assert btc['bidVolume'] == 0.5 and btc['askVolume'] == 2.0
+    eth = stream.ticker('ETH/USDT')
+    assert eth['bidVolume'] is None and eth['askVolume'] is None          # zero or garbage is unknown, not a size
+    now[0] += 1
+    stream._ingest({'BTC/USDT': quote(100.2, 100.3, 1_000_100)}, now[0])
+    btc = stream.ticker('BTC/USDT')
+    assert btc['bid'] == 100.2 and btc['bidVolume'] is None and btc['askVolume'] is None   # never an older size
+
+
 def test_unread_quotes_are_coalesced_not_queued():
     stream = make_feed([{'BTC/USDT': quote(1., 1.1, 1_000)} for _ in range(6)])
     stream.start()

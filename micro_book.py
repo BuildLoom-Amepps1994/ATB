@@ -414,6 +414,9 @@ class _Track:
     last_error: str | None = None
     accepted: int = 0
     refused: int = 0
+    # (first receipt, first id, last id, last receipt) of the lower venue ids refused since the stored book
+    lower_run: tuple[float, int, int, float] | None = None
+    sequence_resets: int = 0          # venue counter restarts accepted (see BookTracker)
 
 
 class BookTracker:
@@ -438,12 +441,24 @@ class BookTracker:
     it. The venue evidence is kept: a local clock step says nothing about the
     venue's update ids or the venue's own clock.
 
+    A venue that restarted its update-id counter sends only ids lower than
+    the newest accepted. When such lower ids keep arriving, each no lower
+    than the one before and rising overall, for longer than ``max_age_s``
+    with no snapshot accepted in between (and each received after the
+    stored book), the stored book has expired and nothing else is coming:
+    that symbol's id evidence starts over from the current snapshot, which
+    is accepted and counted in ``sequence_resets``. One lower id, a replica
+    stuck on one id, ids that fall back, or a venue timestamp older than the
+    newest accepted are still refused.
+
     ``invalidate`` (a stream reconnect) clears the served snapshot and the
     venue evidence, so a venue that restarted its counters cannot lock a
-    symbol out, and fences the receipt clock: a snapshot received no later
-    than the newest receipt the tracker had seen was received before the
-    invalidation and is refused, whatever its venue evidence says.
-    ``generation`` keeps counting.
+    symbol out, and fences the receipt clock at the invalidation time the
+    caller gives (or the newest receipt seen, if later): a snapshot received
+    no later than that was received before the invalidation and is refused,
+    whatever its venue evidence says. A named symbol the tracker has not
+    seen yet is fenced too, and invalidating every symbol also fences the
+    symbols first seen after it. ``generation`` keeps counting.
 
     A receipt whose wall and monotonic stamps disagree with the tracker's
     reference pair by more than ``MIXED_CLOCKS_S`` raises ``ValueError`` and
@@ -463,6 +478,8 @@ class BookTracker:
         # (wall, mono) of the latest receipt accepted, or of the one that revealed a rollback
         self._clock_ref: tuple[float, float] | None = None
         self._rollback_mono: float | None = None
+        self._fence_mono: float | None = None     # the latest invalidation of every symbol
+        self.sequence_resets = 0
 
     def accept(self, snapshot: BookSnapshot) -> BookSnapshot:
         """Store ``snapshot`` as the symbol's newest book; returns it with its generation assigned."""
@@ -476,14 +493,18 @@ class BookTracker:
             try:
                 self._check_clock(snapshot)
                 _check_future(snapshot, self.future_tolerance_s)
-                self._check_order(track, snapshot)
+                restarted = self._check_order(track, snapshot)
             except BookError as exc:
                 track.refused += 1
                 track.last_error = f'{exc.code}: {exc}'
                 raise
+            if restarted:
+                track.max_sequence = None
+                track.sequence_resets += 1
+                self.sequence_resets += 1
             track.generation += 1
             stored = dataclasses.replace(snapshot, generation=track.generation)
-            track.snapshot, track.invalidated = stored, None
+            track.snapshot, track.invalidated, track.lower_run = stored, None, None
             if stored.venue_sequence is not None:
                 track.max_sequence = max(stored.venue_sequence, track.max_sequence or 0)
             if stored.venue_timestamp_ms is not None:
@@ -521,16 +542,23 @@ class BookTracker:
             raise BookError(CLOCK_ROLLBACK, f'wall clock stepped back {stepped:.1f} s while the monotonic clock '
                                             'advanced; every book was invalidated')
 
-    @staticmethod
-    def _check_order(track: _Track, snapshot: BookSnapshot) -> None:
-        if track.fence_mono is not None and snapshot.received_mono <= track.fence_mono:
+    def _check_order(self, track: _Track, snapshot: BookSnapshot) -> bool:
+        """Refuse an older snapshot; True when it shows the venue restarted its id counter."""
+        fences = [fence for fence in (track.fence_mono, self._fence_mono) if fence is not None]
+        if fences and snapshot.received_mono <= max(fences):
             raise BookError(BOOK_OUT_OF_ORDER, f'{snapshot.symbol} book was received before the book was '
                                                f'invalidated ({track.invalidated or "invalidated"})')
         sequence, timestamp = snapshot.venue_sequence, snapshot.venue_timestamp_ms
+        restarted = False
         if sequence is not None and track.max_sequence is not None:
             if sequence < track.max_sequence:
-                raise BookError(BOOK_OUT_OF_ORDER, f'{snapshot.symbol} venue sequence {sequence} is older than '
-                                                   f'{track.max_sequence} already accepted')
+                restarted = self._counter_restarted(track, snapshot)
+                if restarted and timestamp is not None and track.max_timestamp_ms is not None:
+                    # only the id counter restarted: the venue's clock still orders its books
+                    restarted = (track.max_timestamp_ms - timestamp) / 1000 <= TIMESTAMP_REGRESSION_S
+                if not restarted:
+                    raise BookError(BOOK_OUT_OF_ORDER, f'{snapshot.symbol} venue sequence {sequence} is older '
+                                                       f'than {track.max_sequence} already accepted')
         elif timestamp is not None and track.max_timestamp_ms is not None:
             behind = (track.max_timestamp_ms - timestamp) / 1000
             if behind > TIMESTAMP_REGRESSION_S:
@@ -538,7 +566,7 @@ class BookTracker:
                                                    'than one already accepted')
         stored = track.snapshot
         if stored is None or snapshot.received_mono >= stored.received_mono:
-            return
+            return restarted
         # Received before the stored book: only venue evidence shared with it, strictly newer than everything
         # accepted, outranks the receipt order (an equal value or a timestamp inside the jitter tolerance does not).
         if sequence is not None and stored.venue_sequence is not None:
@@ -550,6 +578,25 @@ class BookTracker:
         if not newer:
             raise BookError(BOOK_OUT_OF_ORDER, f'{snapshot.symbol} book was received before the stored one and '
                                                'carries no venue evidence that it is newer')
+        return restarted
+
+    def _counter_restarted(self, track: _Track, snapshot: BookSnapshot) -> bool:
+        """Record a venue id lower than the newest accepted; True once the run of them shows a counter restart.
+
+        A run starts at the first lower id received after the stored book and
+        ends with the next accepted snapshot. A lower id received before the
+        run's last one (handed over late) adds nothing; one lower than the
+        run's last starts a new run, since one counter never goes back.
+        """
+        mono, sequence = snapshot.received_mono, snapshot.venue_sequence
+        stored, run = track.snapshot, track.lower_run
+        if (stored is not None and mono <= stored.received_mono) or (run is not None and mono < run[3]):
+            return False
+        if run is None or sequence < run[2]:
+            track.lower_run = (mono, sequence, sequence, mono)
+            return False
+        track.lower_run = (run[0], run[1], sequence, mono)
+        return sequence > run[1] and mono - run[0] > self.max_age_s
 
     def latest(self, symbol: str, *, now_mono: float, max_age_s: float | None = None) -> BookSnapshot | None:
         """The stored snapshot when it is valid and no older than the limit, else None.
@@ -565,25 +612,49 @@ class BookTracker:
             return None
         return snapshot
 
-    def invalidate(self, symbol: str | None = None, reason: str = '') -> None:
-        """Stop serving ``symbol``'s book (every symbol when None) until a new snapshot is accepted."""
+    def resets(self, symbol: str) -> int:
+        """How many venue id-counter restarts have been accepted for ``symbol``."""
         with self.lock:
-            self._invalidate(symbol, reason or 'invalidated')
+            track = self._tracks.get(symbol)
+            return track.sequence_resets if track is not None else 0
 
-    def _invalidate(self, symbol: str | None, reason: str, *, keep_evidence: bool = False) -> None:
+    def invalidate(self, symbol: str | None = None, reason: str = '', *, now_mono: float) -> None:
+        """Stop serving ``symbol``'s book (every symbol when None) until a new snapshot is accepted.
+
+        ``now_mono`` is when the invalidation happened (a stream reconnect), on
+        the ``time.monotonic()`` clock the receipts are stamped with.
+        """
+        now = _finite(now_mono, 'now_mono')
+        with self.lock:
+            if self._clock_ref is not None and not abs(now - self._clock_ref[1]) <= MIXED_CLOCKS_S:
+                raise ValueError('now_mono must be time.monotonic(), the clock the book receipts are stamped with')
+            self._invalidate(symbol, reason or 'invalidated', fence=now)
+
+    def _invalidate(self, symbol: str | None, reason: str, *, keep_evidence: bool = False,
+                    fence: float | None = None) -> None:
         """Stop serving the books.
 
         A rollback keeps the venue evidence (``_rollback_mono`` already refuses the receipts before it).
-        An explicit invalidation clears the evidence and fences receipts at the newest one seen so far.
+        An explicit invalidation clears the evidence and fences receipts at its own time or the newest one
+        seen so far, whichever is later.
         """
-        tracks = self._tracks.values() if symbol is None else [self._tracks[symbol]] if symbol in self._tracks else []
+        if keep_evidence:
+            tracks = self._tracks.values() if symbol is None else [self._tracks[symbol]] if symbol in self._tracks else []
+            for track in tracks:
+                track.snapshot, track.invalidated = None, reason
+            return
         # Every receipt the tracker has seen was handed to accept() before this call, so nothing received no
-        # later than the newest of them can be news from after the invalidation.
-        fence = self._clock_ref[1] if self._clock_ref is not None else None
+        # later than the newest of them, or than the invalidation itself, can be news from after it.
+        if self._clock_ref is not None:
+            fence = self._clock_ref[1] if fence is None else max(fence, self._clock_ref[1])
+        if symbol is None:
+            tracks = list(self._tracks.values())
+            if fence is not None:
+                self._fence_mono = fence if self._fence_mono is None else max(fence, self._fence_mono)
+        else:
+            tracks = [self._tracks.setdefault(symbol, _Track())]
         for track in tracks:
-            track.snapshot, track.invalidated = None, reason
-            if keep_evidence:
-                continue
+            track.snapshot, track.invalidated, track.lower_run = None, reason, None
             track.max_sequence, track.max_timestamp_ms = None, None
             if fence is not None:
                 track.fence_mono = fence if track.fence_mono is None else max(fence, track.fence_mono)
@@ -612,7 +683,7 @@ class BookTracker:
                 'depth_known': snapshot.depth_known if snapshot else None,
                 'best_bid': money.text(snapshot.best_bid) if snapshot else None,
                 'best_ask': money.text(snapshot.best_ask) if snapshot else None,
-                'accepted': track.accepted, 'refused': track.refused}
+                'accepted': track.accepted, 'refused': track.refused, 'sequence_resets': track.sequence_resets}
         return out
 
 

@@ -106,14 +106,18 @@ class BookTracker:
         # returns the stored snapshot with its generation assigned; raises BookError:
         #   BOOK_OUT_OF_ORDER when venue_sequence (if both known) is lower than the stored one,
         #     or (no sequences) venue_timestamp_ms is older than the stored one by > 1 s;
-        #     the stored snapshot is kept.
+        #     the stored snapshot is kept. Lower ids that keep rising for longer than max_age_s,
+        #     with none accepted in between, are a venue counter restart: the id evidence starts
+        #     over from the current snapshot, which is accepted and counted in sequence_resets.
         #   CLOCK_ROLLBACK when received_wall is more than 1 s earlier than the previous
         #     accepted received_wall while received_mono advanced; every symbol's snapshot
         #     is invalidated (derived state must be rebuilt from new snapshots).
     def latest(self, symbol, *, now_mono: float, max_age_s: float | None = None) -> BookSnapshot | None
         # None when missing, invalidated or older than max_age (monotonic age)
-    def invalidate(self, symbol: str | None = None, reason: str = '') -> None
-    def status(self, now_mono: float) -> dict   # per symbol: generation, age_s, source, sequence, last_error
+    def invalidate(self, symbol: str | None = None, reason: str = '', *, now_mono: float) -> None
+        # refuses every receipt no later than now_mono (or the newest receipt seen), unseen symbols included
+    def status(self, now_mono: float) -> dict   # per symbol: generation, age_s, source, sequence, last_error,
+                                                #   sequence_resets
 ```
 
 A REST depth response is a complete snapshot, so REST has no gap concept;

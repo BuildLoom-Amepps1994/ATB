@@ -132,11 +132,14 @@ Invariants:
   state and reservation release commit in one SQLite transaction. The journal
   links to the cycle through `decision_id = cycle_id`.
 * **Partial exits keep the rest.** A partial sale moves basis pro rata to the
-  base that left; `allocated + residual = basis` exactly. A sellable rest stays
-  `HOLDING`, and its stop counts the loss the partial sale already realized; an
+  base that left; `allocated + residual = basis` exactly. After a partial sale
+  the rest is judged at the sale's best bid. A sellable rest stays `HOLDING`,
+  and its stop counts the loss the partial sale already realized; an
   unsellable rest closes the cycle and stays in the ledger as residual, carried
   by the next cycle on that pair. Once that cycle's entry is booked, the closed
-  cycle no longer records the residual.
+  cycle no longer records the residual. A holding no sale could be sent for at
+  the current best bid (below the minimum amount or the minimum order value)
+  closes at the next exit check, with no order sent, and is kept as residual.
 * **Fresh opportunity for a rebuy.** After a close the pair waits a cooldown
   (doubling with consecutive losses) and needs a completed bar newer than the
   exit.

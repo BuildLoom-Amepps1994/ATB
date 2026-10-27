@@ -17,6 +17,7 @@ Nothing here stubs the strategy or the risk gate. Where a test needs a fault
 (a crash, a dropped response, a late fill) it injects it at the venue or
 raises at a named point, and the rest of the path is the production code.
 """
+import dataclasses
 import json
 import math
 import sqlite3
@@ -872,12 +873,141 @@ def test_a_partial_exit_whose_rest_can_still_be_sold_keeps_it_managed_until_it_i
     assert_ledger_consistent(w)
 
 
-@pytest.mark.parametrize('best_bid, state', [(None, 'HOLDING'), ('2300', 'CLOSED')])
-def test_a_partial_exit_prices_its_rest_at_the_lower_of_the_fill_price_and_the_known_best_bid(world, best_bid, state):
+def _last_event(cycle_id: str) -> dict:
+    return storage.rows('SELECT to_state, reason FROM micro_cycle_events WHERE cycle_id=? ORDER BY id DESC LIMIT 1',
+                        (cycle_id,))[0]
+
+
+UNSELLABLE_CLOSE = 'only an unsellable remainder is left; retained as residual'
+
+
+def _one_usdt_markets(minute: int) -> list[SeriesMarket]:
+    """MEXC-shaped pairs whose limit-order and market-order minimums are both 1 USDT, in 1e-8 steps."""
+    def market(symbol: str) -> dict:
+        return mexc_market(symbol, amount_step=0.00000001, price_tick=0.01, limit_min=1.0, market_min='1')
+    return [SeriesMarket('ETH/USDT', minute - 300, mechanics(), market=market('ETH/USDT')),
+            SeriesMarket('BTC/USDT', minute - 300, flat(900, base=60000.0), market=market('BTC/USDT'))]
+
+
+def test_a_partial_exit_whose_rest_meets_the_minimum_at_the_sales_best_bid_stays_managed_and_is_sold(world,
+                                                                                                    monkeypatch):
+    w = world(_one_usdt_markets)
+    held = w.run_until_state('HOLDING')
+    mgr, venue = w.engine.micro, w.venue()
+    real, priced = venue.create_order, {}
+
+    def shaped(symbol, type_, side, amount, price=None, params=None):
+        # The first sale leaves a rest worth at least 1 USDT at the best bid it is priced on, less at its fill price.
+        if not priced and symbol == 'ETH/USDT':
+            bid = Decimal(str(params['book'].best_bid))
+            received = money.mul(bid, money.sub(money.ONE, money.bps(Decimal(str(params['adverse_bps'])))))
+            rest = ((1 / bid + 1 / received) / 2).quantize(Decimal('1e-8'))
+            venue.partial_next = (Decimal(str(amount)) - rest) / Decimal(str(amount))
+            priced['bid'] = bid
+        return real(symbol, type_, side, amount, price=price, params=params)
+    monkeypatch.setattr(venue, 'create_order', shaped)
+    assert w.run(120, until=lambda: int(micro.load_cycle(held['cycle_id'])['exit_count'] or 0) >= 1)
+    after = micro.load_cycle(held['cycle_id'])
+    sale = [t for t in w.trades() if t['side'] == 'SELL'][0]
+    rest, bid = Decimal(after['owned_base']), priced['bid']
+    minimum = mgr.rules('ETH/USDT').market_min_cost()
+    assert money.mul(rest, bid) >= minimum > money.mul(rest, Decimal(repr(sale['price'])))
+    assert mgr._sellable('ETH/USDT', rest, bid)            # _sell and the venue would send and accept a sale of it
+    # The rest is judged at the sale's best bid: it stays managed, and a later exit sells it.
+    assert (after['state'], after['residual_base']) == ('HOLDING', '0')
+    # From here ETH keeps swinging, its lows 0.5 % above the bid the sale was priced on.
+    series = w.exchange.series['ETH/USDT']
+    start = series.index(w.clock.minute())
+    swing = mechanics(len(series.closes) - start)
+    series.closes[start:] = [c * float(bid) * 1.005 / min(swing) for c in swing]
+    refused = []
+
+    def sold() -> bool:
+        refused.append('outside the micro cycles' in json.dumps(mgr.pairs.get('ETH/USDT') or {}, default=str))
+        return micro.load_cycle(after['cycle_id'])['state'] == 'CLOSED'
+    assert w.run(60, until=sold)
+    closed = micro.load_cycle(after['cycle_id'])
+    assert closed['last_exit_trigger'] != 'unsellable' and _last_event(closed['cycle_id'])['reason'] != UNSELLABLE_CLOSE
+    assert (int(closed['exit_count']), closed['residual_base']) == (2, '0')
+    assert len([t for t in w.trades() if t['side'] == 'SELL']) == 2
+    # Nothing is left on the pair, so no later entry there is refused as 'already held outside the micro cycles'.
+    assert _eth_position() == [] and 'ETH/USDT' not in mgr.owned_symbols() and not any(refused)
+    assert_ledger_consistent(w)
+
+
+def test_an_exit_recovery_keeps_a_rest_below_the_minimum_cost_and_the_next_exit_check_closes_it(world, monkeypatch):
+    w = world()
+    mgr = w.engine.micro
+    held = w.run_until_state('HOLDING')
+    w.engine.running = False                                  # stopped: no pass will follow
+    armed = _fail_sell_booking_once(monkeypatch, held['cycle_id'])
+    w.venue().partial_next = Decimal('0.97')                  # the sale fills 97 % and its booking fails
+    assert mgr.flatten() == {'queued': False, 'attempted': ['ETH/USDT']}
+    assert not armed['on'] and micro.load_cycle(held['cycle_id'])['state'] == 'EXIT_UNKNOWN'
+    assert mgr.apply_recovery(held['cycle_id'], REVIEW)['outcome'] == 'exit fill booked from the venue record'
+    recovered = micro.load_cycle(held['cycle_id'])
+    rules, rest = mgr.rules('ETH/USDT'), Decimal(recovered['owned_base'])
+    sales = [t for t in w.trades() if t['side'] == 'SELL']
+    # The rest passes the amount rules; its value (about 0.75 USDT) is below the 1 USDT market minimum.
+    assert len(sales) == 1 and rest >= rules.min_amount
+    assert money.mul(rest, Decimal(repr(sales[0]['price']))) < rules.market_min_cost()
+    # The recovery has no current bid: it judges only the amount rules and leaves the rest held.
+    assert (recovered['state'], recovered['residual_base'], int(recovered['exit_count'])) == ('HOLDING', '0', 1)
+    assert_ledger_consistent(w)
+    w.go()
+    assert w.run(1, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    closed = micro.load_cycle(held['cycle_id'])
+    # The next exit check closes it through _sell, at the current best bid, without sending anything.
+    assert _last_event(closed['cycle_id']) == {'to_state': 'CLOSED', 'reason': UNSELLABLE_CLOSE}
+    assert (closed['residual_base'], closed['residual_basis']) == (recovered['owned_base'], recovered['basis_quote'])
+    assert Decimal(closed['residual_basis']) > 0 and int(closed['exit_count']) == 1
+    assert len([t for t in w.trades() if t['side'] == 'SELL']) == 1
+    assert len([i for i in w.intents(closed['cycle_id']) if i['side'] == 'SELL']) == 1
+    assert money_close(_eth_position()[0]['qty'], rest, Decimal('1e-12'))
+    assert_ledger_consistent(w)
+
+
+def test_a_held_rest_that_falls_below_the_minimum_at_the_bid_closes_at_the_next_exit_check_without_a_trigger(
+        world, monkeypatch):
+    w = world()
+    mgr = w.engine.micro
+    closes, real_after_close = [], mgr._after_close
+    monkeypatch.setattr(mgr, '_after_close', lambda cycle: (closes.append(cycle['cycle_id']), real_after_close(cycle)))
+    # 95 % fills: the rest (about 1.26 USDT) is above the 1 USDT market minimum and stays managed.
+    after, sale = _first_sale_fills(w, '0.95')
+    rest = Decimal(after['owned_base'])
+    assert (after['state'], after['residual_base'], closes) == ('HOLDING', '0', [])
+    real_evaluate = micro.strat.evaluate_exit
+
+    def hold(**kwargs):
+        return dataclasses.replace(real_evaluate(**kwargs), action='hold', trigger=None, reason='held by the test')
+    monkeypatch.setattr(micro.strat, 'evaluate_exit', hold)        # no exit trigger fires from here on
+    w.set_closes('ETH/USDT', float(sale['price']) * 0.7)            # the rest is now below the minimum at the bid
+    assert w.run(5, until=lambda: micro.load_cycle(after['cycle_id'])['state'] == 'CLOSED')
+    closed = micro.load_cycle(after['cycle_id'])
+    assert _last_event(closed['cycle_id']) == {'to_state': 'CLOSED', 'reason': UNSELLABLE_CLOSE}
+    assert int(closed['exit_count']) == 1
+    assert [i['status'] for i in w.intents(closed['cycle_id']) if i['side'] == 'SELL'] == ['accounted']
+    assert len([t for t in w.trades() if t['side'] == 'SELL']) == 1
+    assert (closed['residual_base'], closed['residual_basis']) == (after['owned_base'], after['basis_quote'])
+    assert Decimal(closed['residual_basis']) > 0 and closes == [closed['cycle_id']]
+    assert money_close(_eth_position()[0]['qty'], rest, Decimal('1e-12'))
+    assert 'ETH/USDT' in mgr.owned_symbols() and 'ETH/USDT' not in mgr.open_symbols()
+    assert_ledger_consistent(w)
+
+
+@pytest.mark.parametrize('rest, best_bid, state', [
+    ('0.000399', '2510', 'HOLDING'),   # 0.9975 USDT at the 2500 fill price, 1.0015 USDT at the sale's best bid
+    ('0.000399', '2504', 'CLOSED'),    # 0.9991 USDT at the sale's best bid: no sale of it could be sent
+    ('0.000399', None, 'HOLDING'),     # no book (exit recovery): the amount rules only, the cost rule comes later
+    ('0.000099', None, 'CLOSED'),      # below the 0.0001 minimum amount
+])
+def test_a_partial_exit_judges_its_rest_at_the_sales_best_bid_and_without_a_book_by_the_amount_rules(
+        world, rest, best_bid, state):
     import types
     w = world()
     held = w.run_until_state('HOLDING')
-    rest = Decimal('0.00042')                # 1.05 USDT at the 2500 fill price, 0.966 USDT at a 2300 best bid
+    rest = Decimal(rest)
     sold = Decimal(held['owned_base']) - rest
     gross = money.mul(sold, Decimal('2500'))
     record = {'id': 'paper-rest-pricing', 'filled': float(sold), 'cost': float(gross),

@@ -536,7 +536,11 @@ States: `ENTRY_RESERVED`, `ENTRY_SUBMITTED`, `ENTRY_UNKNOWN`, `HOLDING`,
 partial index); one cycle per opportunity key (unique index). Order intents
 carry `decision_id = cycle_id` so the journal links to the cycle. Booking a
 fill, the journal `accounted` transition, the ledger rows, the cycle state and
-the reservation release commit in one SQLite transaction.
+the reservation release commit in one SQLite transaction. After a partial sale
+the rest is judged at the sale's best bid; a holding no sale could be sent for
+at the current best bid (below the minimum amount or the minimum order value)
+closes at the next exit check (`HOLDING` -> `CLOSED`, no order sent) and is
+kept as residual.
 
 ## Settings (storage.py, integration step)
 

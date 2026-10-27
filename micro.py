@@ -904,13 +904,15 @@ class MicroManager:
         """Pairs with a closed cycle whose late fill is not booked yet (its recovery books into the pair's position)."""
         return {cycle['symbol'] for cycle in self._closed_late_fills()}
 
-    def _sellable(self, symbol: str, quantity: Decimal, price: Decimal) -> bool:
+    def _sellable(self, symbol: str, quantity: Decimal, price: Decimal | None) -> bool:
+        """Whether a sale of ``quantity`` meets the amount step, the minimum amount and, at ``price``, the minimum
+        order value (``price`` None: the amount rules only)."""
         rules = self.rules(symbol)
         step = rules.amount_step
         amount = money.q_down(quantity, step) if step is not None else quantity
         minimum_cost = rules.market_min_cost()
         return bool(amount > 0 and (rules.min_amount is None or amount >= rules.min_amount)
-                    and (minimum_cost is None or money.mul(amount, price) >= minimum_cost))
+                    and (minimum_cost is None or price is None or money.mul(amount, price) >= minimum_cost))
 
     def _adopt_holding(self, db, closed: dict, owned: Decimal, basis: Decimal) -> str:
         """A new HOLDING cycle for a holding a late entry fill created after its cycle closed (inside ``db``)."""
@@ -1497,6 +1499,12 @@ class MicroManager:
         if book is None:
             book = self._ticker_snapshot(symbol)
         owned = _dec(cycle['owned_base'], money.ZERO)
+        if book is not None and owned > 0 and not self._sellable(symbol, owned, book.best_bid):
+            # No sale could be sent for this holding at the current best bid (below the minimum amount or the
+            # minimum order value): _sell closes the cycle now and keeps it as residual, without waiting for an
+            # exit trigger and without sending an order.
+            self._sell(cycle, book, rules, cost, trigger='unsellable', reason='only an unsellable remainder is left')
+            return
         basis = _dec(cycle['basis_quote'], money.ZERO)
         target_net = _dec(cycle['target_net'], self.target_net())
         stop_net = _dec(cycle['stop_net'], money.mul(self.budget_cap(), money.bps(Decimal(str(params.max_loss_bps)))))
@@ -1784,10 +1792,11 @@ class MicroManager:
             return False
         order_id = order.get('id')
         residual = realized.residual_base
-        # The rule _sell applies, with the rest priced at the lower of the fill price and the best bid when a
-        # book is known: a rest that no sale could ever be sent for closes the cycle now as residual.
-        rest_price = fill['average'] if book is None else min(fill['average'], book.best_bid)
-        rest_sellable = self._sellable(symbol, residual, rest_price)
+        # With the book the sale was priced on, the rest is judged exactly as _sell's minimum check and the paper
+        # venue's judge a sale: at that book's best bid. Without a book (exit recovery) only the amount rules (the
+        # amount step and the minimum amount) are judged here, because the minimum order value needs a current
+        # bid; the next exit check applies it (_manage_exit). A rest that fails closes the cycle now as residual.
+        rest_sellable = self._sellable(symbol, residual, None if book is None else book.best_bid)
         try:
             with storage.connection() as db:
                 db.execute('BEGIN IMMEDIATE')

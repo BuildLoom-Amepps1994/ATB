@@ -11,7 +11,8 @@ A lookup that stays local is answered here, not by the resolver: ``localhost``
 is 127.0.0.1 (``::1`` when IPv6 is asked for), a loopback or unspecified
 address is named ``localhost``, a local literal is parsed numerically, and
 the socket methods are given the literal in place of the name ``localhost``,
-which they would otherwise resolve in C. The resolver reads the hosts file
+which they would otherwise resolve in C (and get no answer for a bracketed
+or zoned spelling, which C would also resolve). The resolver reads the hosts file
 first and asks a DNS server only for what that file lacks, which on many
 machines includes ``localhost`` over IPv6 and every loopback address but
 127.0.0.1. Other names (``localhost.localdomain``, ``ip6-localhost``,
@@ -115,9 +116,16 @@ def _is_name(host) -> bool:
 
 
 def _numeric(address, family):
-    """``address`` with the name localhost replaced by the loopback literal, so the C library never resolves it."""
-    if isinstance(address, tuple) and address and _is_name(address[0]):
-        return ('::1' if family == socket.AF_INET6 else '127.0.0.1', *address[1:])
+    """``address`` as the C socket functions may take it, which resolve any host they cannot parse.
+
+    The name localhost becomes the loopback literal, and a bracketed or zoned
+    spelling, which C would hand to the resolver, gets no answer.
+    """
+    if isinstance(address, tuple) and address and isinstance(address[0], (str, bytes)):
+        if _is_name(address[0]):
+            return ('::1' if family == socket.AF_INET6 else '127.0.0.1', *address[1:])
+        if not _plain(_text(address[0])):
+            _no_name(_text(address[0]))
     return address
 
 

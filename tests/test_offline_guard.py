@@ -171,8 +171,9 @@ def resolver(function):
     return lookup
 
 socket.getaddrinfo, socket.getnameinfo = getaddrinfo, getnameinfo
-for name in ('bind', 'connect', 'connect_ex', 'sendto'):
-    method(name)
+for name in ('bind', 'connect', 'connect_ex', 'sendto', 'sendmsg'):
+    if hasattr(socket.socket, name):          # no sendmsg on Windows
+        method(name)
 socket.gethostbyname, socket.gethostbyname_ex, socket.gethostbyaddr = (
     resolver(f) for f in ('gethostbyname', 'gethostbyname_ex', 'gethostbyaddr'))
 spec = importlib.util.spec_from_file_location('offline_net', sys.argv[1])
@@ -190,8 +191,17 @@ with socket.socket() as server:
         connected = client.connect_ex(('localhost', port))
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
     datagram.sendto(b'local', ('localhost', 9))
+    if hasattr(datagram, 'sendmsg'):
+        datagram.sendmsg([b'local'], [], 0, ('localhost', 9))
+literals = [socket.getaddrinfo(host, 443, 0, socket.SOCK_STREAM)[0][4][0] for host in ('127.0.0.1', '::1')]
+for spelling in ('[127.0.0.1]', '127.0.0.2%lo'):        # C would resolve these: they must not reach it
+    with socket.socket() as sock:
+        try:
+            sock.connect_ex((spelling, 1))
+        except socket.gaierror:
+            pass
 print(json.dumps({'answers': {
-    'bound': bound, 'connect_ex': connected,
+    'bound': bound, 'connect_ex': connected, 'literals': literals,
     'ipv6': socket.getaddrinfo('localhost', 443, socket.AF_INET6, socket.SOCK_STREAM)[0][4][0],
     'ipv4': socket.getaddrinfo('LOCALHOST', 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0],
     'canonical': socket.getaddrinfo('localhost', 443, 0, socket.SOCK_STREAM, 0, socket.AI_CANONNAME)[0][3],
@@ -207,7 +217,7 @@ print(json.dumps({'answers': {
     assert done.returncode == 0, done.stderr
     report = json.loads(done.stdout)
     assert report['answers'] == {
-        'bound': '127.0.0.1', 'connect_ex': 0,
+        'bound': '127.0.0.1', 'connect_ex': 0, 'literals': ['127.0.0.1', '::1'],
         'ipv6': '::1', 'ipv4': '127.0.0.1', 'canonical': 'localhost',
         'name': '127.0.0.1', 'name_ex': ['localhost', [], ['127.0.0.1']],
         'reverse': [['localhost', [], ['127.0.0.2']], ['localhost', [], ['::1']],
@@ -216,7 +226,42 @@ print(json.dumps({'answers': {
         'name_required': ['localhost', '443'],
     }
     assert report['asked'] and all(numeric for _, _, numeric in report['asked']), report['asked']
-    assert {'bind', 'connect', 'connect_ex', 'sendto'} <= {function for function, _, _ in report['asked']}
+    called = [(function, host) for function, host, _ in report['asked']]
+    assert {'bind', 'connect', 'connect_ex', 'sendto'} <= {function for function, _ in called}
+    assert ('sendmsg' in {function for function, _ in called}) == hasattr(socket.socket, 'sendmsg')
+    assert ('getaddrinfo', '127.0.0.1') in called and ('getaddrinfo', '::1') in called
+
+
+def test_the_socket_methods_get_the_loopback_literal_of_their_family():
+    assert offline_net._numeric(('localhost', 80), socket.AF_INET) == ('127.0.0.1', 80)
+    assert offline_net._numeric(('LOCALHOST', 80, 0, 0), socket.AF_INET6) == ('::1', 80, 0, 0)
+    assert offline_net._numeric(('127.0.0.2', 80), socket.AF_INET) == ('127.0.0.2', 80)
+    assert offline_net._numeric('/tmp/socket', socket.AF_INET) == '/tmp/socket'
+
+
+@pytest.mark.parametrize('spelling', ['[127.0.0.1]', '127.0.0.2%lo', '[::1]'])
+def test_a_bracketed_or_zoned_loopback_spelling_is_not_handed_to_the_resolver(spelling):
+    # The C socket functions would resolve a host they cannot parse, so the guard gives it no answer.
+    with socket.socket() as sock:
+        with pytest.raises(socket.gaierror):
+            sock.connect_ex((spelling, 1))
+        with pytest.raises(socket.gaierror):
+            sock.bind((spelling, 0))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
+        with pytest.raises(socket.gaierror):
+            datagram.sendto(b'x', (spelling, 9))
+
+
+def test_a_bind_of_a_socket_that_is_not_ip_is_not_judged_by_host():
+    family = getattr(socket, 'AF_NETLINK', None)
+    if family is None:
+        pytest.skip('no AF_NETLINK on this platform')
+    try:
+        sock = socket.socket(family, socket.SOCK_RAW, 0)          # NETLINK_ROUTE
+    except OSError as exc:
+        pytest.skip(f'netlink sockets unavailable: {exc}')
+    with sock:
+        sock.bind((0, 0))                                         # (pid, groups), not a host
 
 
 @pytest.mark.parametrize('module', ['uvloop', 'winloop'])
@@ -241,9 +286,10 @@ def test_active_says_whether_the_replacements_are_still_in_place(monkeypatch):
     assert not offline_net.active()
 
 
-def test_active_says_whether_the_libuv_loops_are_still_blocked(monkeypatch):
+@pytest.mark.parametrize('module', ['uvloop', 'winloop'])
+def test_active_says_whether_the_libuv_loops_are_still_blocked(monkeypatch, module):
     assert offline_net.active()
-    monkeypatch.delitem(sys.modules, 'uvloop')                 # uvloop could be imported again
+    monkeypatch.delitem(sys.modules, module)                   # it could be imported again
     assert not offline_net.active()
 
 

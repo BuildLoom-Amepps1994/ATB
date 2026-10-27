@@ -112,17 +112,24 @@ class BookTracker:
         #     since the count last started over is accepted, the id evidence starts over from it,
         #     and it is counted in sequence_resets. An id below the run's highest (a lagging
         #     replica) or stamped > 1 s older than the run's newest never counts, and the highest
-        #     id received again right after a lower one (a stuck replica) starts the count over.
+        #     id received again right after a lower one (a stuck replica) starts the count over;
+        #     an id the run received before it started over becomes its highest and starts the
+        #     count over, so it is never the read accepted.
         #     An id that stays the run's highest (a replica frozen before the restart) keeps the
         #     restart refused while it is received again within max_age_s; the first lower read
         #     more than max_age_s after its last receipt becomes the run's highest, so the restart
-        #     is accepted on the second rise after it, a little more than max_age_s after the old
-        #     id's last answer. Ids the run set aside so, or saw above the read accepted, are
-        #     refused even above the new counter's ids until an accepted id passes them (the
-        #     highest 8 are kept; invalidate clears them).
-        #     Not detected, since ids alone cannot tell: stuck replicas whose ids first answer in
-        #     rising order back to back, a frozen replica that first answers after the restart
-        #     was accepted, and a replica stuck on the newest accepted id (an equal id is accepted).
+        #     is accepted on the second rise after it, about max_age_s plus two to three of the
+        #     symbol's reads after the old id's last answer. Ids the run set aside so, or received
+        #     before the read accepted and above it, are refused even above the new counter's ids
+        #     until an accepted id passes them (the highest 8 are kept; invalidate clears them).
+        #     Not detected, since ids alone cannot tell: once the run is older than max_age_s,
+        #     any read the run has not received that is such a second rise is accepted as the
+        #     restart whatever its source (a stuck or frozen replica answering for the first
+        #     time, with any number of lower reads between the two rises); a frozen replica whose
+        #     id was not set aside is served when it answers after the restart was accepted; and a
+        #     book served so, or a replica stuck on the newest accepted id, is served as fresh
+        #     while it keeps answering (an equal id is accepted), the live depth being refused
+        #     while a frozen one answers within max_age_s.
         #   CLOCK_ROLLBACK when received_wall is more than 1 s earlier than the previous
         #     accepted received_wall while received_mono advanced; every symbol's snapshot
         #     is invalidated (derived state must be rebuilt from new snapshots).

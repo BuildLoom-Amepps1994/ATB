@@ -2260,6 +2260,67 @@ def test_a_replica_frozen_before_a_venue_id_restart_never_prices_a_held_cycle(wo
     assert_ledger_consistent(w)
 
 
+@pytest.mark.parametrize('again', [False, True])
+def test_a_frozen_replica_seen_before_a_restart_run_started_over_never_prices_a_held_cycle(world, again):
+    w = world()
+    offset = {'ids': 7_000_000_000}
+    offset_depth_ids(w, 'ETH/USDT', offset)
+    held = w.run_until_state('HOLDING', symbol='ETH/USDT')
+    books = w.engine.micro.books
+    last = books.status(w.clock.monotonic())['ETH/USDT']['sequence']
+    leading, served, frozen = w.exchange.fetch_order_book, [], {}
+    accepted, accept = [], books.accept
+
+    def recorded(snapshot):
+        stored = accept(snapshot)
+        if stored.symbol == 'ETH/USDT':
+            accepted.append(stored.venue_sequence)
+        return stored
+    books.accept = recorded
+
+    def replicas(name, limit=None, params=None):
+        book = leading(name, limit, params)
+        if name == 'ETH/USDT' and offset['ids'] == 0:
+            if not frozen:
+                # a replica froze before the last accepted read: an older id, prices 10 % lower
+                frozen.update(json.loads(json.dumps(book)), nonce=last - 5,
+                              bids=[[round(p * 0.9, 2), q] for p, q in book['bids']],
+                              asks=[[round(p * 0.9, 2), q] for p, q in book['asks']])
+            book['timestamp'] = frozen['timestamp'] = None       # depth without a venue timestamp
+            read = len(served)
+            served.append(book['nonce'])
+            if read == 2:
+                # a replica behind the first read answers an id below the run's first: the run starts over
+                book['nonce'] = served[-1] = served[0] - 2
+            elif read in (1, 4) or (again and read > 4 and read % 2 == 0):
+                # the frozen replica answers before the run starts over, then on the first read after a live rise
+                # once the new run is older than the age limit (reads are 15 s apart), and with again on every
+                # other read after that
+                served[-1] = frozen['nonce']
+                return json.loads(json.dumps(frozen))
+        return book
+    w.exchange.fetch_order_book = replicas
+    offset['ids'] = 0                                    # the venue restarted its lastUpdateId counter
+    w.run(60, until=lambda: micro.load_cycle(held['cycle_id'])['state'] == 'CLOSED')
+    assert len(served) >= 5 and served[1] == served[4] == frozen['nonce'] and served[2] < served[0]
+    assert frozen['nonce'] not in accepted                # the frozen book is never served
+    cycle = micro.load_cycle(held['cycle_id'])
+    assert cycle['last_exit_trigger'] != 'stop_loss', cycle['last_exit_trigger']
+    live_bid = leading('ETH/USDT')['bids'][0][0]
+    sales = [t for t in w.trades() if t['symbol'] == 'ETH/USDT' and t['side'].lower() == 'sell']
+    assert all(t['price'] > (frozen['bids'][0][0] + live_bid) / 2 for t in sales), (sales, frozen['bids'][0])
+    assert w.engine.micro.latch() is None                  # no false loss latch
+    row = books.status(w.clock.monotonic())['ETH/USDT']
+    if again:
+        # the carried id holds the run while it answers this often: depth stays refused, as documented
+        assert row['sequence_resets'] == 0 and row['sequence'] == last
+    else:
+        # once it stops answering the run sets it aside, the restart is accepted on live reads and depth prices the exit
+        assert row['sequence_resets'] == 1 and row['sequence'] < 7_000_000_000
+        assert cycle['last_exit_trigger'] == 'take_profit', cycle['last_exit_trigger']
+    assert_ledger_consistent(w)
+
+
 def test_a_venue_id_restart_on_a_residual_pair_does_not_block_entries_on_other_pairs(world):
     w = world(two_setups, micro_cooldown_seconds=0, data_max_age_seconds=30)
     offset = {'ids': 7_000_000_000}

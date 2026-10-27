@@ -475,37 +475,52 @@ class BookTracker:
     run's highest (a lagging replica, or a live id below an id frozen before
     the restart); an id whose venue timestamp is more than
     ``TIMESTAMP_REGRESSION_S`` older than the run's newest (the venue's clock
-    shows a frozen replica); and the highest id received again right after a
-    lower one (a source stuck on it), which starts the count over. So one
-    lower id, a replica stuck on one id and several stuck ones taking turns
-    are refused, and a lagging replica keeps the run but is never the read
-    accepted. On a counter that rises less often than it is read, a lagging
-    read between two reads of one id also starts the count over, which
-    delays the restart until two rises come without one.
+    shows a frozen replica); the highest id received again right after a
+    lower one (a source stuck on it), which starts the count over; and an id
+    the run received before it started over (it keeps its highest
+    ``RUN_IDS``), which becomes the run's highest and starts the count over.
+    So one lower id, a replica stuck on one id, and stuck replicas taking
+    turns whose ids were all received before the run was older than
+    ``max_age_s`` are refused, and a lagging replica keeps the run but is
+    never the read accepted. On a counter that rises less often than it is
+    read, a lagging read between two reads of one id also starts the count
+    over, which delays the restart until two rises come without one.
 
     The first lower read received more than ``max_age_s`` after the run's
     highest id was last received becomes the run's highest; the count starts
     over, and the run's ids above that read are set aside. So after a one-off
     old-counter read, or once a frozen replica stops answering, the restart
-    is accepted on the second rising read after that, a little more than
-    ``max_age_s`` after the old id's last answer. A replica frozen on an id
-    from before the restart that answers again before that (about every
-    ``max_age_s`` or more often), without venue timestamps, keeps the restart
-    refused for as long as it answers. The ids set aside, and the run's ids
-    (kept when the run starts over) above the read a restart is accepted on,
-    are refused even above the new counter's ids until an accepted id passes
-    them (the highest ``RUN_IDS`` are kept; ``invalidate`` clears them), so a
-    frozen replica whose id the run has seen is not served after the
-    restart, however rarely it answers.
+    is accepted on the second rising read after that: about ``max_age_s``
+    plus two to three of the symbol's reads after the old id's last answer
+    (about 33 s with a 30 s limit for a symbol read every second, up to
+    about 120 s for one read every 30 s). A replica frozen on an id from
+    before the restart, without venue timestamps, that answers again before
+    then (about every ``max_age_s`` or more often) keeps the restart refused
+    for as long as it answers, unless its first answer in the run was itself
+    the read accepted (see below). The ids set aside, and the ids the run
+    received (kept when the run starts over) above the read a restart is
+    accepted on, are refused even above the new counter's ids until an
+    accepted id passes them (the highest ``RUN_IDS`` are kept;
+    ``invalidate`` clears them), so a frozen replica whose id the run
+    received before that read is not served after the restart, however
+    rarely it answers.
 
-    Ids alone cannot tell a frozen replica from a moving counter, so these
-    are not detected: stuck replicas whose ids first answer in rising order
-    back to back once the run is older than ``max_age_s`` are accepted as a
-    restart; a frozen replica that first answers after a restart was
-    accepted is served, since its old id is above the new counter's and a
-    higher id is accepted whatever its venue timestamp; and a replica stuck
-    on the newest accepted id is served as fresh, since an equal id received
-    later is accepted.
+    Ids alone cannot tell a stuck or frozen replica from a moving counter,
+    so these are not detected:
+    - once the run is older than ``max_age_s``, any read whose id the run
+      has not received and that rises above the run's highest for the second
+      time as above is accepted as the restart whatever its source: a stuck
+      or frozen replica answering for the first time, after a rise of the
+      live counter or of another such replica, with any number of lower
+      reads between the two;
+    - a frozen replica whose id the run did not set aside (its first answer
+      came after the restart was accepted, or was the read accepted) is
+      served, since its old id is above the new counter's and a higher id is
+      accepted whatever its venue timestamp;
+    - a book served so, and a replica stuck on the newest accepted id, are
+      served as fresh while they keep answering, since an equal id received
+      later is accepted; while a frozen replica answers so within
+      ``max_age_s``, the live depth below it is refused.
 
     ``invalidate`` (a stream reconnect) clears the served snapshot and the
     venue evidence, so a venue that restarted its counters cannot lock a
@@ -663,10 +678,17 @@ class BookTracker:
         - one whose venue timestamp is more than ``TIMESTAMP_REGRESSION_S``
           older than the run's newest is not the live counter's: it does not
           count, and stays refused once the restart is accepted;
+        - an id the run received before it started over that rises above the
+          highest (a replica frozen above the live ids) becomes the highest
+          and starts the count over: it holds the run while it answers and is
+          never the read accepted;
         - once the highest has not been received again for longer than
           ``max_age_s``, the next lower read becomes the run's highest, the
           count starts over, and the ids of the run above it are set aside
           (refused until ``max_sequence`` passes them).
+        Any other read that rises counts whatever its source, so a stuck or
+        frozen replica's first answer in the run can be the read accepted
+        once the run is older than ``max_age_s`` (see ``BookTracker``).
         """
         mono, sequence, stamp = snapshot.received_mono, snapshot.venue_sequence, snapshot.venue_timestamp_ms
         stored, run = track.snapshot, track.lower_run
@@ -679,11 +701,16 @@ class BookTracker:
                                    seen=_highest(run.seen if run is not None else (), [sequence]))
             return False
         previous, run.last_mono, run.last_id = run.last_id, mono, sequence
+        known = sequence in run.seen
         run.seen = _highest(run.seen, [sequence])
         if stamp is not None:
             if run.stamp_ms is not None and (run.stamp_ms - stamp) / 1000 > TIMESTAMP_REGRESSION_S:
                 return False
             run.stamp_ms = stamp if run.stamp_ms is None else max(stamp, run.stamp_ms)
+        if sequence > run.highest and known:
+            # an id seen before the run started over (a replica frozen above the live ids) holds the run, never shows it
+            run.highest, run.highest_mono, run.rises = sequence, mono, 0
+            return False
         if sequence > run.highest:
             shows = run.rises >= 1 and mono - run.start > self.max_age_s
             run.highest, run.highest_mono, run.rises = sequence, mono, run.rises + 1

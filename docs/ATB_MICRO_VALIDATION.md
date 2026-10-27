@@ -343,7 +343,7 @@ after each change; they are not added to the totals above.
 * **Fact-check of the final report and pull request description** (written
   from these documents): three checkers, each finding then checked by a
   separate verifier. 18 findings survived and 3 were rejected. Two reached
-  these documents and are corrected here: two wall-clock runs were left out
+  `docs/ATB_MICRO_*.md` and are corrected here: two wall-clock runs were left out
   (now under *Wall-clock smoke*, *Two runs not counted above*), and the
   performance document's heading called `483d204` "before the reviews",
   though it already has the module-review fixes. One, the report's
@@ -360,7 +360,9 @@ after each change; they are not added to the totals above.
   clean-machine gate's edit step; which run built the hashed installer; the
   two engine-wide changes legacy paths also get (a 300 s retry after a failed
   catalogue refresh, and a submit-time check that the mode has not changed);
-  and the top-of-book size limit on safety exits without a depth book.
+  and the top-of-book size limit on safety exits without a depth book. Those
+  last two also stood in `CHANGELOG.md` and `README.md`, as the checks below
+  found; they are corrected there.
 * **Check of those corrections** (two checkers on the changed text, each
   finding then checked by a separate verifier): 6 confirmed, 1 rejected. One
   showed that the legacy-path and safety-exit wording corrected in the

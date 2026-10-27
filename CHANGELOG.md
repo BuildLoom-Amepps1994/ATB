@@ -28,9 +28,12 @@ Added
   maximum of the configured and public rates. Nothing calls the endpoint and
   no engine path passes an account rate (`venue_rules.py`,
   `tests/test_micro_commission.py`).
-* Net-profit exits estimated by walking the order book's bids, bounded-loss,
-  maximum-hold and regime exits that need no profit or depth, and confirmed
-  realized P/L from the simulated fill (`micro_strategy.py`, `micro_book.py`).
+* Net-profit exits estimated by walking the order book's bids; bounded-loss,
+  maximum-hold and regime exits that need no profit or depth book to fire
+  (without a depth book the paper venue sells only when the top-of-book bid's
+  stated size covers the whole holding, and a larger sale retries until a
+  depth book returns); and confirmed realized P/L from the simulated fill
+  (`micro_strategy.py`, `micro_book.py`, `micro_venue.py`).
 * A durable, depth-aware paper venue for micro orders with partial fills,
   idempotent client order ids and failure injection for tests
   (`micro_venue.py`); taker fills only, no maker simulation.
@@ -121,7 +124,12 @@ Unchanged
   strategies in both modes: the 300 s retry after a failed catalogue refresh
   (above), and a submit-time refusal of an order whose trading mode changed
   after it was authorized, which no existing path can trigger because the
-  mode changes only while the engine is idle.
+  mode changes only while the engine is idle. Legacy paths that read the
+  database are also slower in both modes: every storage call parses the
+  larger schema (25 objects, was 12), about 0.14 ms more per call, so the
+  protective tick is about 2.3 to 3.7 ms slower at a 0 ms round trip with 1
+  to 5 positions and a warm 8-symbol scan about 8 ms (4 %); the legacy-latency
+  gate is NOT MET in full (`docs/ATB_MICRO_PERFORMANCE.md`).
 
 Known limits: see `docs/ATB_MICRO_RELEASE_GATES.md` (no real-market
 evaluation, no wall-clock soak on Windows, no funded or account-fee evidence).

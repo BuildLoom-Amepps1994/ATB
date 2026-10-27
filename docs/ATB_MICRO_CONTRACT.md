@@ -263,8 +263,9 @@ def estimate_exit(*, owned_base: Decimal, basis_quote: Decimal, rules: VenueRule
     # sellable = q_down(owned, amount_step). Book with known depth: bid walk.
     # Unknown depth (ticker top of book): best_bid * (1 - fallback_slippage - latency), depth_model 'flat_fallback'.
     # Never charge the spread twice (bid prices already contain it) and never add flat slippage to a depth walk.
-    # break_even_bid / target_bid: keep = min(sellable * factor * (1 - fee), net_proceeds / best_bid),
-    # so the bids shown are never more optimistic than est_net (a thin best bid with depth far below it).
+    # break_even_bid / target_bid: keep = net_proceeds / best_bid, so the bids shown are where est_net reaches 0
+    # and target_net, up to the tick, in every depth model; labels['bids_priced_by'] is 'bid walk' for a book walk,
+    # 'estimated proceeds' for exhausted bids and 'best bid' for a flat (ticker) book.
 
 @dataclass(frozen=True)
 class Realized:

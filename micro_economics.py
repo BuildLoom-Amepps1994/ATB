@@ -878,16 +878,14 @@ def estimate_exit(*, owned_base: Decimal, basis_quote: Decimal, rules, book, cos
 
     break_even = target_bid = None
     if sellable > 0:
-        # Net proceeds per unit of the best bid: the whole sale at the (reduced) best bid, or what the estimate's
-        # own proceeds keep (the bid walk, plus the flat fallback beyond exhausted bids), whichever keeps less, so
-        # the bids shown are never more optimistic than est_net (a thin best bid with depth far below it).
+        # Net proceeds per unit of the best bid, from the estimate's own proceeds (the bid walk, the flat fallback
+        # beyond exhausted bids, or the reduced best bid): net scales with a uniform shift of the book, so the bids
+        # shown are where est_net reaches 0 and target_net, up to the tick, in every depth model.
         keep = money.mul(sellable, factor, money.sub(ONE, fee))
         if net is not None:
-            proceeds_keep = money.div(net, validated.best_bid)
-            labels['bids_priced_by'] = 'best bid'
-            if proceeds_keep < keep:
-                keep = proceeds_keep
-                labels['bids_priced_by'] = 'bid walk' if model == 'book' else 'estimated proceeds'
+            keep = money.div(net, validated.best_bid)
+            labels['bids_priced_by'] = ('estimated proceeds' if exhausted else 'bid walk' if walk is not None
+                                        else 'best bid')
         break_even = _tick_up(money.div(allocated, keep), rules.price_tick)
         target_bid = _tick_up(money.div(money.add(allocated, target), keep), rules.price_tick)
     minimum, source = _market_minimum(rules)

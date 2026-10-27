@@ -501,6 +501,34 @@ def test_a_held_cycle_shows_the_break_even_and_target_bids_its_estimated_net_rea
     assert flat.break_even_bid == money.q_up(money.div(flat.allocated_basis, keep), D('0.01'))
 
 
+def test_exhausted_bids_near_the_best_bid_show_the_bids_the_estimate_reaches():
+    """Visible bids at the best bid that cannot absorb the sale: the bids shown are where the conservative estimate
+    nets 0 and the target, up to the tick, not the single-price flat-fallback figure above them."""
+    near = Book(bids=((D('99.99'), D('0.2')), (D('99.98'), D('0.04'))), asks=((D('100.01'), D('1')),))
+    held = exit_estimate(D('0.25'), D('25'), near)
+    assert held.depth_model == 'flat_fallback' and held.depth_exhausted
+
+    def net_at(bid):
+        return exit_estimate(D('0.25'), D('25'), scaled(near, bid)).est_net_pnl
+    assert net_at(money.sub(held.break_even_bid, D('0.01'))) < 0, held.break_even_bid
+    assert net_at(held.break_even_bid) >= 0
+    assert net_at(money.sub(held.target_bid, D('0.01'))) < D('0.05'), held.target_bid
+    assert net_at(held.target_bid) >= D('0.05')
+    assert held.labels['bids_priced_by'] == 'estimated proceeds'
+    # The deep-book and ticker figures are unchanged; only the label names how each was priced.
+    result = size()
+    owned = money.add(result.sellable_base, result.predicted_residual_base)
+    deep = exit_estimate(owned, result.max_debit, deep_book())
+    assert (deep.break_even_bid, deep.target_bid, deep.labels['bids_priced_by']) == (D('100.30'), D('100.50'),
+                                                                                      'bid walk')
+    ticker = Book(bids=((D('99.99'), None),), asks=((D('100.01'), None),), depth_known=False)
+    flat = exit_estimate(owned, result.max_debit, ticker)
+    assert (flat.break_even_bid, flat.target_bid, flat.labels['bids_priced_by']) == (D('100.50'), D('100.70'),
+                                                                                      'best bid')
+    thin = exit_estimate(owned, result.max_debit, Book(bids=THIN_TOP_BIDS, asks=((D('100.01'), D('1000')),)))
+    assert thin.labels['bids_priced_by'] == 'bid walk'
+
+
 # ------------------------------------------------ 10. partial-close conservation
 def test_partial_closes_conserve_ownership_basis_and_cash_exactly():
     entry = me.account_entry(filled_base=D('0.24958519'), gross_quote=D('24.97'), quote_fee=D('0.02497'),

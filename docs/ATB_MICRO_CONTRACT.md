@@ -106,11 +106,14 @@ class BookTracker:
         # returns the stored snapshot with its generation assigned; raises BookError:
         #   BOOK_OUT_OF_ORDER when venue_sequence (if both known) is lower than the stored one,
         #     or (no sequences) venue_timestamp_ms is older than the stored one by > 1 s;
-        #     the stored snapshot is kept. Lower ids that rise above the first of them, none
-        #     below it, for longer than max_age_s with none accepted in between, are a venue
-        #     counter restart: the id evidence starts over from the current snapshot, which is
-        #     accepted and counted in sequence_resets; a lagging replica's lower id does not restart
-        #     that wait.
+        #     the stored snapshot is kept. Lower ids, none below the first of them, that keep
+        #     arriving for longer than max_age_s with none accepted in between are a venue
+        #     counter restart: the next read whose id is above every id of that run, after an
+        #     earlier read that also rose so, is accepted, the id evidence starts over from it, and
+        #     it is counted in sequence_resets. A lagging replica's lower id keeps that wait but is
+        #     never the read accepted, a repeated id (a stuck replica) is never accepted, and while
+        #     an id of the run stays above every later one (a replica frozen before the restart)
+        #     nothing is accepted.
         #   CLOCK_ROLLBACK when received_wall is more than 1 s earlier than the previous
         #     accepted received_wall while received_mono advanced; every symbol's snapshot
         #     is invalidated (derived state must be rebuilt from new snapshots).

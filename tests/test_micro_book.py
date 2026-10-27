@@ -654,6 +654,63 @@ def test_a_lagging_or_stuck_replica_is_still_refused_as_out_of_order():
     assert row['sequence_resets'] == 0 and row['sequence'] == 1002 and tracker.sequence_resets == 0
 
 
+@pytest.mark.parametrize('every, first', [(2, 1), (2, 0), (5, 3)])
+def test_a_replica_frozen_on_a_pre_restart_id_is_never_served_after_a_venue_counter_restart(every, first):
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(7_000_000_023, mono=100.0))
+    # the venue restarted its lastUpdateId counter, and a replica that froze before the last accepted read keeps
+    # answering some reads with its old id and its old prices: on the new counter its id is above every live one
+    frozen, live = 7_000_000_010, 264
+    for i in range(40):
+        mono = 101.0 + i
+        if i % every == first:
+            snapshot = seq(frozen, mono=mono, bid='1500.00')
+        else:
+            live += 3
+            snapshot = seq(live, mono=mono)
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, snapshot)
+        served = tracker.latest('ETH/USDT', now_mono=mono)
+        assert served is None or served.generation == 1           # the last pre-restart book, until it expires
+    row = tracker.status(141.0)['ETH/USDT']
+    assert row['sequence'] == 7_000_000_023 and row['sequence_resets'] == 0 and tracker.sequence_resets == 0
+
+
+def test_two_replicas_stuck_on_lower_ids_never_count_as_a_venue_counter_restart():
+    # no restart: the leading replica stops answering and two replicas stuck on 990 and 995 take turns
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(1000, mono=100.0))
+    for i in range(1, 41):
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(990 if i % 2 else 995, mono=100.0 + i))
+    row = tracker.status(141.0)['ETH/USDT']
+    assert row['sequence'] == 1000 and row['sequence_resets'] == 0 and row['accepted'] == 1
+    assert tracker.sequence_resets == 0
+
+
+def test_a_stuck_id_after_one_higher_read_never_counts_as_a_venue_counter_restart():
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(seq(1000, mono=100.0))
+    # one read rises above a stuck id once, then only the stuck id answers
+    for i, n in enumerate([990, 995] + [990] * 40, 1):
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, seq(n, mono=100.0 + i))
+    row = tracker.status(143.0)['ETH/USDT']
+    assert row['sequence'] == 1000 and row['sequence_resets'] == 0 and row['accepted'] == 1
+    assert tracker.sequence_resets == 0
+
+
+def test_a_rising_id_that_would_show_a_restart_is_still_refused_when_the_venue_clock_places_it_earlier():
+    def btc(n, ts_ms, mono):
+        return book(depth([['2000.10', '1']], [['2000.20', '1']], nonce=n, timestamp=ts_ms, symbol='BTC/USDT'),
+                    mono=mono, symbol='BTC/USDT')
+    tracker = BookTracker(max_age_s=5)
+    tracker.accept(btc(5_000, WALL_MS - 1_000, 110.0))
+    for n, mono in ((10, 111.0), (20, 112.0), (30, 116.5)):
+        refused(micro_book.BOOK_OUT_OF_ORDER, tracker.accept, btc(n, WALL_MS - 9_000, mono))
+    # 30 rose for the second time after the age limit: only the venue's own older stamp refused it
+    assert tracker.status(116.6)['BTC/USDT']['sequence_resets'] == 0
+    assert tracker.accept(btc(40, WALL_MS - 500, 117.0)).venue_sequence == 40
+    assert tracker.sequence_resets == 1
+
+
 def test_generation_is_a_local_count_of_accepted_snapshots_never_venue_evidence():
     tracker = BookTracker(max_age_s=5)
     forged = dataclasses.replace(seq(500_000, mono=100.0), generation=999)

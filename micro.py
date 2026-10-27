@@ -118,6 +118,10 @@ SCHEMA = (
         WHERE state NOT IN ('CLOSED', 'ABANDONED')''',
     'CREATE UNIQUE INDEX IF NOT EXISTS micro_one_cycle_per_opportunity ON micro_cycles(exchange, mode, opportunity_key)',
     'CREATE INDEX IF NOT EXISTS micro_cycles_recent ON micro_cycles(exchange, mode, closed_wall)',
+    # The closed cycles that retain a remainder, newest last per pair: owned_symbols finds a position's remainder
+    # with one seek. Its WHERE clause must stay a copy of that lookup's predicates, or SQLite cannot use it.
+    '''CREATE INDEX IF NOT EXISTS micro_cycles_closed_residual ON micro_cycles(exchange, mode, symbol, closed_wall)
+        WHERE state='CLOSED' AND residual_base IS NOT NULL AND residual_base NOT IN ('0', '')''',
     '''CREATE TABLE IF NOT EXISTS micro_cycle_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id TEXT NOT NULL, at TEXT NOT NULL,
         from_state TEXT, to_state TEXT NOT NULL, reason TEXT NOT NULL, data TEXT)''',
@@ -304,7 +308,8 @@ class MicroManager:
             # One statement on one connection: the legacy monitor calls this on every protective tick, and its
             # cost must not grow with the closed history. The open cycles come from the one-open-cycle index
             # (DISTINCT lets the planner read it in order); the remainders are looked up per ledger position,
-            # and only for a position no open cycle already owns.
+            # only for a position no open cycle already owns, each with one seek in micro_cycles_closed_residual,
+            # whose WHERE clause copies the remainder predicates below (keep the two identical).
             rows = storage.rows("SELECT DISTINCT c.symbol, 1 AS open, NULL AS residual_base, NULL AS qty "
                                 "FROM micro_cycles c WHERE c.exchange=? AND c.mode='paper' "
                                 "AND c.state NOT IN ('CLOSED','ABANDONED') "

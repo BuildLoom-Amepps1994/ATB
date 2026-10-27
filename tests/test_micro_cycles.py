@@ -2387,8 +2387,9 @@ def test_owned_symbols_never_claim_a_later_position_for_a_residual_the_ledger_no
 
 def test_owned_symbols_cost_does_not_grow_with_the_closed_cycle_history(world, monkeypatch):
     """The legacy monitor, every micro tick and the dashboard snapshot ask for the micro-owned pairs while
-    they hold the storage lock. Weeks of closed and abandoned cycles must not make that slower: the cost is
-    counted in SQLite virtual-machine steps, which do not depend on the machine's speed."""
+    they hold the storage lock. Weeks of closed and abandoned cycles must not make that slower, also with
+    paper positions outside the open cycles, on pairs the cycles traded and on pairs they never traded: the
+    cost is counted in SQLite virtual-machine steps, which do not depend on the machine's speed."""
     import contextlib
     w = world()
     w.run_until_state('HOLDING', symbol='ETH/USDT')
@@ -2410,26 +2411,60 @@ def test_owned_symbols_cost_does_not_grow_with_the_closed_cycle_history(world, m
     monkeypatch.setattr(storage, 'connection', counted)
     owned, short_history = owned_and_steps()
     assert owned == {'ETH/USDT'}
-    history, pairs = 3000, ('ETH/USDT', 'BTC/USDT', 'C0/USDT', 'C1/USDT', 'C2/USDT')
-    start = time.time() - 30 * 86400
-    with real_connection() as db:
-        db.executemany('INSERT INTO micro_cycles(cycle_id, exchange, mode, symbol, state, created_at, updated_at, '
-                       'opportunity_key, budget_cap, closed_wall, residual_base) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-                       [(f'cyc_hist{index:020d}', exchange, 'paper', pairs[index % 5],
-                         'ABANDONED' if index % 4 == 0 else 'CLOSED', 'x', 'x', f'history|{index}', '25',
-                         start + 60 * index, '0.5' if index == 3 else '0') for index in range(history)])
+    pairs, start = ('ETH/USDT', 'BTC/USDT', 'C0/USDT', 'C1/USDT', 'C2/USDT'), time.time() - 30 * 86400
+
+    def add_history(first: int, count: int) -> None:
+        with real_connection() as db:
+            db.executemany('INSERT INTO micro_cycles(cycle_id, exchange, mode, symbol, state, created_at, updated_at, '
+                           'opportunity_key, budget_cap, closed_wall, residual_base) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                           [(f'cyc_hist{index:020d}', exchange, 'paper', pairs[index % 5],
+                             'ABANDONED' if index % 4 == 0 else 'CLOSED', 'x', 'x', f'history|{index}', '25',
+                             start + 60 * index, '0.5' if index == 3 else '0')
+                            for index in range(first, first + count)])
+    add_history(0, 3000)
     owned, long_history = owned_and_steps()
     assert owned == {'ETH/USDT'}
     assert long_history <= 2 * short_history, (short_history, long_history)   # the held cycle's own position
-    # Positions outside every open cycle: the oldest closed C1 cycle retains 0.5 C1, and C0 has no remainder.
+    # Positions outside every open cycle: the oldest closed C1 cycle retains 0.5 C1, BTC and C0 have closed
+    # cycles with no remainder, and the cycles never traded L0 to L2.
     with real_connection() as db:
-        for symbol, qty in (('C0/USDT', 2.0), ('C1/USDT', 0.5)):
+        for symbol, qty in (('C0/USDT', 2.0), ('C1/USDT', 0.5), ('BTC/USDT', 0.01),
+                            ('L0/USDT', 1.0), ('L1/USDT', 3.0), ('L2/USDT', 7.0)):
             db.execute("INSERT INTO positions(exchange, mode, symbol, qty, entry_price, cost, highest, stop, target, "
                        "opened_at) VALUES (?, 'paper', ?, ?, 10, ?, 10, 9, 11, '2026-10-26T00:00:00+00:00')",
                        (exchange, symbol, qty, 10 * qty))
     owned, outside = owned_and_steps()
     assert owned == {'ETH/USDT', 'C1/USDT'}
-    assert outside <= long_history + 2 * 20 * history, (long_history, outside)   # at most one pass each
+    add_history(3000, 12000)                                      # five times the history, none of it a remainder
+    owned, outside_longer = owned_and_steps()
+    assert owned == {'ETH/USDT', 'C1/USDT'}
+    assert outside_longer <= outside + 100, (outside, outside_longer)   # each remainder lookup is one index seek
+
+
+def test_start_up_adds_the_closed_remainder_index_to_a_database_written_without_it(tmp_path, monkeypatch):
+    """A version-4 database from a build before the closed-remainder index gets it at the next start, built
+    from the rows already there: no row changes and the schema version stays 4."""
+    monkeypatch.setattr(storage, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(storage, 'DB_PATH', tmp_path / 'portfolio.sqlite3')
+    monkeypatch.setattr(storage, 'CONFIG_PATH', tmp_path / 'settings.json')
+    storage.init_db()
+    with storage.connection() as db:
+        db.execute('DROP INDEX micro_cycles_closed_residual')
+        db.executemany('INSERT INTO micro_cycles(cycle_id, exchange, mode, symbol, state, created_at, updated_at, '
+                       "opportunity_key, budget_cap, closed_wall, residual_base) VALUES (?, 'mexc', 'paper', "
+                       "'C1/USDT', ?, 'x', 'x', ?, '25', ?, ?)",
+                       [('cyc_old0', 'CLOSED', 'old|0', 1.0, '0.5'), ('cyc_old1', 'CLOSED', 'old|1', 2.0, '0'),
+                        ('cyc_old2', 'ABANDONED', 'old|2', 3.0, '0.25')])
+        before = [tuple(row) for row in db.execute('SELECT * FROM micro_cycles ORDER BY cycle_id')]
+    storage.init_db()
+    remainder = ("SELECT cycle_id FROM micro_cycles INDEXED BY micro_cycles_closed_residual WHERE exchange='mexc' "
+                 "AND mode='paper' AND symbol='C1/USDT' AND state='CLOSED' AND residual_base IS NOT NULL "
+                 "AND residual_base NOT IN ('0', '')")     # INDEXED BY raises when the index cannot answer it
+    with storage.connection() as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 4
+        assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        assert [tuple(row) for row in db.execute('SELECT * FROM micro_cycles ORDER BY cycle_id')] == before
+        assert [row['cycle_id'] for row in db.execute(remainder)] == ['cyc_old0']
 
 
 def _five_pairs_and_one_outside_them(minute: int) -> list[SeriesMarket]:

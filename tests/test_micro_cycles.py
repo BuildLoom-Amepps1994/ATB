@@ -23,11 +23,13 @@ import math
 import sqlite3
 import sys
 import threading
+import types
 import time
 import uuid
 from decimal import Decimal
 from pathlib import Path
 
+import ccxt
 import pytest
 from fastapi.testclient import TestClient
 
@@ -3064,3 +3066,34 @@ def test_an_unfilled_cycle_reports_how_long_its_outcome_has_been_pending(world):
     shown = _status_cycle(w, unknown['cycle_id'])
     assert shown['age_s'] is None                              # never held: no hold time
     assert shown['pending_s'] >= 3 * 3600
+
+
+def test_the_volume_gate_reads_the_ticker_sparingly_and_blocks_thin_or_unknown_pairs(monkeypatch):
+    calls = []
+
+    class Data:
+        volume = 4e6
+
+        def ticker(self, symbol):
+            calls.append(symbol)
+            if self.volume is None:
+                raise ccxt.NetworkError('down')
+            return {'quoteVolume': self.volume}
+
+    data = Data()
+    manager = object.__new__(micro.MicroManager)
+    manager.engine = types.SimpleNamespace(data=data, cfg={'min_quote_volume': 5e6})
+    manager._volumes = {}
+    clock = [1000.0]
+    monkeypatch.setattr(micro.time, 'monotonic', lambda: clock[0])
+    assert manager._volume_gate('FLOKI/USDT') == '24h quote volume 4,000,000 USDT is below the 5,000,000 USDT minimum'
+    data.volume = 6e6
+    assert manager._volume_gate('FLOKI/USDT').startswith('24h quote volume 4,000,000')   # cached
+    clock[0] += micro.VOLUME_REFRESH_S
+    assert manager._volume_gate('FLOKI/USDT') is None and len(calls) == 2
+    data.volume = None
+    clock[0] += micro.VOLUME_REFRESH_S
+    assert manager._volume_gate('FLOKI/USDT') == 'unknown 24h quote volume'
+    clock[0] += micro.VOLUME_RETRY_S
+    data.volume = 7e6
+    assert manager._volume_gate('FLOKI/USDT') is None and len(calls) == 4

@@ -81,6 +81,8 @@ MAX_EFFICIENCY_RANGE = 0.25
 EDGE_RATIO = 0.6
 MAX_SPREAD_BPS = 20.0
 BOOK_LEVELS = 20
+VOLUME_REFRESH_S = 300.0          # a pair's 24h quote volume is read from its ticker at most this often
+VOLUME_RETRY_S = 60.0             # and retried this soon after a failed or empty read
 ENTRY_BOOK_SECONDS = 3.0          # a flat pair's book is refreshed this often while a setup is plausible
 IDLE_BOOK_SECONDS = 30.0          # otherwise only this often (eligibility display)
 EXIT_RETRY_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
@@ -241,6 +243,8 @@ class MicroManager:
         # between book reads only while both are unchanged.
         self._decided_bar: dict[str, tuple] = {}
         self._conflicts: dict[str, tuple[float, list]] = {}
+        # 24h quote volume per pair, from the public ticker: (monotonic read time, USDT or None when unknown).
+        self._volumes: dict[str, tuple[float, float | None]] = {}
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -259,6 +263,7 @@ class MicroManager:
             self._decided_bar.clear()
             self._next_book.clear()
             self._next_mark.clear()
+            self._volumes.clear()
         return self._venue
 
     def active(self) -> bool:
@@ -1907,6 +1912,33 @@ class MicroManager:
                 basis = money.add(basis, _dec(cycle['basis_quote'], money.ZERO))
         return reserved, basis
 
+    def _volume_gate(self, symbol: str) -> str | None:
+        """None when the pair's 24h quote volume meets ``min_quote_volume``; else the reason it does not.
+
+        The classic strategies refuse a pair below this minimum (or with no
+        reported volume); micro cycles keep the same floor, because a thin book
+        that looks deep for a moment is where a 25 USDT cycle loses its round trip.
+        The ticker is read at most every ``VOLUME_REFRESH_S`` (``VOLUME_RETRY_S``
+        after a failure); an unknown volume blocks, as it does for the classic scan.
+        """
+        now_mono = time.monotonic()
+        read_at, volume = self._volumes.get(symbol, (None, None))
+        due = read_at is None or now_mono - read_at >= (VOLUME_REFRESH_S if volume is not None else VOLUME_RETRY_S)
+        if due:
+            try:
+                ticker = self.engine.data.ticker(symbol)
+                raw = ticker.get('quoteVolume') if isinstance(ticker, dict) else None
+                volume = float(raw) if raw is not None and math.isfinite(float(raw)) and float(raw) > 0 else None
+            except Exception:
+                volume = None
+            self._volumes[symbol] = (now_mono, volume)
+        minimum = float(self.engine.cfg.get('min_quote_volume') or 0.0)
+        if volume is None:
+            return 'unknown 24h quote volume'
+        if volume < minimum:
+            return f'24h quote volume {volume:,.0f} USDT is below the {minimum:,.0f} USDT minimum'
+        return None
+
     def _entries(self, params, selected: list[str]) -> None:
         engine = self.engine
         now = time.time()
@@ -2019,7 +2051,8 @@ class MicroManager:
             gates = {'selected': True, 'capacity': capacity, 'cooldown_remaining_s': round(cooldown, 1),
                      'fresh_after_exit': fresh_after_exit, 'review_block': bool(blockers) or bool(conflicts),
                      'risk_block': engine.risk_block if engine.risk.kill_switch()['engaged'] else None,
-                     'latched': latch.get('reason') if latch else None}
+                     'latched': latch.get('reason') if latch else None,
+                     'low_volume': self._volume_gate(symbol)}
             # A stand-in names its pair and its own cause: no book, or a sizing that raised on one (an
             # unmapped code, so the strategy reports it as ERROR with this detail).
             if sizing is not None:
@@ -2370,6 +2403,7 @@ class MicroManager:
             self._decided_bar.clear()
             self._next_book.clear()
             self._next_mark.clear()
+            self._volumes.clear()
             self.counters.clear()
             self.waiting_since.clear()
             self.context.clear()

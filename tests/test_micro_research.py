@@ -314,3 +314,20 @@ def test_a_second_fixture_clock_replaces_the_first_everywhere(monkeypatch):
     second.advance(4 * 3600)
     assert abs(time.time() - micro.datetime.now().timestamp()) < 1.0
     assert second._real is fx._REAL_TIME and first._real is fx._REAL_TIME          # never chained
+
+
+def test_an_entry_on_a_sub_cent_market_books_inside_its_reservation(tmp_path):
+    # MEXC PEPE, SHIB and BONK quote in 1E-9. The harness used to round the fee up
+    # to 1E-8, which put the debit above the reservation and stopped the run.
+    _real_file(tmp_path, 'PEPE/USDT', [0.000004053] * 200,
+               market=fx.mexc_market('PEPE/USDT', price_tick=1e-9), embed=False)
+    series = {s.symbol: s for s, _label, _provenance in r.load_real(tmp_path)}['PEPE/USDT']
+    rules = r.rules_for(series, 1.0)
+    cost = r.scenario_cost(rules, r.SCENARIOS['baseline'])
+    snapshot = r.book(series, series.closes[-1], 60000, r.SCENARIOS['baseline'], 1)
+    sizing = r.econ.size_entry(rules=rules, book=snapshot, cost=cost, budget_cap=r.money.parse('15'),
+                               cash_available=r.money.parse('1000'), allocation_remaining=r.money.parse('15'),
+                               target_net=r.money.parse('0.03'), exit_stress_bps=r.money.parse('120'), now_wall=60.0)
+    assert sizing.eligible, sizing
+    cycle = r._buy('PEPE/USDT', sizing, snapshot, cost, 1, r.money.parse('0.03'), r.money.parse('0.18'), 'test')
+    assert cycle.entry_debit <= sizing.max_debit

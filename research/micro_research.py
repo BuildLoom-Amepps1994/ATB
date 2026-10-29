@@ -458,7 +458,10 @@ def _buy(symbol, sizing, snapshot, cost, bar, target_net, stop_net, candidate, *
          carry_basis=money.ZERO) -> Cycle:
     walk = econ.walk_asks(snapshot, quote_amount=sizing.gross_quote, latency_bps=cost.latency_bps)
     gross = walk.quote
-    fee = money.q_up(money.mul(gross, cost.taker_fee), Decimal('0.00000001'))
+    # The fee is booked unrounded, as the paper venue reports it. Rounding it up to a
+    # fixed 1E-8 put the debit above a reservation sized on a finer quote step (MEXC
+    # PEPE, SHIB and BONK quote in 1E-9) and stopped the run.
+    fee = money.mul(gross, cost.taker_fee)
     acquisition = econ.account_entry(filled_base=walk.base, gross_quote=gross, quote_fee=fee, base_fee=money.ZERO,
                                      other_fees={}, other_fee_value=None, fee_status='simulated',
                                      reserved=sizing.max_debit)
@@ -472,7 +475,7 @@ def _sell(cycle: Cycle, snapshot, rules, cost, trigger, bar) -> None:
     step = rules.amount_step or Decimal('0.00000001')
     sellable = money.q_down(cycle.owned, step)
     walk = econ.walk_bids(snapshot, base_amount=sellable, latency_bps=cost.latency_bps)
-    fee = money.q_up(money.mul(walk.quote, cost.taker_fee), Decimal('0.00000001'))
+    fee = money.mul(walk.quote, cost.taker_fee)       # unrounded, as the paper venue reports it
     realized = econ.realize_exit(owned_base=cycle.owned, basis_quote=cycle.basis, sold_base=walk.base,
                                  gross_quote=walk.quote, quote_fee=fee, base_fee=money.ZERO, other_fees={},
                                  other_fee_value=None, fee_status='simulated')

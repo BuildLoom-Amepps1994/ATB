@@ -151,7 +151,28 @@ class TradingEngine:
     def _new_paper_exchange(self):
         """Simulated counterparty sharing the live submit/confirm/ledger path."""
         return paper_exchange.PaperExchange(self.exchange_name, catalogue=self._catalogue,
-                                            settings=lambda: self.cfg, balances=self._paper_balances)
+                                            settings=lambda: self.cfg, balances=self._paper_balances,
+                                            book=self._paper_book)
+
+    PAPER_BOOK_MAX_AGE_S = 5.0
+
+    def _paper_book(self, symbol: str) -> dict | None:
+        """A fresh public order book for one paper fill, or None (the paper exchange then uses the flat slippage).
+
+        Read only when a paper order fills, so it costs one public depth request
+        per simulated fill. A reply that is not bid and ask levels, or is older
+        than ``PAPER_BOOK_MAX_AGE_S`` on arrival, is not used.
+        """
+        try:
+            book = self.data.order_book(symbol, limit=50)
+        except Exception:
+            return None
+        if not isinstance(book, dict) or not isinstance(book.get('bids'), list) or not isinstance(book.get('asks'), list):
+            return None
+        stamp = finite_positive(book.get('timestamp'))
+        if stamp and time.time() - (stamp / 1000 + self._clock_offset()) > self.PAPER_BOOK_MAX_AGE_S:
+            return None
+        return book
 
     def _paper_balances(self) -> dict:
         free = {'USDT': self._cash('paper')}

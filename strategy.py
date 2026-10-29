@@ -235,6 +235,20 @@ def regime_signal(higher: pd.DataFrame) -> bool:
     return bool(row['close'] > row['ema50'] and row['ema20'] > row['ema50'])
 
 
+TRAIL_ARM_ATR = 1.0   # the trailing stop moves only after the high is this many ATRs above the entry fill
+
+
+def trail_armed(highest: float, entry: float | None, atr: float, arm_multiple: float = TRAIL_ARM_ATR) -> bool:
+    """True once the high has risen ``arm_multiple`` ATRs above the entry fill.
+
+    The entry fill is at or above the ask (plus simulated slippage in paper), so
+    a trail measured from it at once would sit above the bid on fast timeframes,
+    where a few ATRs are smaller than the spread and slippage, and sell on the
+    next check. Without a known entry the trail behaves as before.
+    """
+    return entry is None or highest >= entry + arm_multiple * atr
+
+
 def stop_fraction(atr: float, price: float, *, rapid: bool = False) -> float:
     if not all(math.isfinite(float(value)) and float(value) > 0 for value in (atr, price)):
         raise ValueError('A protective stop requires finite positive price and ATR')
@@ -346,7 +360,7 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
     fee, slip = parameters['fee_pct'], parameters['slippage_pct']
     starting = 10000.0
     cash, qty, entry_basis = starting, 0.0, 0.0
-    highest = stop = target = 0.0
+    highest = stop = target = entry_fill = 0.0
     pending_trend_exit = False
     fees_paid = slippage_costs = 0.0
     curve: list[dict[str, float]] = []
@@ -414,7 +428,7 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
                     entry_fee = qty * price * fee
                     fees_paid += entry_fee
                     slippage_costs += qty * (price - market_open)
-                    highest = price
+                    highest = entry_fill = price
                     stop = price * (1 - fraction)
                     target = price * (1 + 2.75 * fraction)
                     executions.append({'type': 'buy', 'time': int(bar['timestamp']),
@@ -431,7 +445,10 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
             else:
                 highest = max(highest, float(bar['high']))
                 # This stop is active on the NEXT candle, never retroactively.
-                stop = max(stop, highest - 2.5 * float(bar['atr']))
+                # It trails only once the high is TRAIL_ARM_ATR above the entry
+                # fill, as in the engine (decision.evaluate_exit).
+                if trail_armed(highest, entry_fill, float(bar['atr'])):
+                    stop = max(stop, highest - 2.5 * float(bar['atr']))
                 pending_trend_exit = float(bar['close']) < float(bar['ema50'])
         liquidation = qty * float(bar['close']) * (1 - slip) * (1 - fee)
         equity = cash + liquidation

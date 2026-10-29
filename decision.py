@@ -23,7 +23,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from strategy import MIN_EFFICIENCY, entry_price_ok, entry_signal, setup_quality
+from strategy import MIN_EFFICIENCY, entry_price_ok, entry_signal, setup_quality, trail_armed
 
 DECISION_VERSION = 'entry-v1'
 FEATURE_KEYS = ('close', 'volume', 'ema20', 'ema50', 'rsi', 'atr', 'vol_avg20', 'prior_high20', 'efficiency')
@@ -188,6 +188,18 @@ def evaluate_entry(*, symbol: str, last, regime_ok: bool, market_ok: bool | None
                     confidence=confidence, inputs=inputs, proposal=proposal)
 
 
+def entry_reference(position: dict) -> float | None:
+    """The position's entry fill price, or None when the row cannot say."""
+    try:
+        entry = float(position.get('entry_price') or 0.0)
+        if not (math.isfinite(entry) and entry > 0):
+            qty, cost = float(position.get('qty') or 0.0), float(position.get('cost') or 0.0)
+            entry = cost / qty if qty > 0 else 0.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return entry if math.isfinite(entry) and entry > 0 else None
+
+
 def evaluate_exit(position: dict, price: float, *, atr: float | None = None, trend_broken: bool = False,
                   dust: bool = False, trailing_multiple: float = 2.5) -> dict:
     """Exit policy for one tracked position at an observed executable bid.
@@ -200,11 +212,13 @@ def evaluate_exit(position: dict, price: float, *, atr: float | None = None, tre
     has always used: a stored stop or target first (``trigger='stored'``),
     then the updated trailing stop (``'trailing'``), then a completed-candle
     trend reversal (``'trend'``). A verified sub-minimum remainder is skipped
-    (``skip``) rather than ordered.
+    (``skip``) rather than ordered. The trailing stop ratchets only once the
+    high is ``TRAIL_ARM_ATR`` ATRs above the entry fill (:func:`trail_armed`).
     """
     highest, stop, target = float(position['highest']), float(position['stop']), float(position['target'])
     trailing = atr is not None and math.isfinite(atr) and atr > 0
     new_highest = max(highest, price)
+    trailing = trailing and trail_armed(new_highest, entry_reference(position), atr)
     new_stop = max(stop, new_highest - trailing_multiple * atr) if trailing else stop
     levels = {'highest': new_highest, 'stop': new_stop}
     if dust:

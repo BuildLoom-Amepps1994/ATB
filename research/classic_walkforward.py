@@ -50,7 +50,7 @@ import strategy  # noqa: E402
 
 DAY_MS = 86_400_000
 TF_MS = {'1h': 3_600_000, '4h': 14_400_000, '1d': DAY_MS, '1w': 7 * DAY_MS}
-PROFILES = {'balanced': ('1h', '4h'), 'swing': ('4h', '1d'), 'position': ('1d', '1w')}
+PROFILES = {'balanced': ('1h', '4h'), 'swing': ('4h', '1d'), 'position': ('1d', '1w'), 'trend': ('1d', '1w')}
 
 
 def _ms(text: str) -> int:
@@ -164,7 +164,8 @@ def run_pair(base: str, profile: str, data: Path, cost: str, splits: list[str], 
     if filters and base != 'BTC':
         market, _ = load(data, 'BTC', higher_tf)
     fee, slip = PROTOCOL['costs'][cost]
-    settings = {'fee_pct': fee, 'slippage_pct': slip, 'market_filters': filters, **PROTOCOL['sizing']}
+    settings = {'fee_pct': fee, 'slippage_pct': slip, 'market_filters': filters, 'time_horizon': profile,
+                **PROTOCOL['sizing']}
     run = backtest or strategy.backtest
     report = {'filled_bars': filled + filled_h, 'splits': {}}
     for name in splits:

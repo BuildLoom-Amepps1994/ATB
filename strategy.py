@@ -122,6 +122,11 @@ def _trailing(values: np.ndarray, length: int, reducer) -> np.ndarray:
 
 
 EFFICIENCY_PERIOD = 20
+# The Trend strategy (PAPER only): hold while the completed daily close is above
+# its TREND_SMA-day simple average (research/trend_research.py, trend-research-v1).
+TREND_SMA = 100
+TREND_STOP_FRACTION = .25      # a disaster stop only; the rule itself exits on a close below the average
+TREND_TARGET_MULTIPLE = 10.0   # no profit target in the rule: the stored target sits at ten times the fill
 
 
 def indicators(df: pd.DataFrame, *, window: int = PRIMARY_WINDOW) -> pd.DataFrame:
@@ -158,6 +163,7 @@ def indicators(df: pd.DataFrame, *, window: int = PRIMARY_WINDOW) -> pd.DataFram
     correction = _shift(high - low - tr, window - 1) * (1 - 1 / 14) ** (window - 1)
     columns['atr'] = atr + np.nan_to_num(correction, nan=0.0)
     columns['vol_avg20'] = pd.Series(volume).rolling(20).mean().to_numpy()
+    columns['sma100'] = _trailing(close, TREND_SMA, np.mean)
     columns['prior_high20'] = _trailing(_shift(high, 1), 20, np.max)
     # Kaufman efficiency: net move over the summed path of the last 20 changes.
     path = _trailing(np.abs(change), EFFICIENCY_PERIOD, np.sum)
@@ -170,8 +176,29 @@ def indicators(df: pd.DataFrame, *, window: int = PRIMARY_WINDOW) -> pd.DataFram
 MIN_EFFICIENCY = .3
 
 
+def trend_signal(last) -> tuple[bool, str, int]:
+    """The Trend rule: a completed daily close above its TREND_SMA-day average."""
+    try:
+        close, average = float(last['close']), float(last['sma100'])
+    except (TypeError, ValueError, KeyError):
+        return False, 'Insufficient indicators', 0
+    if not (math.isfinite(close) and math.isfinite(average)) or close <= 0 or average <= 0:
+        return False, 'Insufficient indicators', 0
+    if close > average:
+        return True, 'BUY setup', 100
+    return False, f'Waiting: close below its {TREND_SMA}-day average', 0
+
+
+def trend_broken(last, *, trend_rule: bool = False) -> bool:
+    """The completed-candle exit: below the Trend average, or below EMA50 for the other strategies."""
+    if trend_rule:
+        return bool(last['close'] < last['sma100'])
+    return bool(last['close'] < last['ema50'])
+
+
 def entry_signal(last, regime_ok: bool = True, *, rapid: bool = False,
-                 market_ok: bool | None = None, filters: bool = True) -> tuple[bool, str, int]:
+                 market_ok: bool | None = None, filters: bool = True,
+                 trend_rule: bool = False) -> tuple[bool, str, int]:
     """Completed-candle breakout rules; every check must pass.
 
     With ``filters`` the 20-candle trend efficiency must show a directional
@@ -179,6 +206,8 @@ def entry_signal(last, regime_ok: bool = True, *, rapid: bool = False,
     is the BTC higher-timeframe trend for altcoins; None means not applied.
     Both can only block an entry, never size or place one.
     """
+    if trend_rule:
+        return trend_signal(last)
     keys = ['close', 'volume', 'ema20', 'ema50', 'rsi', 'atr', 'vol_avg20', 'prior_high20']
     if filters:
         keys.append('efficiency')
@@ -249,9 +278,11 @@ def trail_armed(highest: float, entry: float | None, atr: float, arm_multiple: f
     return entry is None or highest >= entry + arm_multiple * atr
 
 
-def stop_fraction(atr: float, price: float, *, rapid: bool = False) -> float:
+def stop_fraction(atr: float, price: float, *, rapid: bool = False, trend: bool = False) -> float:
     if not all(math.isfinite(float(value)) and float(value) > 0 for value in (atr, price)):
         raise ValueError('A protective stop requires finite positive price and ATR')
+    if trend:
+        return TREND_STOP_FRACTION
     minimum, maximum = (.008, .03) if rapid else (.035, .12)
     return max(minimum, min(maximum, 2.25 * atr / price))
 
@@ -313,6 +344,7 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
         raise ValueError('At least 125 completed candles are required for a backtest')
     duration = _contiguous_interval(x, timeframe_ms(timeframe) if timeframe else None)
     rapid = timeframe in ('1m', '5m')
+    trend_rule = settings.get('time_horizon') == 'trend'
     if (higher_rows is None) != (higher_timeframe is None):
         raise ValueError('Supply both higher-timeframe candles and their timeframe')
     higher_count = 0
@@ -409,7 +441,11 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
             exited = qty == 0
         if qty == 0 and not exited:
             signal_args = {'rapid': True} if rapid else {}
-            filter_args = dict(signal_args)
+            if trend_rule:
+                signal_args = {'trend': True}
+            filter_args = {'rapid': True} if rapid else {}
+            if trend_rule:
+                filter_args['trend_rule'] = True
             if not filters:
                 filter_args['filters'] = False
             if market is not None:
@@ -430,7 +466,7 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
                     slippage_costs += qty * (price - market_open)
                     highest = entry_fill = price
                     stop = price * (1 - fraction)
-                    target = price * (1 + 2.75 * fraction)
+                    target = price * (TREND_TARGET_MULTIPLE if trend_rule else 1 + 2.75 * fraction)
                     executions.append({'type': 'buy', 'time': int(bar['timestamp']),
                                        'price': price, 'size_usdt': budget,
                                        'quantity': qty, 'fee_usdt': entry_fee})
@@ -447,9 +483,9 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
                 # This stop is active on the NEXT candle, never retroactively.
                 # It trails only once the high is TRAIL_ARM_ATR above the entry
                 # fill, as in the engine (decision.evaluate_exit).
-                if trail_armed(highest, entry_fill, float(bar['atr'])):
+                if not trend_rule and trail_armed(highest, entry_fill, float(bar['atr'])):
                     stop = max(stop, highest - 2.5 * float(bar['atr']))
-                pending_trend_exit = float(bar['close']) < float(bar['ema50'])
+                pending_trend_exit = trend_broken(bar, trend_rule=trend_rule)
         liquidation = qty * float(bar['close']) * (1 - slip) * (1 - fee)
         equity = cash + liquidation
         peak = max(peak, equity)

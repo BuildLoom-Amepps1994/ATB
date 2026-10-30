@@ -115,3 +115,22 @@ At doubled costs the 12-pair holdout is -0.6 %. The rule kept most of the
 gains of rising markets and avoided most of the falls, but over the last 18
 months, when most of these coins fell, it roughly broke even. It is the most
 consistent result in this research, not a demonstrated profit.
+
+## The Trend strategy in the app (2026-10-30)
+
+The 100-day rule is now a strategy in the app: **Trend · PAPER only**. It buys
+a pair whose completed daily close is above its 100-day average and sells at
+the next check after a close below it. It keeps the app's risk sizing, a 25 %
+disaster stop, no trailing stop and no profit target, and it refuses live
+trading at every boundary that refuses live Micro. Its backtest, through the
+same `strategy.backtest` and walk-forward (`--profiles trend`), on the 11
+pairs the backtest accepts, realistic costs:
+
+| Split | Account mean | Buy and hold mean | Trades | Mean closed trade |
+| --- | --- | --- | --- | --- |
+| Development | +17.2 % | +1,570 % | 353 | +17.7 % (t 2.7) |
+| Validation | +1.8 % | +62.5 % | 135 | +5.6 % (t 1.8) |
+| Holdout | -0.1 % | -21.7 % | 109 | -2.2 % (t -1.9) |
+
+The account figures are small because each entry is sized from the 0.65 %
+risk budget over the 25 % stop, about 2.6 % of the account.

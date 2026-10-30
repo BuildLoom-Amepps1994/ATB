@@ -105,7 +105,7 @@ def evaluate_entry(*, symbol: str, last, regime_ok: bool, market_ok: bool | None
                    quote_ts: float | None, cfg: dict, now: float, held: bool = False,
                    exited_this_candle: bool = False, higher_candle_ts: int | None = None,
                    higher_error: str | None = None, signal_fn=None, price_ok_fn=None,
-                   quality_fn=None) -> Decision:
+                   quality_fn=None, trend_rule: bool = False) -> Decision:
     """Entry decision for one symbol from already-computed, completed-candle features.
 
     ``last`` is the indicator row of the last *completed* primary candle;
@@ -133,17 +133,23 @@ def evaluate_entry(*, symbol: str, last, regime_ok: bool, market_ok: bool | None
     # The indicator values the rule saw, so the record replays on its own and
     # two different candles never share a decision id.
     features = {key: _finite(last.get(key)) for key in FEATURE_KEYS}
+    if trend_rule:
+        features['sma100'] = _finite(last.get('sma100'))
     inputs = {'signal_candle_ts_ms': int(signal_ts) if signal_ts else None,
               'higher_candle_ts_ms': higher_candle_ts, 'quote_ts': quote_ts, 'quote_age_s': quote_age_s,
               'price': price, 'volume': volume, 'spread_pct': spread_pct, 'regime_ok': bool(regime_ok),
               'market_ok': market_ok, 'rapid': rapid, 'filters': filters, 'features': features,
               'limits': {'min_quote_volume': cfg['min_quote_volume'], 'max_spread_pct': cfg['max_spread_pct'],
                          'data_max_age_seconds': cfg['data_max_age_seconds']}}
+    if trend_rule:
+        inputs['trend_rule'] = True
     if higher_error:
         signal, status, score = False, f'Higher-timeframe data unavailable: {higher_error}', 0
         check('higher_timeframe_data', False, status)
     else:
-        signal, status, score = signal_fn(last, regime_ok=regime_ok, rapid=rapid, market_ok=market_ok, filters=filters)
+        extra = {'trend_rule': True} if trend_rule else {}
+        signal, status, score = signal_fn(last, regime_ok=regime_ok, rapid=rapid, market_ok=market_ok, filters=filters,
+                                          **extra)
         check('strategy_signal', signal, status, score=score)
     liquid = volume >= cfg['min_quote_volume']
     check('liquidity', liquid, STATUS_LOW_VOLUME, value=volume, threshold=cfg['min_quote_volume'])

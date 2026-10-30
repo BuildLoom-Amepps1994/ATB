@@ -82,3 +82,36 @@ the selection rule, so none was built and the holdout was not read.
 
 At doubled costs every rule loses clearly. With Rapid, Balanced and Micro,
 that makes four fast approaches with no edge after costs on these markets.
+
+## Out-of-sample pairs and a plain daily trend rule (2026-10-30)
+
+**Position and Swing on 20 pairs never used for selection** (NEAR, INJ, BCH,
+ZEC, XMR, FIL, RUNE, CAKE, CRV, UNI, DASH, ATOM, ETC, AAVE, XLM, HBAR, ALGO,
+VET, GRT, SAND), realistic costs:
+
+| Strategy | Development mean trade | Validation mean trade | Holdout mean trade | Holdout account |
+| --- | --- | --- | --- | --- |
+| Position | +2.63 % (t 1.1) | +2.95 % (t 1.2) | -3.06 % (16 trades) | -0.16 % |
+| Swing | -0.02 % | -0.61 % | -0.77 % (235 trades) | -0.63 % |
+
+Swing's edge on the 12 selection pairs did not carry over. Position held up
+before the holdout and lost in it.
+
+**Daily trend rule** (`research/trend_research.py`, `trend-research-v1`): hold
+a pair while its daily close is above its N-day average, else cash. N was
+chosen from 50, 100 and 200 on the 12 selection pairs (development and
+validation, realistic costs): N = 100. Sleeve returns, fully invested while
+the rule holds:
+
+| Pairs and split | Rule, mean (median) | Buy and hold, mean | Pairs positive |
+| --- | --- | --- | --- |
+| 12 selection pairs, validation | +41.9 % (+13.0 %) | +53.4 % | 9 of 12 |
+| 12 selection pairs, holdout | +1.4 % (-2.1 %) | -24.6 % | 6 of 12 |
+| 20 other pairs, development | +208.9 % (+66.1 %) | +125.9 % | 12 of 19 |
+| 20 other pairs, validation | +16.1 % (+9.2 %) | -1.9 % | 12 of 19 |
+| 20 other pairs, holdout | +65.4 % (-19.5 %) | +140.2 % | 8 of 20 |
+
+At doubled costs the 12-pair holdout is -0.6 %. The rule kept most of the
+gains of rising markets and avoided most of the falls, but over the last 18
+months, when most of these coins fell, it roughly broke even. It is the most
+consistent result in this research, not a demonstrated profit.

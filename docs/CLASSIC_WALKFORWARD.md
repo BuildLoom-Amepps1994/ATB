@@ -67,3 +67,18 @@ verdict is NOT SHOWN. Most of the gain came from BNB, TRX and XRP.
   28 October 2026.
 * Rapid (1m/5m) was not part of this protocol; on 14 days of 1-minute candles
   it had no edge even at zero cost (see the 2026-10-29 paper run report).
+
+## Short-horizon dip buying (research/dip_research.py, 2026-10-30)
+
+Three rules that buy a sharp 1-hour dip and sell on the bounce were tested on
+the same 12 pairs and splits, fixed in advance (`dip-research-v1`). None met
+the selection rule, so none was built and the holdout was not read.
+
+| Rule | Development mean trade (t) | Validation mean trade (t) | Validation trades |
+| --- | --- | --- | --- |
+| A: RSI(2) < 5 above EMA(200) | +0.06 % (1.8) | -0.09 % (-2.1) | 1,365 |
+| B: z-score < -2.5 above EMA(200) | -0.08 % (-0.9) | -0.02 % (-0.1) | 369 |
+| C: RSI(2) < 5, no trend filter | -0.07 % (-3.2) | -0.11 % (-3.6) | 4,401 |
+
+At doubled costs every rule loses clearly. Together with Rapid and Balanced,
+this is the fourth fast approach with no edge after costs on these markets.

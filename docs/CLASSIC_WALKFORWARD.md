@@ -80,5 +80,5 @@ the selection rule, so none was built and the holdout was not read.
 | B: z-score < -2.5 above EMA(200) | -0.08 % (-0.9) | -0.02 % (-0.1) | 369 |
 | C: RSI(2) < 5, no trend filter | -0.07 % (-3.2) | -0.11 % (-3.6) | 4,401 |
 
-At doubled costs every rule loses clearly. Together with Rapid and Balanced,
-this is the fourth fast approach with no edge after costs on these markets.
+At doubled costs every rule loses clearly. With Rapid, Balanced and Micro,
+that makes four fast approaches with no edge after costs on these markets.

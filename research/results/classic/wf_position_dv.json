@@ -1,0 +1,1218 @@
+{
+ "protocol": {
+  "version": "classic-walkforward-v1",
+  "splits": {
+   "development": [
+    null,
+    "2024-01-01"
+   ],
+   "validation": [
+    "2024-01-01",
+    "2025-05-01"
+   ],
+   "holdout": [
+    "2025-05-01",
+    null
+   ]
+  },
+  "costs": {
+   "realistic": [
+    0.05,
+    0.05
+   ],
+   "doubled": [
+    0.1,
+    0.1
+   ],
+   "app": [
+    0.1,
+    0.2
+   ]
+  },
+  "sizing": {
+   "risk_pct": 0.65,
+   "max_position_pct": 8.0
+  },
+  "random_runs": 30,
+  "verdict": "holdout mean trade > 0 and account > 0 at realistic and doubled costs, account > random-entry mean + 2 sd"
+ },
+ "protocol_sha256": "f75da8dad86ee9bd23710ac3d2ff139fd84fc6b83790b91a0b1658a88253da2b",
+ "filters": true,
+ "generated_utc": "2026-10-29T23:05:42Z",
+ "results": {
+  "position/realistic": {
+   "pairs": {
+    "BTC": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 4.42,
+       "buy_hold_pct": 415.02,
+       "max_drawdown_pct": 1.49,
+       "trades": [
+        0.2711536270260253,
+        0.07538395997766499,
+        -0.1007893614869304,
+        0.10715850622845814,
+        0.034810877745899395,
+        0.16126985875377972,
+        0.09672854215517232
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 1.15,
+       "buy_hold_pct": 122.27,
+       "max_drawdown_pct": 1.31,
+       "trades": [
+        0.18564471266150362,
+        -0.06728131539424514,
+        -0.07809782601915377,
+        -0.024069801986697805,
+        0.2067897302873618,
+        -0.0856335517958232
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "ETH": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 4.27,
+       "buy_hold_pct": 1472.08,
+       "max_drawdown_pct": 0.8,
+       "trades": [
+        0.32800632933533247,
+        -0.03305569457755486,
+        0.32800632933533264,
+        0.13678669093137316,
+        0.03831609827794474,
+        -0.020470534790771964
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 0.89,
+       "buy_hold_pct": -21.55,
+       "max_drawdown_pct": 0.77,
+       "trades": [
+        -0.06591151613636755,
+        0.20034166848713286,
+        -0.03938797515054471,
+        -0.0064391672884728385
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "SOL": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 1.01,
+       "buy_hold_pct": 6457.1,
+       "max_drawdown_pct": 1.63,
+       "trades": [
+        -0.01608881448430154,
+        -0.1213191204397801,
+        0.3280063293353326
+       ],
+       "evaluation_bars": 1156,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 0.99,
+       "buy_hold_pct": 44.73,
+       "max_drawdown_pct": 2.59,
+       "trades": [
+        0.3280063293353327,
+        -0.04432547796694839,
+        -0.11695777436327294,
+        -0.10245843239321246,
+        -0.10867961158520391,
+        0.32800632933533247,
+        -0.057386251390972566
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "XRP": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 3.69,
+       "buy_hold_pct": 190.06,
+       "max_drawdown_pct": 1.01,
+       "trades": [
+        -0.09554795608200922,
+        0.3280063293353328,
+        0.32800632933533247,
+        0.09403095718654547
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -2.0,
+       "buy_hold_pct": 255.25,
+       "max_drawdown_pct": 2.02,
+       "trades": [
+        -0.10533648450322719,
+        -0.1213191204397802,
+        -0.02745410865053279,
+        -0.09620199657567662
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "DOGE": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 3.33,
+       "buy_hold_pct": 3954.21,
+       "max_drawdown_pct": 1.03,
+       "trades": [
+        0.3280063293353327,
+        0.3280063293353324,
+        -0.038709255649663474
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 2.6,
+       "buy_hold_pct": 91.96,
+       "max_drawdown_pct": 0.82,
+       "trades": [
+        0.245506310406816,
+        -0.04814407904090344,
+        0.32800632933533247,
+        -0.12131912043977992
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "ADA": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": -0.09,
+       "buy_hold_pct": 1505.8,
+       "max_drawdown_pct": 1.82,
+       "trades": [
+        0.32800632933533225,
+        -0.12131912043978015,
+        -0.08123829740596974,
+        -0.1213191204397801,
+        -0.017692537237492065
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 0.0,
+       "buy_hold_pct": 14.55,
+       "max_drawdown_pct": 0.0,
+       "trades": [],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "LINK": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": -2.93,
+       "buy_hold_pct": 569.56,
+       "max_drawdown_pct": 3.56,
+       "trades": [
+        -0.12131912043978009,
+        -0.12131912043977987,
+        0.028799236672545962,
+        -0.12131912043978006,
+        -0.027265342148713043,
+        -0.07001935805575689,
+        -0.12131912043978003
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -0.97,
+       "buy_hold_pct": -4.49,
+       "max_drawdown_pct": 1.96,
+       "trades": [
+        0.06139756290009449,
+        -0.12082995208447338,
+        -0.12131912043977981
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "AVAX": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "skipped": "Candle high/low contradict its open or close"
+      },
+      "validation": {
+       "skipped": "Candle high/low contradict its open or close"
+      }
+     }
+    },
+    "LTC": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 1.7,
+       "buy_hold_pct": 48.13,
+       "max_drawdown_pct": 1.8,
+       "trades": [
+        -0.006267677437978689,
+        0.32800632933533264,
+        -0.010040113317925727,
+        0.08045170266515776,
+        0.0779827947677227,
+        -0.030982811734968682,
+        -0.12131912043977992
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -0.22,
+       "buy_hold_pct": 14.45,
+       "max_drawdown_pct": 0.93,
+       "trades": [
+        0.013268033788022856,
+        -0.053547355594298934
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "BNB": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 6.04,
+       "buy_hold_pct": 1967.69,
+       "max_drawdown_pct": 0.88,
+       "trades": [
+        0.060235172920595714,
+        0.3280063293353324,
+        0.32800632933533247,
+        0.3273793862310018,
+        -0.052989841462530884,
+        0.1123220290198318
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 2.51,
+       "buy_hold_pct": 92.01,
+       "max_drawdown_pct": 0.87,
+       "trades": [
+        0.17496160626422352,
+        0.29972410221423335,
+        -0.04235616647197401,
+        -0.05838499887279608
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "TRX": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 0.43,
+       "buy_hold_pct": 631.98,
+       "max_drawdown_pct": 2.06,
+       "trades": [
+        0.029955898211109448,
+        -0.12131912043978012,
+        -0.12131912043978003,
+        0.04979502042354502,
+        -0.042982269505941875,
+        0.18895788630415733,
+        -0.07725383537768461,
+        0.10891336790094239,
+        -0.048123837807947115,
+        0.019503169042817268
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -0.6,
+       "buy_hold_pct": 128.36,
+       "max_drawdown_pct": 2.02,
+       "trades": [
+        0.14576777658504825,
+        -0.041930733393699855,
+        0.011742019103969992,
+        -0.0484592063886932,
+        0.015658302807535423,
+        -0.0027064612019460066,
+        -0.03777870635553224,
+        -0.09123729925144919
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 1
+      }
+     }
+    },
+    "DOT": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": -0.27,
+       "buy_hold_pct": 56.05,
+       "max_drawdown_pct": 0.61,
+       "trades": [],
+       "evaluation_bars": 1111,
+       "open_at_end": 1
+      },
+      "validation": {
+       "return_pct": -0.39,
+       "buy_hold_pct": -50.52,
+       "max_drawdown_pct": 1.34,
+       "trades": [
+        -0.013154002750595133,
+        0.057646533638095125,
+        -0.12131912043978008
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    }
+   },
+   "summary": {
+    "development": {
+     "pairs": 11,
+     "account_mean_pct": 1.964,
+     "buy_hold_mean_pct": 1569.789,
+     "worst_drawdown_pct": 3.56,
+     "trades": 58,
+     "wins": 31,
+     "mean_trade_pct": 6.4229,
+     "t_stat": 3.03
+    },
+    "validation": {
+     "pairs": 11,
+     "account_mean_pct": 0.36,
+     "buy_hold_mean_pct": 62.456,
+     "worst_drawdown_pct": 2.59,
+     "trades": 45,
+     "wins": 15,
+     "mean_trade_pct": 1.1845,
+     "t_stat": 0.58
+    }
+   }
+  },
+  "position/doubled": {
+   "pairs": {
+    "BTC": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 4.3,
+       "buy_hold_pct": 413.99,
+       "max_drawdown_pct": 1.48,
+       "trades": [
+        0.26924784883963804,
+        0.07323534014039221,
+        -0.10213750382268821,
+        0.10494640076843527,
+        0.03274332302823674,
+        0.1595288239030198,
+        0.09453727578941137
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 1.09,
+       "buy_hold_pct": 121.83,
+       "max_drawdown_pct": 1.34,
+       "trades": [
+        0.18386713378971734,
+        -0.06914488965508885,
+        -0.07947998865929544,
+        -0.02601971295922967,
+        0.20498044972941812,
+        -0.08700441649250758
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "ETH": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 4.14,
+       "buy_hold_pct": 1468.94,
+       "max_drawdown_pct": 0.82,
+       "trades": [
+        0.32601531468531497,
+        -0.03498765171425239,
+        0.32601531468531497,
+        0.13451538828433193,
+        0.03624154012090642,
+        -0.022427637108148473
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 0.85,
+       "buy_hold_pct": -21.71,
+       "max_drawdown_pct": 0.77,
+       "trades": [
+        -0.06777782725954927,
+        0.19854205519147883,
+        -0.041307280374845524,
+        -0.008424304313154916
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "SOL": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 0.97,
+       "buy_hold_pct": 6444.0,
+       "max_drawdown_pct": 1.62,
+       "trades": [
+        -0.01805467148979124,
+        -0.12263648351648337,
+        0.32601531468531514
+       ],
+       "evaluation_bars": 1156,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 0.91,
+       "buy_hold_pct": 44.44,
+       "max_drawdown_pct": 2.58,
+       "trades": [
+        0.32601531468531475,
+        -0.0462349180482931,
+        -0.11828167619189357,
+        -0.10380407237295497,
+        -0.11001592445660525,
+        0.32601531468531464,
+        -0.0592695960144033
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "XRP": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 3.6,
+       "buy_hold_pct": 189.48,
+       "max_drawdown_pct": 1.0,
+       "trades": [
+        -0.097355053524177,
+        0.32601531468531497,
+        0.3260153146853149,
+        0.09184508060228777
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -2.01,
+       "buy_hold_pct": 254.54,
+       "max_drawdown_pct": 2.02,
+       "trades": [
+        -0.1066778095608283,
+        -0.12263648351648335,
+        -0.029397257769899376,
+        -0.0980077872433053
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "DOGE": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 3.26,
+       "buy_hold_pct": 3946.11,
+       "max_drawdown_pct": 1.02,
+       "trades": [
+        0.32601531468531497,
+        0.32601531468531453,
+        -0.040629916957221755
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 2.52,
+       "buy_hold_pct": 91.57,
+       "max_drawdown_pct": 0.82,
+       "trades": [
+        0.24363898398228728,
+        -0.05004588954776706,
+        0.3260153146853147,
+        -0.12263648351648346
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "ADA": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": -0.14,
+       "buy_hold_pct": 1502.59,
+       "max_drawdown_pct": 1.83,
+       "trades": [
+        0.3260153146853152,
+        -0.1226364835164834,
+        -0.08307398558190363,
+        -0.12263648351648344,
+        -0.019655190000916544
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 0.0,
+       "buy_hold_pct": 14.32,
+       "max_drawdown_pct": 0.0,
+       "trades": [],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "LINK": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": -2.96,
+       "buy_hold_pct": 568.22,
+       "max_drawdown_pct": 3.57,
+       "trades": [
+        -0.12263648351648347,
+        -0.12263648351648355,
+        0.026743693228759028,
+        -0.12263648351648349,
+        -0.02920886842402166,
+        -0.07187746170052588,
+        -0.12263648351648339
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -0.99,
+       "buy_hold_pct": -4.69,
+       "max_drawdown_pct": 1.95,
+       "trades": [
+        0.05927688791910699,
+        -0.12214804854726068,
+        -0.12263648351648333
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "AVAX": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "skipped": "Candle high/low contradict its open or close"
+      },
+      "validation": {
+       "skipped": "Candle high/low contradict its open or close"
+      }
+     }
+    },
+    "LTC": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 1.61,
+       "buy_hold_pct": 47.84,
+       "max_drawdown_pct": 1.79,
+       "trades": [
+        -0.00825315709981069,
+        0.3260153146853148,
+        -0.012018055643449951,
+        0.07829295746534108,
+        0.0758289824520503,
+        -0.03291891049676111,
+        -0.12263648351648353
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -0.23,
+       "buy_hold_pct": 14.22,
+       "max_drawdown_pct": 0.92,
+       "trades": [
+        0.011243521726380892,
+        -0.05543837034111707
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "BNB": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 5.91,
+       "buy_hold_pct": 1963.56,
+       "max_drawdown_pct": 0.88,
+       "trades": [
+        0.05811682039768924,
+        0.32601531468531453,
+        0.32601531468531486,
+        0.32538931152598144,
+        -0.0548819701239764,
+        0.11009960682837852
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 2.45,
+       "buy_hold_pct": 91.63,
+       "max_drawdown_pct": 0.86,
+       "trades": [
+        0.1732000440490414,
+        0.2977754897179474,
+        -0.04426954124260259,
+        -0.06026634799626376
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "TRX": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 0.32,
+       "buy_hold_pct": 630.51,
+       "max_drawdown_pct": 2.07,
+       "trades": [
+        0.02789804375468025,
+        -0.12263648351648347,
+        -0.12263648351648324,
+        0.04769752735139708,
+        -0.04489439332114542,
+        0.18717534015389153,
+        -0.07863726337153337,
+        0.10725082856485645,
+        -0.04955093897611377,
+        0.017466199165366902
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -0.72,
+       "buy_hold_pct": 127.9,
+       "max_drawdown_pct": 2.09,
+       "trades": [
+        0.14404998324452947,
+        -0.04384495818068164,
+        0.009720556023476984,
+        -0.0498858047552218,
+        0.013629014982423578,
+        -0.004699056182709553,
+        -0.039221317471070966,
+        -0.0925997625248624
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 1
+      }
+     }
+    },
+    "DOT": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": -0.28,
+       "buy_hold_pct": 55.73,
+       "max_drawdown_pct": 0.6,
+       "trades": [],
+       "evaluation_bars": 1111,
+       "open_at_end": 1
+      },
+      "validation": {
+       "return_pct": -0.41,
+       "buy_hold_pct": -50.62,
+       "max_drawdown_pct": 1.33,
+       "trades": [
+        -0.01512572351725694,
+        0.055533353222939556,
+        -0.12263648351648346
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    }
+   },
+   "summary": {
+    "development": {
+     "pairs": 11,
+     "account_mean_pct": 1.885,
+     "buy_hold_mean_pct": 1566.452,
+     "worst_drawdown_pct": 3.57,
+     "trades": 58,
+     "wins": 31,
+     "mean_trade_pct": 6.238,
+     "t_stat": 2.95
+    },
+    "validation": {
+     "pairs": 11,
+     "account_mean_pct": 0.315,
+     "buy_hold_mean_pct": 62.13,
+     "worst_drawdown_pct": 2.58,
+     "trades": 45,
+     "wins": 15,
+     "mean_trade_pct": 1.0101,
+     "t_stat": 0.49
+    }
+   }
+  },
+  "position/app": {
+   "pairs": {
+    "BTC": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 4.2,
+       "buy_hold_pct": 412.96,
+       "max_drawdown_pct": 1.47,
+       "trades": [
+        0.26797733047243094,
+        0.07109100950208816,
+        -0.10303626508012301,
+        0.1027387112410467,
+        0.03067989568267115,
+        0.15836813438960293,
+        0.09235038375608194
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 1.04,
+       "buy_hold_pct": 121.38,
+       "max_drawdown_pct": 1.39,
+       "trades": [
+        0.18268208160374158,
+        -0.07100474374140076,
+        -0.08040143011208895,
+        -0.027965731406900483,
+        0.20377426309305216,
+        -0.08791832598550797
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "ETH": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 4.04,
+       "buy_hold_pct": 1465.8,
+       "max_drawdown_pct": 0.83,
+       "trades": [
+        0.32468797202797217,
+        -0.03691575216657243,
+        0.32468797202797234,
+        0.13224861974276772,
+        0.034171123316635445,
+        -0.024380832544886214
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 0.81,
+       "buy_hold_pct": -21.87,
+       "max_drawdown_pct": 0.77,
+       "trades": [
+        -0.06964041274471586,
+        0.19734231339449035,
+        -0.04322275417124704,
+        -0.010405478492697483
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "SOL": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 0.94,
+       "buy_hold_pct": 6430.93,
+       "max_drawdown_pct": 1.61,
+       "trades": [
+        -0.020016604138029057,
+        -0.12351472527472532,
+        0.32468797202797245
+       ],
+       "evaluation_bars": 1156,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 0.86,
+       "buy_hold_pct": 44.15,
+       "max_drawdown_pct": 2.58,
+       "trades": [
+        0.3246879720279724,
+        -0.0481405463951064,
+        -0.11916427711662636,
+        -0.10470116539360286,
+        -0.11090679940709924,
+        0.3246879720279724,
+        -0.06114918099656229
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "XRP": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 3.53,
+       "buy_hold_pct": 188.9,
+       "max_drawdown_pct": 1.0,
+       "trades": [
+        -0.0991585435340987,
+        0.3246879720279722,
+        0.3246879720279722,
+        0.08966356759106872
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -2.03,
+       "buy_hold_pct": 253.83,
+       "max_drawdown_pct": 2.03,
+       "trades": [
+        -0.10757202596767435,
+        -0.12351472527472503,
+        -0.0313365278628068,
+        -0.09980997308734613
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "DOGE": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 3.21,
+       "buy_hold_pct": 3938.03,
+       "max_drawdown_pct": 1.01,
+       "trades": [
+        0.32468797202797217,
+        0.3246879720279719,
+        -0.04254674412978912
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 2.47,
+       "buy_hold_pct": 91.19,
+       "max_drawdown_pct": 0.82,
+       "trades": [
+        0.24239410011443707,
+        -0.05194390355069673,
+        0.3246879720279726,
+        -0.1235147252747252
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "ADA": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": -0.17,
+       "buy_hold_pct": 1499.39,
+       "max_drawdown_pct": 1.85,
+       "trades": [
+        0.3246879720279724,
+        -0.12351472527472503,
+        -0.08490600925111798,
+        -0.12351472527472517,
+        -0.021613924803581777
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 0.0,
+       "buy_hold_pct": 14.09,
+       "max_drawdown_pct": 0.0,
+       "trades": [],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "LINK": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": -2.99,
+       "buy_hold_pct": 566.89,
+       "max_drawdown_pct": 3.58,
+       "trades": [
+        -0.12351472527472508,
+        -0.12351472527472536,
+        0.024692253179470568,
+        -0.12351472527472522,
+        -0.031148514919970838,
+        -0.073731856091523,
+        -0.12351472527472517
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -1.0,
+       "buy_hold_pct": -4.88,
+       "max_drawdown_pct": 1.95,
+       "trades": [
+        0.05716044635195252,
+        -0.1230267792293957,
+        -0.12351472527472517
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "AVAX": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "skipped": "Candle high/low contradict its open or close"
+      },
+      "validation": {
+       "skipped": "Candle high/low contradict its open or close"
+      }
+     }
+    },
+    "LTC": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 1.53,
+       "buy_hold_pct": 47.54,
+       "max_drawdown_pct": 1.79,
+       "trades": [
+        -0.010234673232510967,
+        0.3246879720279724,
+        -0.013992049486307973,
+        0.076138521677327,
+        0.073679469700872,
+        -0.034851144306425656,
+        -0.12351472527472511
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -0.25,
+       "buy_hold_pct": 13.99,
+       "max_drawdown_pct": 0.93,
+       "trades": [
+        0.00922305111260041,
+        -0.05732561013512024
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "BNB": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 5.81,
+       "buy_hold_pct": 1959.44,
+       "max_drawdown_pct": 0.88,
+       "trades": [
+        0.05600269665239167,
+        0.32468797202797217,
+        0.3246879720279723,
+        0.3240625954984281,
+        -0.05677032160894674,
+        0.10788162116441392
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": 2.4,
+       "buy_hold_pct": 91.24,
+       "max_drawdown_pct": 0.86,
+       "trades": [
+        0.17202566963057378,
+        0.29647641515366513,
+        -0.04617909642404669,
+        -0.06214394146199246
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    },
+    "TRX": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": 0.22,
+       "buy_hold_pct": 629.05,
+       "max_drawdown_pct": 2.08,
+       "trades": [
+        0.025844297306126383,
+        -0.12351472527472525,
+        -0.12351472527472518,
+        0.045604221416017804,
+        -0.04680270004439343,
+        0.1859869764500337,
+        -0.07955954839318341,
+        0.1061424693771039,
+        -0.0505023394375992,
+        0.015433295604789675
+       ],
+       "evaluation_bars": 1451,
+       "open_at_end": 0
+      },
+      "validation": {
+       "return_pct": -0.82,
+       "buy_hold_pct": 127.45,
+       "max_drawdown_pct": 2.17,
+       "trades": [
+        0.1429047880661068,
+        -0.04575536168162627,
+        0.007703128304293777,
+        -0.05083687001572708,
+        0.011603778138828597,
+        -0.006687673430331274,
+        -0.04018305789402311,
+        -0.0935080710708837
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 1
+      }
+     }
+    },
+    "DOT": {
+     "filled_bars": 0,
+     "splits": {
+      "development": {
+       "return_pct": -0.28,
+       "buy_hold_pct": 55.42,
+       "max_drawdown_pct": 0.6,
+       "trades": [],
+       "evaluation_bars": 1111,
+       "open_at_end": 1
+      },
+      "validation": {
+       "return_pct": -0.44,
+       "buy_hold_pct": -50.72,
+       "max_drawdown_pct": 1.32,
+       "trades": [
+        -0.017093508221088228,
+        0.05342439126053211,
+        -0.12351472527472526
+       ],
+       "evaluation_bars": 486,
+       "open_at_end": 0
+      }
+     }
+    }
+   },
+   "summary": {
+    "development": {
+     "pairs": 11,
+     "account_mean_pct": 1.822,
+     "buy_hold_mean_pct": 1563.123,
+     "worst_drawdown_pct": 3.58,
+     "trades": 58,
+     "wins": 31,
+     "mean_trade_pct": 6.0811,
+     "t_stat": 2.87
+    },
+    "validation": {
+     "pairs": 11,
+     "account_mean_pct": 0.276,
+     "buy_hold_mean_pct": 61.805,
+     "worst_drawdown_pct": 2.58,
+     "trades": 45,
+     "wins": 15,
+     "mean_trade_pct": 0.8638,
+     "t_stat": 0.42
+    }
+   }
+  }
+ },
+ "runtime_s": 1.2
+}

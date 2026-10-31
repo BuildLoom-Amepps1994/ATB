@@ -53,3 +53,19 @@ def test_a_sell_walks_the_bids_into_the_second_level():
 def test_an_unusable_book_falls_back_to_the_configured_slippage(book):
     order = exchange(book).create_market_buy_order_with_cost('BTC/USDT', 150.0, {'reference_price': 100.01})
     assert order['average'] == pytest.approx(100.01 * 1.002) and order['info']['fill_model'] == 'flat slippage'
+
+
+@pytest.mark.parametrize('taker, expected_fee, source', [
+    (0.0005, 150.0 * 0.0005, 'published taker'),      # MEXC's public spot taker rate
+    (0.0026, 150.0 * 0.0026, 'published taker'),      # Kraken's, above the configured 0.1 %
+    (None, 0.15, 'configured'),                        # not published
+    ('x', 0.15, 'configured'),                         # malformed
+    (0.5, 0.15, 'configured'),                         # 50 %: a catalogue error
+    (True, 0.15, 'configured'),
+])
+def test_the_paper_fee_is_the_published_taker_rate_when_the_catalogue_has_one(taker, expected_fee, source):
+    markets = {'BTC/USDT': {'symbol': 'BTC/USDT', 'spot': True, 'active': True, 'taker': taker}}
+    venue = paper_exchange.PaperExchange('mexc', catalogue=lambda: markets, settings=lambda: SETTINGS,
+                                         balances=lambda: {'USDT': 10_000.0})
+    order = venue.create_market_buy_order_with_cost('BTC/USDT', 150.0, {'reference_price': 100.0})
+    assert order['fee']['cost'] == pytest.approx(expected_fee) and order['info']['fee_source'] == source

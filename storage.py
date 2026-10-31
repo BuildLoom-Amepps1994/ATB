@@ -48,7 +48,7 @@ DEFAULTS = {
 MICRO_FIELDS = ('micro_budget_usdt', 'micro_max_cycles', 'micro_target_net_bps', 'micro_max_loss_bps',
                 'micro_max_hold_minutes', 'micro_cooldown_seconds', 'micro_max_consecutive_losses',
                 'micro_daily_loss_limit_usdt', 'micro_latency_bps', 'micro_book_max_age_seconds')
-HORIZON_CHOICES = ('rapid', 'balanced', 'swing', 'position', 'micro')
+HORIZON_CHOICES = ('rapid', 'balanced', 'swing', 'position', 'micro', 'trend')
 BOUNDS = {
     'discovered_pairs': (0, 12), 'min_quote_volume': (1000000, 1000000000),
     'max_spread_pct': (0.05, 2.0), 'scan_seconds': (10, 3600),

@@ -23,7 +23,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from strategy import MIN_EFFICIENCY, entry_price_ok, entry_signal, setup_quality
+from strategy import MIN_EFFICIENCY, entry_price_ok, entry_signal, setup_quality, trail_armed
 
 DECISION_VERSION = 'entry-v1'
 FEATURE_KEYS = ('close', 'volume', 'ema20', 'ema50', 'rsi', 'atr', 'vol_avg20', 'prior_high20', 'efficiency')
@@ -105,7 +105,7 @@ def evaluate_entry(*, symbol: str, last, regime_ok: bool, market_ok: bool | None
                    quote_ts: float | None, cfg: dict, now: float, held: bool = False,
                    exited_this_candle: bool = False, higher_candle_ts: int | None = None,
                    higher_error: str | None = None, signal_fn=None, price_ok_fn=None,
-                   quality_fn=None) -> Decision:
+                   quality_fn=None, trend_rule: bool = False) -> Decision:
     """Entry decision for one symbol from already-computed, completed-candle features.
 
     ``last`` is the indicator row of the last *completed* primary candle;
@@ -133,17 +133,23 @@ def evaluate_entry(*, symbol: str, last, regime_ok: bool, market_ok: bool | None
     # The indicator values the rule saw, so the record replays on its own and
     # two different candles never share a decision id.
     features = {key: _finite(last.get(key)) for key in FEATURE_KEYS}
+    if trend_rule:
+        features['sma100'] = _finite(last.get('sma100'))
     inputs = {'signal_candle_ts_ms': int(signal_ts) if signal_ts else None,
               'higher_candle_ts_ms': higher_candle_ts, 'quote_ts': quote_ts, 'quote_age_s': quote_age_s,
               'price': price, 'volume': volume, 'spread_pct': spread_pct, 'regime_ok': bool(regime_ok),
               'market_ok': market_ok, 'rapid': rapid, 'filters': filters, 'features': features,
               'limits': {'min_quote_volume': cfg['min_quote_volume'], 'max_spread_pct': cfg['max_spread_pct'],
                          'data_max_age_seconds': cfg['data_max_age_seconds']}}
+    if trend_rule:
+        inputs['trend_rule'] = True
     if higher_error:
         signal, status, score = False, f'Higher-timeframe data unavailable: {higher_error}', 0
         check('higher_timeframe_data', False, status)
     else:
-        signal, status, score = signal_fn(last, regime_ok=regime_ok, rapid=rapid, market_ok=market_ok, filters=filters)
+        extra = {'trend_rule': True} if trend_rule else {}
+        signal, status, score = signal_fn(last, regime_ok=regime_ok, rapid=rapid, market_ok=market_ok, filters=filters,
+                                          **extra)
         check('strategy_signal', signal, status, score=score)
     liquid = volume >= cfg['min_quote_volume']
     check('liquidity', liquid, STATUS_LOW_VOLUME, value=volume, threshold=cfg['min_quote_volume'])
@@ -188,6 +194,18 @@ def evaluate_entry(*, symbol: str, last, regime_ok: bool, market_ok: bool | None
                     confidence=confidence, inputs=inputs, proposal=proposal)
 
 
+def entry_reference(position: dict) -> float | None:
+    """The position's entry fill price, or None when the row cannot say."""
+    try:
+        entry = float(position.get('entry_price') or 0.0)
+        if not (math.isfinite(entry) and entry > 0):
+            qty, cost = float(position.get('qty') or 0.0), float(position.get('cost') or 0.0)
+            entry = cost / qty if qty > 0 else 0.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return entry if math.isfinite(entry) and entry > 0 else None
+
+
 def evaluate_exit(position: dict, price: float, *, atr: float | None = None, trend_broken: bool = False,
                   dust: bool = False, trailing_multiple: float = 2.5) -> dict:
     """Exit policy for one tracked position at an observed executable bid.
@@ -200,11 +218,13 @@ def evaluate_exit(position: dict, price: float, *, atr: float | None = None, tre
     has always used: a stored stop or target first (``trigger='stored'``),
     then the updated trailing stop (``'trailing'``), then a completed-candle
     trend reversal (``'trend'``). A verified sub-minimum remainder is skipped
-    (``skip``) rather than ordered.
+    (``skip``) rather than ordered. The trailing stop ratchets only once the
+    high is ``TRAIL_ARM_ATR`` ATRs above the entry fill (:func:`trail_armed`).
     """
     highest, stop, target = float(position['highest']), float(position['stop']), float(position['target'])
     trailing = atr is not None and math.isfinite(atr) and atr > 0
     new_highest = max(highest, price)
+    trailing = trailing and trail_armed(new_highest, entry_reference(position), atr)
     new_stop = max(stop, new_highest - trailing_multiple * atr) if trailing else stop
     levels = {'highest': new_highest, 'stop': new_stop}
     if dust:

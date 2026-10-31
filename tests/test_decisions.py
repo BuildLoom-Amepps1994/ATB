@@ -265,3 +265,24 @@ def test_decisions_api_filters_by_symbol_and_bounds_the_limit(webapp):
     assert len(client.get('/api/decisions', params={'limit': 2}).json()['decisions']) == 2
     assert len(client.get('/api/decisions', params={'limit': 0}).json()['decisions']) == 1
     assert client.get('/api/decisions', params={'limit': 'x'}).status_code == 422
+
+
+def test_trailing_stop_waits_for_a_gain_of_one_atr_above_the_entry_fill():
+    # A paper fill at the ask plus slippage starts the high above the bid. With a
+    # small fast-timeframe ATR a trail measured from it at once would sit above
+    # the bid and sell on the next check (2026-10-28 live paper run: 52 of 69
+    # Rapid trades sold within 5 seconds).
+    fill = 100.3
+    held = decision.evaluate_exit(position(entry_price=fill, highest=fill, stop=99.5, target=103.), 100.1, atr=.05)
+    assert held['action'] == 'hold' and held['stop'] == 99.5 and held['highest'] == fill
+    # Once the bid has risen one ATR above the fill, the trail ratchets as before.
+    armed = decision.evaluate_exit(position(entry_price=fill, highest=fill, stop=99.5, target=103.), 100.4, atr=.05)
+    assert armed['action'] == 'hold' and armed['stop'] == pytest.approx(100.4 - 2.5 * .05)
+
+
+def test_trail_arm_falls_back_to_cost_over_quantity_and_to_the_old_rule():
+    assert decision.entry_reference({'qty': 2., 'cost': 200.}) == 100.
+    assert decision.entry_reference({'entry_price': 0, 'qty': 0, 'cost': 0}) is None
+    from strategy import trail_armed
+    assert trail_armed(101., None, 5.)            # unknown entry: trail as before
+    assert not trail_armed(101., 100., 2.) and trail_armed(102., 100., 2.)

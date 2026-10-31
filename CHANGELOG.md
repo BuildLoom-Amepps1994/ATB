@@ -4,7 +4,63 @@ Releases are numbered `1.5.<commits on main>` by the release workflow; this
 file records what changed in substance. Earlier history is in the README and
 the review documents it links.
 
-## Unreleased: micro cycles (PAPER only, 25 USDT all-in)
+## Unreleased: real paper costs, the trailing-stop fix and the Trend strategy
+
+Found by the first paper run of the app on live public prices (28 to 29
+October 2026, five isolated paper instances on MEXC and Kraken) and the
+research that followed on seven years of public MEXC candles.
+
+Fixed
+
+* **Trailing stop.** A paper buy fills at the ask plus the configured
+  slippage, and the position's high started at that fill. On fast
+  timeframes 2.5 ATRs is smaller than the spread plus slippage, so the first
+  trailing update put the stop above the bid and the next check sold: 52 of
+  69 Rapid paper trades sold within 5 seconds. The trail now ratchets only
+  once the high is one ATR above the entry fill, in the engine and in the
+  backtest (`strategy.trail_armed`, `decision.evaluate_exit`).
+* **Micro research harness.** The simulated fee was rounded up to 1E-8 USDT
+  while sizing reserved it on the market's own quote step; on pairs quoted in
+  1E-9 (MEXC PEPE, SHIB, BONK) the debit exceeded the reservation and the run
+  stopped. The fee is now booked unrounded, as the paper venue reports it.
+
+Changed
+
+* **Classic paper fills walk the live public order book**, level by level,
+  each level moved 3 bps against the order as the micro paper venue does
+  (`paper_exchange.walk_levels`). A book that is missing, stale, too thin for
+  the order or more than 1 % from the reference quote falls back to the
+  configured flat slippage, and each order records which model filled it.
+  Measured in paper on 29 October: 4.3 bps per fill on average, where the
+  flat 0.20 % charged 20.
+* **Micro refuses a pair below the 24 h quote volume minimum**
+  (`min_quote_volume`), or with no reported volume, as the classic strategies
+  do: the manager reads the public ticker at most every 5 minutes and passes
+  the result to the strategy as the optional `low_volume` gate (a new
+  `volume` check with code `INSUFFICIENT_DEPTH`). The research harness
+  supplies no such gate, so its decisions are unchanged.
+
+Added
+
+* **Trend strategy · PAPER only** (`time_horizon = 'trend'`, 1-day signals):
+  buy a pair whose completed daily close is above its 100-day simple average,
+  sell at the next check after a close below it, with the app's risk sizing,
+  a 25 % disaster stop, no trailing stop and no profit target. It refuses
+  live trading at every boundary that refuses live micro
+  (`micro_policy.PAPER_ONLY_HORIZONS`). The backtest and the research
+  screen follow the same rule.
+* Research on real public MEXC candles: a walk-forward of the classic
+  strategies with fixed date splits, a random-entry baseline and a verdict
+  rule (`research/classic_walkforward.py`); short-horizon dip-buying rules
+  (`research/dip_research.py`); a daily moving-average trend rule
+  (`research/trend_research.py`); and the micro harness on 14 days of real
+  1-minute candles for 9 pairs. Results and verdicts are in
+  `docs/CLASSIC_WALKFORWARD.md` and `docs/ATB_MICRO_RESEARCH.md`. None of
+  the app's strategies has demonstrated a profit after costs; the Trend rule
+  is the most consistent result (gains in rising markets, about breakeven
+  over the 18 months held back), not a proven one.
+
+## 1.5.126: micro cycles (PAPER only, 25 USDT all-in)
 
 Added
 

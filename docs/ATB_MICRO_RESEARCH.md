@@ -1,11 +1,53 @@
 # Micro-trading mode: research
 
-**NO DEMONSTRATED EDGE.** Every result below comes from synthetic fixture
-markets generated from formulas and seeds. Real public market data was **NOT
-RUN**: the exchange endpoints are unreachable from the environment this
-candidate was built in. The fixtures show that the cycle mechanics, the cost
-accounting and the abstention logic work. They cannot show that the strategy
-makes money in a real market, and nothing in this document says it does.
+**NO DEMONSTRATED EDGE.** The harness has now run on real public market
+data (next section): 14 days of MEXC 1-minute candles for nine pairs, on a
+Windows PC that can reach the exchange. The verdict is NO DEMONSTRATED EDGE on
+every pair. The fixture results that follow it show that the cycle mechanics,
+the cost accounting and the abstention logic work. Nothing in this document
+says the strategy makes money in a real market.
+
+## Real public data (run 2026-10-28, PEPE, SHIB and BONK on 2026-10-31)
+
+Collected with `research/collect_public_ohlcv.py --exchange mexc --days 14`
+on 2026-10-28 (20,160 completed 1-minute bars per pair, 0 gaps, 14 to 28
+October 2026) and replayed with `research/micro_research.py` under protocol
+`micro-research-v3` (SHA-256 `635c6356…bf34`), one pair per run, into
+`research/results/real/micro_real_<BASE>.json`. PEPE, SHIB and BONK first
+stopped the harness with "the entry debit exceeds the reserved amount" (the
+fee rounded up to 1E-8 on a 1E-9 quote step) and ran after that fix; the
+other six pairs' results are the same on either harness. Amounts are USDT of
+simulated cash at the 25 USDT budget and baseline costs (0.10 % modeled fee,
+3 bps latency, book modeled from the bars).
+
+| Pair | Development (12,024 bars) | Validation (3,888) | Holdout (3,888) | Holdout buy and hold | Holdout random entries, mean (sd) | Verdict |
+|---|---|---|---|---|---|---|
+| BTC/USDT | 0 cycles | 0 | 0 | -0.02 | not run | NO DEMONSTRATED EDGE |
+| ETH/USDT | 0 | 0 | 0 | -0.08 | not run | NO DEMONSTRATED EDGE |
+| SOL/USDT | 0 | 0 | 0 | -0.18 | not run | NO DEMONSTRATED EDGE |
+| DOGE/USDT | 5 cycles, -0.2321 | 0 | 0 | +0.56 | not run | NO DEMONSTRATED EDGE |
+| XRP/USDT | 3, +0.1456 | 0 | 1, -0.1037 | +0.43 | -0.0923 (0.0602) | NO DEMONSTRATED EDGE |
+| FLOKI/USDT | 2, -0.1455 | 1, -0.1468 | 0 | +0.10 | not run | NO DEMONSTRATED EDGE |
+| PEPE/USDT | 4, -0.1147 | 0 | 0 | +1.05 | not run | NO DEMONSTRATED EDGE |
+| SHIB/USDT | 2, +0.0820 | 1, -0.0998 | 0 | -0.03 | not run | NO DEMONSTRATED EDGE |
+| BONK/USDT | 5, -0.1388 | 2, +0.1307 | 4, -0.5752 | -0.05 | -0.4224 (0.2402) | NO DEMONSTRATED EDGE |
+
+Over the nine pairs: 30 cycles, -1.20 USDT net; in the holdout splits 5
+cycles, -0.68 USDT. No pair's holdout result is above zero, so the verdict
+rule's first condition fails everywhere; on BONK the strategy also sits below
+the random-entry mean. The doubled and severe cost scenarios made no cycle on
+any pair. The always-enter baseline lost between 10.6 and 21.0 USDT on every
+holdout, which is the cost the abstentions avoided.
+
+Why the majors never traded: at the 25 USDT budget the required move is about
+58 bps on MEXC (`docs/ATB_MICRO_ECONOMICS.md`), while the 1-minute ATR of
+BTC, ETH and SOL over these days was 2 to 9 bps, so the economic gate
+(`0.6 x ATR x sqrt(30)`) refused every bar. The 35.6-hour live paper run of
+2026-10-28 (five instances, with decision records) saw the same: the gate
+passed in 0.0 to 0.3 % of about 112,000 decisions on those pairs and never on
+Kraken, where the public taker fee of 0.26 % lifts the required move to 107
+to 119 bps. In that run the mode made 5 cycles on the alt pairs, lost 0.47
+USDT and engaged its consecutive-loss latch.
 
 ## Protocol (frozen)
 
@@ -299,7 +341,8 @@ Baselines over the same bars and costs (25 USDT):
 
 ## Running it on real data
 
-On a machine that can lawfully reach the exchange's public endpoints:
+This is how the section above was produced. On a machine that can lawfully
+reach the exchange's public endpoints:
 
 ```
 python -m research.collect_public_ohlcv --exchange mexc --symbols ETH/USDT,BTC/USDT --days 14 --out research/data

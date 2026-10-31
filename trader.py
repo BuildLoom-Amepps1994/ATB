@@ -24,7 +24,8 @@ import paper_exchange
 import risk
 import storage
 from market_data import MarketData
-from strategy import entry_price_ok, entry_signal, regime_signal, research_report, setup_quality, stop_fraction
+from strategy import (TREND_TARGET_MULTIPLE, entry_price_ok, entry_signal, regime_signal, research_report, setup_quality,
+                      stop_fraction, trend_broken)
 
 
 MARKET_SYMBOL = 'BTC/USDT'
@@ -32,7 +33,7 @@ MARKET_SYMBOL = 'BTC/USDT'
 KNOWN_MEMES = {'DOGE', 'SHIB', 'PEPE', 'BONK', 'FLOKI', 'WIF', 'BRETT', 'POPCAT',
                'MOG', 'TURBO', 'FARTCOIN', 'PNUT', 'BOME', 'PENGU', 'NEIRO', 'BABYDOGE'}
 
-HORIZONS = {'rapid': ('1m', '5m'), 'balanced': ('1h', '4h'),
+HORIZONS = {'rapid': ('1m', '5m'), 'balanced': ('1h', '4h'), 'trend': ('1d', '1w'),
             'swing': ('4h', '1d'), 'position': ('1d', '1w'),
             # PAPER-only micro cycles (micro.py): 1m features, 5m context.
             'micro': ('1m', '5m')}
@@ -151,7 +152,34 @@ class TradingEngine:
     def _new_paper_exchange(self):
         """Simulated counterparty sharing the live submit/confirm/ledger path."""
         return paper_exchange.PaperExchange(self.exchange_name, catalogue=self._catalogue,
-                                            settings=lambda: self.cfg, balances=self._paper_balances)
+                                            settings=lambda: self.cfg, balances=self._paper_balances,
+                                            book=self._paper_book)
+
+    PAPER_BOOK_MAX_AGE_S = 5.0
+
+    def _paper_book(self, symbol: str) -> dict | None:
+        """A fresh public order book for one paper fill, or None (the paper exchange then uses the flat slippage).
+
+        Read only when a paper order fills, so it costs one public depth request
+        per simulated fill. A reply that is not bid and ask levels, or is older
+        than ``PAPER_BOOK_MAX_AGE_S`` on arrival, is not used.
+        """
+        try:
+            book = self.data.order_book(symbol, limit=50)
+        except Exception:
+            return None
+        if not isinstance(book, dict) or not isinstance(book.get('bids'), list) or not isinstance(book.get('asks'), list):
+            return None
+        stamp = finite_positive(book.get('timestamp'))
+        if stamp and time.time() - (stamp / 1000 + self._clock_offset()) > self.PAPER_BOOK_MAX_AGE_S:
+            return None
+        return book
+
+    def _target_multiple(self, fraction: float) -> float:
+        """Stored profit target as a multiple of the fill: 2.75 stops above it, or none for Trend."""
+        if self.cfg.get('time_horizon') == 'trend':
+            return TREND_TARGET_MULTIPLE
+        return 1 + 2.75 * fraction
 
     def _paper_balances(self) -> dict:
         free = {'USDT': self._cash('paper')}
@@ -1551,12 +1579,12 @@ class TradingEngine:
                     db.execute('''UPDATE positions SET qty=?,entry_price=?,cost=?,highest=?,stop=?,target=?,opened_at=?
                                   WHERE exchange=? AND mode=? AND symbol=?''',
                                (total_qty, average, total_cost, max(average, fill_price), average * (1 - fraction),
-                                average * (1 + 2.75 * fraction), now(), exchange, mode, symbol))
+                                average * self._target_multiple(fraction), now(), exchange, mode, symbol))
                 else:
                     db.execute('''INSERT INTO positions(exchange,mode,symbol,qty,entry_price,cost,highest,stop,target,opened_at)
                                   VALUES (?,?,?,?,?,?,?,?,?,?)''',
                                (exchange, mode, symbol, qty, fill_price, cost + estimated, fill_price,
-                                fill_price * (1 - fraction), fill_price * (1 + 2.75 * fraction), now()))
+                                fill_price * (1 - fraction), fill_price * self._target_multiple(fraction), now()))
                 db.execute('''INSERT INTO trades(created_at,exchange,mode,symbol,side,price,quantity,gross,fee,reason,order_id)
                               VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
                            (now(), exchange, mode, symbol, 'BUY', fill_price, qty, gross,
@@ -1902,7 +1930,9 @@ class TradingEngine:
                     last = primary.iloc[-1]
                     atr = finite_positive(last['atr'])
                     if allow_orders and self._orders_allowed():
-                        self._mark_positions(symbol, self.last_prices[symbol], atr, bool(last['close'] < last['ema50']),
+                        # Trend has no trailing stop: its exit is the close below the average.
+                        self._mark_positions(symbol, self.last_prices[symbol], 0.0 if horizon == 'trend' else atr,
+                                             trend_broken(last, trend_rule=horizon == 'trend'),
                                              stored_checked_at=protected_at)
                     if held_before and not any(p['symbol'] == symbol for p in self._active_positions(self.mode)):
                         exited_symbols.add(symbol)
@@ -1927,6 +1957,7 @@ class TradingEngine:
                     held_now = any(p['symbol'] == symbol for p in self._active_positions(self.mode))
                     verdict = decision.evaluate_entry(
                         symbol=symbol, last=last, regime_ok=regime_ok, market_ok=market_ok, rapid=horizon == 'rapid',
+                        trend_rule=horizon == 'trend',
                         filters=filters, price=price, volume=volume, spread_pct=spread, quote_age_s=self._price_age(symbol),
                         quote_ts=quote_ts, cfg=self.cfg, now=decided_at, held=held_now,
                         exited_this_candle=(symbol in exited_symbols
@@ -2144,7 +2175,8 @@ class TradingEngine:
                 atr = finite_positive(primary.iloc[-1]['atr'])
                 if not atr:
                     raise error('Historical volatility is unavailable; a protective stop cannot be sized.')
-                fraction = stop_fraction(atr, price, rapid=self.cfg['time_horizon'] == 'rapid')
+                fraction = stop_fraction(atr, price, rapid=self.cfg['time_horizon'] == 'rapid',
+                                         trend=self.cfg['time_horizon'] == 'trend')
                 cash = self._cash(self.mode)
                 equity = self._equity(self.mode, cash, positions)
                 if not self._daily_allowed(self.mode, equity)[0]:
@@ -2160,7 +2192,8 @@ class TradingEngine:
                 if not self._marks_fresh(positions) or not self._orders_allowed():
                     raise error('Order preparation was stopped or portfolio prices became stale.')
                 # Recompute using the final quote and current liquidation marks.
-                fraction = stop_fraction(atr, refreshed, rapid=self.cfg['time_horizon'] == 'rapid')
+                fraction = stop_fraction(atr, refreshed, rapid=self.cfg['time_horizon'] == 'rapid',
+                                         trend=self.cfg['time_horizon'] == 'trend')
                 equity = self._equity(self.mode, cash, positions)
                 cap, _, _ = self._entry_budget(symbol, positions, cash, equity, fraction)
                 if amount > cap + 1e-8 or not self._daily_allowed(self.mode, equity)[0]:
@@ -2311,7 +2344,8 @@ class TradingEngine:
                 continue
             cash = self._cash(self.mode)
             equity = self._equity(self.mode, cash, positions)
-            fraction = stop_fraction(atr, price, rapid=self.cfg['time_horizon'] == 'rapid')
+            fraction = stop_fraction(atr, price, rapid=self.cfg['time_horizon'] == 'rapid',
+                                     trend=self.cfg['time_horizon'] == 'trend')
             budget, available_risk, loss_fraction = self._entry_budget(symbol, positions, cash, equity, fraction)
             if budget < 12:
                 if available_risk < 12 * loss_fraction:

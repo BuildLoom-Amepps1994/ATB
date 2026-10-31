@@ -1053,3 +1053,13 @@ def test_exit_records_are_json_safe_and_list_every_trigger():
     assert record['new_peak'] == '0.08' and record['trigger'] == 'take_profit'
     assert [c['check'] for c in record['checks']] == list(ms.EXIT_TRIGGERS)
     assert [c['check'] for c in record['checks'] if c['fired']] == ['take_profit']
+
+
+def test_a_supplied_low_volume_gate_blocks_as_a_thin_market_and_an_absent_one_is_not_checked(momentum):
+    thin = decide(momentum, gates={**GATES, 'low_volume': '24h quote volume 95,782 USDT is below the 1,000,000 USDT minimum'})
+    failed = [c for c in thin.checks if c['check'] == 'volume']
+    assert thin.action == 'abstain' and failed and failed[0]['code'] == ms.INSUFFICIENT_DEPTH
+    assert '95,782' in failed[0]['detail'] and thin.inputs['gates']['low_volume'].startswith('24h quote volume')
+    ample = decide(momentum, gates={**GATES, 'low_volume': None})
+    assert [c['passed'] for c in ample.checks if c['check'] == 'volume'] == [True]
+    assert not [c for c in decide(momentum).checks if c['check'] == 'volume']

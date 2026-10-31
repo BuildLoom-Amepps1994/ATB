@@ -198,6 +198,7 @@ PARAM_LIMITS = {'target_net_bps': (5.0, 200.0), 'max_loss_bps': (20.0, 400.0), '
 
 GATE_KEYS = ('selected', 'capacity', 'cooldown_remaining_s', 'fresh_after_exit', 'review_block', 'risk_block',
              'latched')
+OPTIONAL_GATE_KEYS = ('low_volume',)   # checked only when supplied (the research harness does not)
 BLOCK_KEYS = ('review_block', 'risk_block', 'latched')
 BOOK_KEYS = ('best_bid', 'best_ask', 'spread_bps', 'generation', 'sequence', 'age_s', 'source')
 SIZING_KEYS = ('symbol', 'eligible', 'code', 'detail', 'budget_cap', 'target_budget', 'gross_quote', 'fee_reserve',
@@ -670,7 +671,7 @@ def evaluate_entry(*, symbol, features, regime, regime_reasons, sizing: dict, bo
         if isinstance(book_summary, dict) else None,
         'sizing': {key: _plain(sizing[key]) for key in SIZING_KEYS if key in sizing}
         if isinstance(sizing, dict) else None,
-        'gates': {key: _gate_value(key, gates[key]) for key in GATE_KEYS if key in gates}
+        'gates': {key: _gate_value(key, gates[key]) for key in GATE_KEYS + OPTIONAL_GATE_KEYS if key in gates}
         if isinstance(gates, dict) else {},
         'params': params.as_dict(),
     }
@@ -703,6 +704,13 @@ def _decide(symbol: str, now: float, inputs: dict, features: Features | None, pa
     block('review_block', 'review', REVIEW, 'Review block')
     block('risk_block', 'risk', RISK, 'Risk block')
     block('latched', 'latch', RISK, 'Safety latch')
+    if 'low_volume' in gates:
+        # Optional (the manager supplies it; the research harness and older records do not): the
+        # pair's 24h quote volume against the same minimum the classic strategies use.
+        thin = gates['low_volume']
+        check('volume', not thin, INSUFFICIENT_DEPTH,
+              thin if isinstance(thin, str) else ('24h quote volume is too low' if thin
+                                                  else '24h quote volume meets the minimum'))
     check('selected', gates.get('selected') is True, NOT_SELECTED,
           'selected for this scan' if gates.get('selected') is True else 'not selected for this scan')
     capacity = gates.get('capacity')

@@ -418,3 +418,17 @@ def test_quote_reads_go_ahead_of_queued_candle_requests():
     order = [url.rsplit('/', 1)[1] for _, url in sorted(starts)]
     # The second request was already pacing; the quote overtakes the third.
     assert order == ['ping', 'ping', 'time', 'ping']
+
+
+def test_a_paper_entry_is_not_sold_by_the_trail_on_an_unchanged_market(engine):
+    # Paper fills add the configured slippage above the ask. The trail must not
+    # start from that price while the market has not moved (fast timeframes have
+    # an ATR smaller than the slippage).
+    engine.cfg['slippage_pct'] = .2
+    assert engine._buy('BTC/USDT', 800, 100, .008)
+    position = engine._active_positions('paper')[0]
+    assert position['entry_price'] > 100
+    engine.running = True
+    engine._mark_positions('BTC/USDT', 99.99, .03, False)
+    assert len(engine._active_positions('paper')) == 1
+    assert engine._active_positions('paper')[0]['stop'] == position['stop']

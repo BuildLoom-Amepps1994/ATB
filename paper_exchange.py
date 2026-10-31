@@ -9,7 +9,10 @@ when the book cannot absorb the order or its fill is more than
 ``BOOK_MAX_DEVIATION`` from the caller's reference quote, the fill is the
 reference quote (the executable bid/ask the caller just observed) adjusted by
 the configured slippage. The configured fee is charged in USDT either way.
-Nothing here touches a network: the book comes from a callable the engine owns. Failure injection hooks let tests exercise the
+The fee is the market's published taker rate when the catalogue has one (MEXC
+publishes 0.05 % on most spot pairs, Kraken 0.26 %), else the configured
+``fee_pct``. Nothing here touches a network: the book and the catalogue come
+from callables the engine owns. Failure injection hooks let tests exercise the
 uncertain, rejected and partially filled paths without a real exchange.
 """
 from __future__ import annotations
@@ -164,17 +167,39 @@ class PaperExchange:
             return None
         return walked
 
+    MAX_PUBLISHED_FEE = 0.05      # a published taker rate above 5 % is a catalogue error, not a fee
+
+    def _fee_rate(self, symbol: str, settings: dict) -> tuple[float, str]:
+        """The market's published taker rate when the catalogue has a usable one, else the configured fee."""
+        configured = float(settings['fee_pct']) / 100
+        try:
+            market = self._catalogue().get(symbol)
+        except Exception:
+            market = None
+        taker = market.get('taker') if isinstance(market, dict) else None
+        if isinstance(taker, bool):
+            return configured, 'configured'
+        try:
+            rate = float(taker)
+        except (TypeError, ValueError):
+            return configured, 'configured'
+        if not math.isfinite(rate) or rate <= 0 or rate > self.MAX_PUBLISHED_FEE:
+            return configured, 'configured'
+        return rate, 'published taker'
+
     def _accept(self, symbol: str, side: str, filled: float, gross: float, average: float, params: dict | None,
                 fill_model: str = 'flat slippage') -> dict:
         settings = self._settings()
-        fee = gross * float(settings['fee_pct']) / 100
+        rate, fee_source = self._fee_rate(symbol, settings)
+        fee = gross * rate
         fee_currency = self.fee_currency or symbol.split('/')[1]
         order_id = 'paper-' + uuid.uuid4().hex[:12]
         order = {'id': order_id, 'clientOrderId': (params or {}).get('clientOrderId'), 'symbol': symbol,
                  'type': 'market', 'side': side, 'status': 'closed', 'filled': filled, 'remaining': 0.0,
                  'amount': filled, 'cost': gross, 'average': average, 'price': average,
                  'fee': {'currency': fee_currency, 'cost': fee}, 'fees': [],
-                 'timestamp': int(time.time() * 1000), 'info': {'simulated': True, 'fill_model': fill_model}}
+                 'timestamp': int(time.time() * 1000),
+                 'info': {'simulated': True, 'fill_model': fill_model, 'fee_source': fee_source, 'fee_rate': rate}}
         if self.partial_next is not None:
             ratio = max(0.0, min(1.0, float(self.partial_next)))
             self.partial_next = None

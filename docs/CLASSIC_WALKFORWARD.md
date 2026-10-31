@@ -134,3 +134,30 @@ pairs the backtest accepts, realistic costs:
 
 The account figures are small because each entry is sized from the 0.65 %
 risk budget over the 25 % stop, about 2.6 % of the account.
+
+## A band against whipsaws (research/trend_variants.py, 2026-10-31)
+
+Most of Trend's holdout trades were whipsaws round the average. Variants with
+an entry/exit band (enter above SMA x (1 + b), exit below SMA x (1 - b)) and
+a rising-average filter were tested on **development and validation only**,
+32 pairs (the 12 selection pairs and the 20 others), realistic costs,
+protocol `trend-variants-v1` with the grid and the selection rule fixed in
+advance. The holdout was not read: the forward paper run is the test.
+
+| Variant | Development mean (median) sleeve | Validation mean (median) sleeve | Validation pairs positive | Validation trades | Mean trade |
+| --- | --- | --- | --- | --- | --- |
+| Plain (b = 0) | +386 % (+93 %) | +26.1 % (+10.9 %) | 21 of 31 | 371 | +4.3 % |
+| b = 1 % | +424 % (+135 %) | +26.5 % (+13.8 %) | 21 of 31 | 267 | +5.8 % |
+| b = 2 % | +461 % (+142 %) | +25.6 % (+12.9 %) | 20 of 31 | 204 | +7.2 % |
+| b = 3 % | +459 % (+177 %) | +30.5 % (+18.6 %) | 20 of 31 | 167 | +9.5 % |
+| **b = 5 % (selected)** | **+545 % (+115 %)** | **+32.7 % (+22.5 %)** | **22 of 31** | **128** | **+11.9 %** |
+| Rising-average filter, any b | lower | lower | | fewer | |
+
+The band cut trades by two thirds and raised the validation median on both
+pair sets. The app's Trend strategy now uses the 5 % band
+(`strategy.TREND_BAND`). Through the app's own backtest on the 11 pairs it
+accepts (`research/results/classic/wf_trend_band_dv.json`), the account
+returns are unchanged at +18.0 % (development) and +1.8 % (validation), with
+130 and 44 trades instead of 353 and 135 and a mean trade of +50 % and +18 %
+(t 2.9 and 2.1) instead of +18 % and +6 %. 5 % is the top of the grid, so a wider band may be
+better still; that is a question for new data, not for these years.

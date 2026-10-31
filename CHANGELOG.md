@@ -4,7 +4,26 @@ Releases are numbered `1.5.<commits on main>` by the release workflow; this
 file records what changed in substance. Earlier history is in the README and
 the review documents it links.
 
-## Unreleased: real paper costs, the trailing-stop fix and the Trend strategy
+## Unreleased: fewer Trend whipsaws and published paper fees
+
+Changed
+
+* **Trend enters and exits through a 5 % band** round its 100-day average:
+  buy on a completed daily close more than 5 % above the average, sell after
+  a close more than 5 % below it (`strategy.TREND_BAND`). The band was chosen
+  from 0, 1, 2, 3 and 5 % (with and without a rising-average filter, which
+  hurt) on development and validation data only, over 32 pairs
+  (`research/trend_variants.py`, `docs/CLASSIC_WALKFORWARD.md`): on
+  validation the mean sleeve return rose from 26.1 % to 32.7 %, the median
+  from 10.9 % to 22.5 %, and trades fell from 371 to 128. The held-back
+  months were not read again; the forward paper run is the test.
+* **Classic paper fills charge the market's published taker fee** when the
+  catalogue has one (MEXC publishes 0.05 % on most spot pairs, Kraken 0.26 %)
+  instead of the flat configured 0.1 %, which stays the fallback; each order
+  records the rate and its source (`paper_exchange.PaperExchange._fee_rate`).
+  Sizing and the backtest keep the configured rate.
+
+## 1.5.137: real paper costs, the trailing-stop fix and the Trend strategy
 
 Found by the first paper run of the app on live public prices (28 to 29
 October 2026, five isolated paper instances on MEXC and Kraken) and the

@@ -125,6 +125,9 @@ EFFICIENCY_PERIOD = 20
 # The Trend strategy (PAPER only): hold while the completed daily close is above
 # its TREND_SMA-day simple average (research/trend_research.py, trend-research-v1).
 TREND_SMA = 100
+# A band round the average against whipsaws: enter above SMA x (1 + band), exit below SMA x (1 - band).
+# Chosen from {0, 1, 2, 3, 5} % on development and validation data (research/trend_variants.py).
+TREND_BAND = .05
 TREND_STOP_FRACTION = .25      # a disaster stop only; the rule itself exits on a close below the average
 TREND_TARGET_MULTIPLE = 10.0   # no profit target in the rule: the stored target sits at ten times the fill
 
@@ -177,22 +180,24 @@ MIN_EFFICIENCY = .3
 
 
 def trend_signal(last) -> tuple[bool, str, int]:
-    """The Trend rule: a completed daily close above its TREND_SMA-day average."""
+    """The Trend rule: a completed daily close more than TREND_BAND above its TREND_SMA-day average."""
     try:
         close, average = float(last['close']), float(last['sma100'])
     except (TypeError, ValueError, KeyError):
         return False, 'Insufficient indicators', 0
     if not (math.isfinite(close) and math.isfinite(average)) or close <= 0 or average <= 0:
         return False, 'Insufficient indicators', 0
-    if close > average:
+    if close > average * (1 + TREND_BAND):
         return True, 'BUY setup', 100
-    return False, f'Waiting: close below its {TREND_SMA}-day average', 0
+    if close < average * (1 - TREND_BAND):
+        return False, f'Waiting: close below its {TREND_SMA}-day average', 0
+    return False, f'Waiting: close within {TREND_BAND:.0%} of its {TREND_SMA}-day average', 50
 
 
 def trend_broken(last, *, trend_rule: bool = False) -> bool:
-    """The completed-candle exit: below the Trend average, or below EMA50 for the other strategies."""
+    """The completed-candle exit: TREND_BAND below the Trend average, or below EMA50 for the other strategies."""
     if trend_rule:
-        return bool(last['close'] < last['sma100'])
+        return bool(last['close'] < last['sma100'] * (1 - TREND_BAND))
     return bool(last['close'] < last['ema50'])
 
 

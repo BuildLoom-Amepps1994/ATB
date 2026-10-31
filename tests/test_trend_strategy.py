@@ -1,4 +1,4 @@
-"""The Trend strategy: a daily close above its 100-day average, PAPER only."""
+"""The Trend strategy: a daily close 5 % above its 100-day average, PAPER only."""
 import sys
 from pathlib import Path
 
@@ -28,12 +28,18 @@ def test_the_trend_signal_is_the_close_against_its_100_day_average():
     x = strategy.indicators(strategy.frame_from_ohlcv(rows, drop_open_candle=False))
     last = x.iloc[-1]
     assert last['sma100'] == pytest.approx(np.mean([r[4] for r in rows[-100:]]))
+    assert last['close'] > last['sma100'] * 1.05
     assert strategy.entry_signal(last, regime_ok=False, market_ok=False, trend_rule=True) == (True, 'BUY setup', 100)
+    inside = last.copy()
+    inside['close'] = inside['sma100'] * 1.01          # above the average but inside the 5 % band: no entry, no exit
+    ok, status, score = strategy.entry_signal(inside, trend_rule=True)
+    assert not ok and status == 'Waiting: close within 5% of its 100-day average' and score == 50
+    assert not strategy.trend_broken(inside, trend_rule=True) and not strategy.trend_broken(last, trend_rule=True)
     below = last.copy()
-    below['close'] = below['sma100'] * .99
+    below['close'] = below['sma100'] * .94
     ok, status, score = strategy.entry_signal(below, trend_rule=True)
     assert not ok and status == 'Waiting: close below its 100-day average' and score == 0
-    assert strategy.trend_broken(below, trend_rule=True) and not strategy.trend_broken(last, trend_rule=True)
+    assert strategy.trend_broken(below, trend_rule=True)
     assert strategy.stop_fraction(5., 100., trend=True) == strategy.TREND_STOP_FRACTION
 
 

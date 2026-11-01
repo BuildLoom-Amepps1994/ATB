@@ -161,3 +161,28 @@ returns are unchanged at +18.0 % (development) and +1.8 % (validation), with
 130 and 44 trades instead of 353 and 135 and a mean trade of +50 % and +18 %
 (t 2.9 and 2.1) instead of +18 % and +6 %. 5 % is the top of the grid, so a wider band may be
 better still; that is a question for new data, not for these years.
+
+## Portfolio rules (research/trend_portfolio.py, 2026-11-01)
+
+The app runs Trend over a watchlist with a fixed number of position slots,
+filled in scan order as pairs qualify, each sized the same. Two refinements
+were tested on **development and validation only**, 32 pairs, 8 or 5 slots,
+each slot 1/k of the account, protocol `trend-portfolio-v1` fixed in advance:
+which qualifying pair gets a free slot (scan order or the highest 90-day
+return), and how much to size it (fixed, or scaled by min(1, 60 % /
+annualised 20-day volatility)).
+
+| Variant (8 slots) | Development return (Sharpe, max drawdown) | Validation return (Sharpe, max drawdown) | Validation trades |
+| --- | --- | --- | --- |
+| Scan order, fixed size (base) | +3,022 % (1.32, 76 %) | +6.5 % (0.38, 43 %) | 56 |
+| Scan order, volatility-scaled | +1,449 % (1.27, 75 %) | +20.1 % (0.55, 35 %) | 56 |
+| Momentum rank, fixed size | +497 % (0.95, 78 %) | -13.5 % (0.16, 50 %) | 58 |
+| Momentum rank, volatility-scaled | +691 % (1.14, 64 %) | +6.3 % (0.35, 34 %) | 58 |
+
+With 5 slots the pattern is the same. Momentum ranking is worse everywhere.
+Volatility scaling raised the validation return and Sharpe ratio and cut the
+drawdown, at about half the raw return of the 2019-2023 boom, which is what a
+rule that sizes volatile coins down must do. The protocol's selection rule
+judged by raw development return and kept the base, so the scaling ships as
+a setting that is off by default (`trend_vol_target_pct`), and the forward
+paper run compares fixed and scaled sizing side by side on the same pairs.

@@ -8,6 +8,18 @@ the review documents it links.
 
 Changed
 
+* **Trend can scale each entry by recent volatility** (`trend_vol_target_pct`,
+  off by default): the size target is multiplied by min(1, target /
+  annualised 20-day volatility). Tested on development and validation data
+  only over 32 pairs with 8 position slots (`research/trend_portfolio.py`,
+  `trend-portfolio-v1`): at a 60 % target the validation return rose from
+  +6.5 % to +20.1 %, the Sharpe ratio from 0.38 to 0.55 and the maximum
+  drawdown fell from 43 % to 35 %, at about half the raw return of the
+  2019-2023 boom. The protocol's own selection rule, which judged by raw
+  development return, kept the fixed size, so the setting ships off and the
+  forward paper run compares the two side by side. Filling free slots by
+  90-day momentum rank instead of scan order was worse everywhere and is not
+  built. See `docs/CLASSIC_WALKFORWARD.md`, *Portfolio rules*.
 * **Trend no longer downloads weekly candles or reads the BTC gate.** It uses
   neither, so the download was wasted and a weekly request that failed could
   withhold its entries with "Higher-timeframe data unavailable". A Trend scan

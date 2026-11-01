@@ -24,8 +24,8 @@ import paper_exchange
 import risk
 import storage
 from market_data import MarketData
-from strategy import (TREND_TARGET_MULTIPLE, entry_price_ok, entry_signal, regime_signal, research_report, setup_quality,
-                      stop_fraction, trend_broken)
+from strategy import (TREND_TARGET_MULTIPLE, annualised_volatility, entry_price_ok, entry_signal, regime_signal,
+                      research_report, setup_quality, stop_fraction, trend_broken, trend_size_scale)
 
 
 MARKET_SYMBOL = 'BTC/USDT'
@@ -2066,8 +2066,12 @@ class TradingEngine:
                            - float(p['qty']) * float(p['stop']) * proceeds_factor) for p in positions)
 
     def _entry_budget(self, symbol: str, positions: list[dict], cash: float,
-                      equity: float, fraction: float) -> tuple[float, float, float]:
-        """One budget calculation for both automated and explicit manual buys."""
+                      equity: float, fraction: float, scale: float = 1.0) -> tuple[float, float, float]:
+        """One budget calculation for both automated and explicit manual buys.
+
+        ``scale`` (0..1) shrinks the size target before the caps: Trend's
+        optional volatility scaling passes ``strategy.trend_size_scale``.
+        """
         fee_rate, slip = self.cfg['fee_pct'] / 100, self.cfg['slippage_pct'] / 100
         loss_fraction = 1 - (1 - fraction) * (1 - slip) * (1 - fee_rate) / (1 + fee_rate)
         with self.lock:
@@ -2081,7 +2085,19 @@ class TradingEngine:
         if is_meme(symbol):
             budget = min(budget, equity * self.cfg['max_meme_position_pct'] / 100,
                          max(0.0, equity * self.cfg['max_meme_exposure_pct'] / 100 - meme_used))
+        budget *= max(0.0, min(1.0, float(scale)))
         return budget, available_risk, loss_fraction
+
+    def _trend_scale(self, symbol: str) -> float:
+        """Trend's volatility size multiplier from the cached daily closes; 1 when off or unknown."""
+        target = self.cfg.get('trend_vol_target_pct') or 0.0
+        if self.cfg.get('time_horizon') != 'trend' or not target:
+            return 1.0
+        try:
+            closes = self.data.candles(symbol, HORIZONS['trend'][0], limit=175)['close'].tolist()
+        except Exception:
+            return 1.0
+        return trend_size_scale(annualised_volatility(closes), target)
 
     def manual_trade(self, symbol: str, side: str, quote_amount=None,
                      confirmation: str = '', request_id: str = '', expected_context: str = '') -> dict:
@@ -2351,7 +2367,8 @@ class TradingEngine:
             equity = self._equity(self.mode, cash, positions)
             fraction = stop_fraction(atr, price, rapid=self.cfg['time_horizon'] == 'rapid',
                                      trend=self.cfg['time_horizon'] == 'trend')
-            budget, available_risk, loss_fraction = self._entry_budget(symbol, positions, cash, equity, fraction)
+            budget, available_risk, loss_fraction = self._entry_budget(symbol, positions, cash, equity, fraction,
+                                                                       self._trend_scale(symbol))
             if budget < 12:
                 if available_risk < 12 * loss_fraction:
                     with self.lock:

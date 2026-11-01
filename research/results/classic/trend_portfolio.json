@@ -1,0 +1,200 @@
+{
+ "protocol": {
+  "version": "trend-portfolio-v1",
+  "lookback": 100,
+  "band": 0.05,
+  "momentum_days": 90,
+  "vol_days": 20,
+  "vol_target": 0.6,
+  "fill": [
+   "scan",
+   "momentum"
+  ],
+  "size": [
+   "fixed",
+   "vol"
+  ],
+  "slots": [
+   5,
+   8
+  ],
+  "splits": {
+   "development": [
+    null,
+    "2024-01-01"
+   ],
+   "validation": [
+    "2024-01-01",
+    "2025-05-01"
+   ]
+  },
+  "costs": {
+   "fee": 0.0005,
+   "slip": 0.0005
+  },
+  "selection": "development return >= 90 % of base (scan, fixed, k=8); highest validation Sharpe; higher validation return on ties"
+ },
+ "results": {
+  "scan/fixed/k5": {
+   "development": {
+    "return_pct": 2963.1,
+    "sharpe": 1.4,
+    "max_drawdown_pct": 77.17,
+    "trades": 96,
+    "wins": 36,
+    "mean_trade_pct": 52.51,
+    "days": 1566
+   },
+   "validation": {
+    "return_pct": -1.92,
+    "sharpe": 0.27,
+    "max_drawdown_pct": 51.23,
+    "trades": 41,
+    "wins": 14,
+    "mean_trade_pct": 0.95,
+    "days": 485
+   }
+  },
+  "scan/vol/k5": {
+   "development": {
+    "return_pct": 1625.47,
+    "sharpe": 1.4,
+    "max_drawdown_pct": 60.93,
+    "trades": 96,
+    "wins": 36,
+    "mean_trade_pct": 52.41,
+    "days": 1566
+   },
+   "validation": {
+    "return_pct": 17.17,
+    "sharpe": 0.49,
+    "max_drawdown_pct": 41.71,
+    "trades": 41,
+    "wins": 14,
+    "mean_trade_pct": 0.95,
+    "days": 485
+   }
+  },
+  "momentum/fixed/k5": {
+   "development": {
+    "return_pct": 1633.94,
+    "sharpe": 1.25,
+    "max_drawdown_pct": 77.46,
+    "trades": 98,
+    "wins": 34,
+    "mean_trade_pct": 42.67,
+    "days": 1566
+   },
+   "validation": {
+    "return_pct": -4.91,
+    "sharpe": 0.29,
+    "max_drawdown_pct": 51.66,
+    "trades": 40,
+    "wins": 12,
+    "mean_trade_pct": 0.65,
+    "days": 485
+   }
+  },
+  "momentum/vol/k5": {
+   "development": {
+    "return_pct": 1061.54,
+    "sharpe": 1.29,
+    "max_drawdown_pct": 60.15,
+    "trades": 98,
+    "wins": 34,
+    "mean_trade_pct": 42.64,
+    "days": 1566
+   },
+   "validation": {
+    "return_pct": 9.2,
+    "sharpe": 0.39,
+    "max_drawdown_pct": 41.4,
+    "trades": 40,
+    "wins": 12,
+    "mean_trade_pct": 0.65,
+    "days": 485
+   }
+  },
+  "scan/fixed/k8": {
+   "development": {
+    "return_pct": 3021.96,
+    "sharpe": 1.32,
+    "max_drawdown_pct": 76.16,
+    "trades": 141,
+    "wins": 50,
+    "mean_trade_pct": 75.04,
+    "days": 1566
+   },
+   "validation": {
+    "return_pct": 6.52,
+    "sharpe": 0.38,
+    "max_drawdown_pct": 43.05,
+    "trades": 56,
+    "wins": 19,
+    "mean_trade_pct": 1.99,
+    "days": 485
+   }
+  },
+  "scan/vol/k8": {
+   "development": {
+    "return_pct": 1449.17,
+    "sharpe": 1.27,
+    "max_drawdown_pct": 75.26,
+    "trades": 148,
+    "wins": 50,
+    "mean_trade_pct": 70.55,
+    "days": 1566
+   },
+   "validation": {
+    "return_pct": 20.06,
+    "sharpe": 0.55,
+    "max_drawdown_pct": 35.18,
+    "trades": 56,
+    "wins": 19,
+    "mean_trade_pct": 1.99,
+    "days": 485
+   }
+  },
+  "momentum/fixed/k8": {
+   "development": {
+    "return_pct": 497.18,
+    "sharpe": 0.95,
+    "max_drawdown_pct": 77.73,
+    "trades": 149,
+    "wins": 47,
+    "mean_trade_pct": 35.89,
+    "days": 1566
+   },
+   "validation": {
+    "return_pct": -13.53,
+    "sharpe": 0.16,
+    "max_drawdown_pct": 49.71,
+    "trades": 58,
+    "wins": 17,
+    "mean_trade_pct": -0.73,
+    "days": 485
+   }
+  },
+  "momentum/vol/k8": {
+   "development": {
+    "return_pct": 690.93,
+    "sharpe": 1.14,
+    "max_drawdown_pct": 64.49,
+    "trades": 150,
+    "wins": 47,
+    "mean_trade_pct": 35.6,
+    "days": 1566
+   },
+   "validation": {
+    "return_pct": 6.3,
+    "sharpe": 0.35,
+    "max_drawdown_pct": 34.33,
+    "trades": 58,
+    "wins": 17,
+    "mean_trade_pct": -0.73,
+    "days": 485
+   }
+  }
+ },
+ "selected": "scan/fixed/k8"
+}

@@ -118,3 +118,40 @@ def test_a_trend_scan_reads_daily_candles_only_and_a_weekly_failure_cannot_block
     markets = engine.scan_once(allow_orders=False)
     assert requested and set(requested) == {'1d'}
     assert all('Higher-timeframe data unavailable' not in (m.get('status') or '') for m in markets)
+
+
+def test_volatility_scaling_shrinks_a_trend_entry_in_proportion_and_is_off_by_default(engine, monkeypatch):
+    closes = [100 * (1.08 if i % 2 else 1 / 1.08) ** 1 for i in range(30)]       # about 8 % a day: far above a 60 % target
+    sigma = strategy.annualised_volatility(closes)
+    assert sigma is not None and sigma > 1.0
+    assert strategy.trend_size_scale(sigma, 0) == 1.0 and strategy.trend_size_scale(None, 60) == 1.0
+    assert strategy.trend_size_scale(0.3, 60) == 1.0 and strategy.trend_size_scale(1.2, 60) == pytest.approx(0.5)
+    assert strategy.annualised_volatility(closes[:10]) is None and strategy.annualised_volatility(['x'] * 30) is None
+
+    engine.update_config({'time_horizon': 'trend'})
+    positions, cash = [], engine._cash('paper')
+    equity = engine._equity('paper', cash, positions)
+    full, _, _ = engine._entry_budget('BTC/USDT', positions, cash, equity, strategy.TREND_STOP_FRACTION)
+    assert engine._trend_scale('BTC/USDT') == 1.0                                 # off by default
+    engine.update_config({'time_horizon': 'trend', 'trend_vol_target_pct': 60})
+    import pandas as pd
+    monkeypatch.setattr(engine.data, 'candles', lambda *a, **k: pd.DataFrame({'close': closes}))
+    scale = engine._trend_scale('BTC/USDT')
+    assert 0 < scale < 1 and scale == pytest.approx(0.6 / sigma)
+    scaled, _, _ = engine._entry_budget('BTC/USDT', positions, cash, equity, strategy.TREND_STOP_FRACTION, scale=scale)
+    assert scaled == pytest.approx(full * scale)
+    engine.update_config({'time_horizon': 'balanced', 'trend_vol_target_pct': 60})
+    assert engine._trend_scale('BTC/USDT') == 1.0                                 # other strategies never scale
+
+
+def test_a_profile_saved_before_the_volatility_target_existed_loads_without_review(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(storage, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(storage, 'CONFIG_PATH', tmp_path / 'settings.json')
+    monkeypatch.setattr(storage, 'DB_PATH', tmp_path / 'portfolio.sqlite3')
+    old = {k: v for k, v in storage.DEFAULTS.items() if k != 'trend_vol_target_pct'}
+    storage.save_settings(old)
+    (tmp_path / 'settings.json').write_text(json.dumps(old), encoding='utf8')
+    storage._SETTINGS_CACHE = None
+    cfg = storage.settings()
+    assert cfg['trend_vol_target_pct'] == 0.0 and not storage.settings_health()['review_required']

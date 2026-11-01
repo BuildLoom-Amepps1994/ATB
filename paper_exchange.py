@@ -8,8 +8,8 @@ depth are then the market's own, as in the micro paper venue). Otherwise, or
 when the book cannot absorb the order or its fill is more than
 ``BOOK_MAX_DEVIATION`` from the caller's reference quote, the fill is the
 reference quote (the executable bid/ask the caller just observed) adjusted by
-the configured slippage. The configured fee is charged in USDT either way.
-The fee is the market's published taker rate when the catalogue has one (MEXC
+the configured slippage. The fee is charged in USDT either way, at the
+market's published taker rate when the catalogue has one (MEXC
 publishes 0.05 % on most spot pairs, Kraken 0.26 %), else the configured
 ``fee_pct``. Nothing here touches a network: the book and the catalogue come
 from callables the engine owns. Failure injection hooks let tests exercise the

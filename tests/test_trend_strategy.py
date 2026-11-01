@@ -101,3 +101,20 @@ def test_a_trend_entry_stores_a_disaster_stop_and_no_profit_target(engine):
     # No trailing: a mark with an ATR far above the arm level leaves the stop where it was.
     engine._mark_positions('BTC/USDT', fill * 1.5, 0.0, False)
     assert engine._active_positions('paper')[0]['stop'] == pytest.approx(position['stop'])
+
+
+def test_a_trend_scan_reads_daily_candles_only_and_a_weekly_failure_cannot_block_it(engine, monkeypatch):
+    engine.update_config({'time_horizon': 'trend', 'watchlist': ['BTC/USDT', 'ETH/USDT']})
+    requested = []
+    original = engine.data.candles
+
+    def candles(symbol, timeframe, limit=None, **kwargs):
+        requested.append(timeframe)
+        if timeframe == '1w':
+            raise RuntimeError('weekly candles unavailable')
+        return original(symbol, timeframe, limit=limit, **kwargs)
+
+    monkeypatch.setattr(engine.data, 'candles', candles)
+    markets = engine.scan_once(allow_orders=False)
+    assert requested and set(requested) == {'1d'}
+    assert all('Higher-timeframe data unavailable' not in (m.get('status') or '') for m in markets)

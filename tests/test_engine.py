@@ -84,10 +84,11 @@ def test_paper_round_trip_has_exact_cash_and_fee_accounting(engine):
     position = engine._active_positions('paper')[0]
     assert position['cost'] == 800
     assert engine._cash('paper') == 9200
-    expected_qty = 800/(100*1.002*1.001)
+    fee = 1 + engine.cfg['fee_pct'] / 100          # the configured rate: the fake market publishes none
+    expected_qty = 800/(100*1.002*fee)
     assert position['qty'] == pytest.approx(expected_qty)
     engine._sell(position,110,'test exit')
-    expected = 9200+expected_qty*110*.998*.999
+    expected = 9200+expected_qty*110*.998*(2-fee)
     assert engine._cash('paper') == pytest.approx(expected)
     assert engine._active_positions('paper') == []
     assert engine.snapshot()['realized'] == pytest.approx(round(expected-10000,2))

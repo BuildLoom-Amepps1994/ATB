@@ -1891,9 +1891,13 @@ class TradingEngine:
             catalogue = self._catalogue()
             tradable = [symbol for symbol in symbols if self._spot(symbol, catalogue.get(symbol))]
             wanted = [(symbol, primary_tf, 175) for symbol in tradable]
-            wanted += [(symbol, higher_tf, 85) for symbol in tradable]
-            if self.cfg.get('market_filters', True) and self._spot(MARKET_SYMBOL, catalogue.get(MARKET_SYMBOL)):
-                wanted.append((MARKET_SYMBOL, higher_tf, 85))
+            # Trend reads only its daily candles: no confirmation timeframe and no BTC gate, so a
+            # weekly download that fails cannot block its entries, and nothing is fetched for nothing.
+            uses_higher = horizon != 'trend'
+            if uses_higher:
+                wanted += [(symbol, higher_tf, 85) for symbol in tradable]
+                if self.cfg.get('market_filters', True) and self._spot(MARKET_SYMBOL, catalogue.get(MARKET_SYMBOL)):
+                    wanted.append((MARKET_SYMBOL, higher_tf, 85))
             # Background downloads overlap round trips; the loop below still
             # runs each symbol's protective checks before using its candles.
             self.data.prefetch(wanted)
@@ -1941,14 +1945,15 @@ class TradingEngine:
                     filters = self.cfg.get('market_filters', True)
                     higher_error = higher_candle_ts = None
                     regime_ok, market_ok = False, None
-                    try:
-                        higher = self.data.candles(symbol, higher_tf, limit=85)
-                        regime_ok = regime_signal(higher)
-                        higher_candle_ts = int(higher.iloc[-1]['timestamp']) if len(higher) else None
-                        market_ok = (self._market_regime(higher_tf, market_state)
-                                     if filters and symbol != MARKET_SYMBOL else None)
-                    except Exception as exc:
-                        higher_error = type(exc).__name__
+                    if uses_higher:
+                        try:
+                            higher = self.data.candles(symbol, higher_tf, limit=85)
+                            regime_ok = regime_signal(higher)
+                            higher_candle_ts = int(higher.iloc[-1]['timestamp']) if len(higher) else None
+                            market_ok = (self._market_regime(higher_tf, market_state)
+                                         if filters and symbol != MARKET_SYMBOL else None)
+                        except Exception as exc:
+                            higher_error = type(exc).__name__
                     # One pure, replayable decision per symbol; the record keeps
                     # every check, the data timestamps and the abstention reason.
                     decided_at = time.time()

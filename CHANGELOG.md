@@ -4,7 +4,25 @@ Releases are numbered `1.5.<commits on main>` by the release workflow; this
 file records what changed in substance. Earlier history is in the README and
 the review documents it links.
 
-## Unreleased: fewer Trend whipsaws and published paper fees
+## Unreleased: Trend reads daily candles only; the week's changes reviewed
+
+Changed
+
+* **Trend no longer downloads weekly candles or reads the BTC gate.** It uses
+  neither, so the download was wasted and a weekly request that failed could
+  withhold its entries with "Higher-timeframe data unavailable". A Trend scan
+  now reads each pair's daily candles only (`trader.TradingEngine.scan_once`).
+
+Checked
+
+* A review of the code changed since 1.5.126 (the trailing-stop fix, the
+  order-book paper fills, the Micro volume gate, the Trend strategy and its
+  band, the published paper fee) found no defect; `pyflakes` over the
+  application, research, script and benchmark modules reports only two
+  unused locals in `trader.py` that predate this work; the dashboard's own
+  `node --test` suite passes.
+
+## 1.5.140: fewer Trend whipsaws and published paper fees
 
 Changed
 

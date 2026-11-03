@@ -129,6 +129,8 @@ TREND_SMA = 100
 # Chosen from {0, 1, 2, 3, 5} % on development and validation data (research/trend_variants.py).
 TREND_BAND = .05
 TREND_STOP_FRACTION = .25      # a disaster stop only; the rule itself exits on a close below the average
+TREND_VOL_DAYS = 20            # realised volatility window (completed daily closes) for the optional size scaling
+TREND_PERIODS_PER_YEAR = 365
 TREND_TARGET_MULTIPLE = 10.0   # no profit target in the rule: the stored target sits at ten times the fill
 
 
@@ -192,6 +194,37 @@ def trend_signal(last) -> tuple[bool, str, int]:
     if close < average * (1 - TREND_BAND):
         return False, f'Waiting: close below its {TREND_SMA}-day average', 0
     return False, f'Waiting: close within {TREND_BAND:.0%} of its {TREND_SMA}-day average', 50
+
+
+def annualised_volatility(closes, days: int = TREND_VOL_DAYS, periods_per_year: int = TREND_PERIODS_PER_YEAR) -> float | None:
+    """Annualised standard deviation of the last ``days`` log returns, or None when they cannot be computed."""
+    try:
+        values = [float(c) for c in list(closes)[-(days + 1):]]
+    except (TypeError, ValueError):
+        return None
+    if len(values) < days + 1 or any(not math.isfinite(v) or v <= 0 for v in values):
+        return None
+    returns = [math.log(b / a) for a, b in zip(values, values[1:])]
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+    return math.sqrt(variance) * math.sqrt(periods_per_year)
+
+
+def trend_size_scale(volatility: float | None, target_pct: float) -> float:
+    """The Trend size multiplier min(1, target / volatility); 1 when the target is off or the volatility unknown.
+
+    Research (docs/CLASSIC_WALKFORWARD.md, *Portfolio rules*): sizing each
+    entry down in proportion to its recent volatility raised the validation
+    return and lowered the drawdown, at a lower raw return in the 2019-2023
+    boom. Off (0) by default until the forward paper run has judged it.
+    """
+    try:
+        target = float(target_pct) / 100
+    except (TypeError, ValueError):
+        return 1.0
+    if not (math.isfinite(target) and target > 0) or volatility is None or not math.isfinite(volatility) or volatility <= 0:
+        return 1.0
+    return max(0.0, min(1.0, target / volatility))
 
 
 def trend_broken(last, *, trend_rule: bool = False) -> bool:

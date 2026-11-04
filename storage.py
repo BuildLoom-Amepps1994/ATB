@@ -95,6 +95,10 @@ class ConfigValidationError(ValueError):
     """Only messages constructed here are safe to show in the browser."""
 
 
+class DatabaseDamaged(sqlite3.DatabaseError):
+    """The portfolio database failed SQLite's integrity check; nothing was changed."""
+
+
 def validate_settings(data: dict, base: dict | None = None, allow_paper_start: bool = False) -> dict:
     if not isinstance(data, dict):
         raise ConfigValidationError('Settings must be an object.')
@@ -174,8 +178,13 @@ def _atomic_json(path: Path, value: dict) -> None:
     _atomic_bytes(path, json.dumps(value, indent=2, allow_nan=False).encode('utf8'))
 
 
-def _read_settings_file(path: Path, *, require_complete: bool = False):
-    """Return validated values, a safe error code, raw evidence and exchange."""
+def _read_settings_file(path: Path, *, require_complete: bool = False, protected=()):
+    """Return validated values, a safe error code, raw evidence and exchange.
+
+    ``protected`` names later-added keys whose last-good value is not the
+    default; a file without them (an older build's save, a hand edit) would
+    silently put that cap back to its default, so it is treated as damaged.
+    """
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
@@ -192,7 +201,7 @@ def _read_settings_file(path: Path, *, require_complete: bool = False):
     try:
         if not isinstance(saved, dict):
             raise ConfigValidationError('Invalid saved settings.')
-        if require_complete and set(DEFAULTS) - LATER_FIELDS - set(saved):
+        if require_complete and (set(DEFAULTS) - LATER_FIELDS - set(saved) or set(protected) - set(saved)):
             raise ConfigValidationError('Previously validated settings are incomplete.')
         safe = validate_settings({k: v for k, v in saved.items() if k in DEFAULTS}, allow_paper_start=True)
         return safe, None, raw, exchange
@@ -264,8 +273,11 @@ def _settings_state():
     backup_path, recovery_path = _settings_paths()
     backup, backup_fault, backup_raw, _ = _read_settings_file(backup_path)
     # Legacy partial configurations can be adopted once. After a last-good
-    # copy was ever written, removed risk fields must not silently use defaults.
-    current, fault, raw, exchange = _read_settings_file(CONFIG_PATH, require_complete=backup_fault != 'missing')
+    # copy was ever written, removed risk fields must not silently use defaults,
+    # and neither may a later-added cap the operator changed from its default.
+    protected = {key for key in LATER_FIELDS if backup is not None and backup.get(key) != DEFAULTS.get(key)}
+    current, fault, raw, exchange = _read_settings_file(CONFIG_PATH, require_complete=backup_fault != 'missing',
+                                                        protected=protected)
     record = _read_recovery_record()
     # Only a genuinely new profile may be initialized without explicit review.
     if (fault == 'missing' and not backup_path.exists() and not recovery_path.exists()
@@ -368,12 +380,24 @@ def _create_positions(db):
         PRIMARY KEY (exchange,mode,symbol))''')
 
 
+def _require_intact(db) -> None:
+    """Refuse a damaged ledger before any migration or write touches it."""
+    try:
+        verdict = db.execute('PRAGMA quick_check(1)').fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        verdict = f'{type(exc).__name__}: {exc}'
+    if verdict != 'ok':
+        raise DatabaseDamaged('The portfolio database failed its integrity check (' + str(verdict)[:200] + '). Nothing was '
+                              'changed. Restore portfolio.sqlite3 from a backup of the data folder before starting.')
+
+
 def init_db():
     # Preserve old rows; live records without an exchange/account identity are
     # quarantined until manually reconciled, never guessed from current settings.
     cfg = settings()
     exchange, paper_start = cfg['exchange'], cfg['paper_start_usdt']
     with connection() as db:
+        _require_intact(db)
         db.execute('PRAGMA journal_mode=WAL')
         # SQLite DDL is transactional only inside an explicit transaction. A
         # crash between rename and copy must not strand the old position table.
@@ -598,6 +622,25 @@ def abandon_stale_paper_intents(exchange: str) -> int:
                             "WHERE exchange=? AND mode='paper' AND status NOT IN ('accounted','rejected','reconciled') "
                             "AND (decision_id IS NULL OR decision_id NOT LIKE ?)",
                             (_now(), _now(), exchange, MICRO_DECISION_PREFIX + '%'))
+        return cursor.rowcount
+
+
+def reject_never_sent_live_intents() -> int:
+    """Close live intents that provably never reached the exchange.
+
+    ``submitted_at`` is stamped immediately before the request leaves
+    (``trader._submit``), by the same build that introduced the column and
+    ``client_order_id``. A live row still 'pending' with a client order id
+    and no stamp therefore sent nothing: a crash between the intent and the
+    request. Closing it at start-up keeps it from halting live trading until
+    the offline tool is run. Rows without a client order id predate the stamp
+    and are left to the reconciliation.
+    """
+    with connection() as db:
+        stamp = _now()
+        cursor = db.execute("UPDATE order_journal SET status='rejected',updated_at=?,final_at=?,note='never sent; closed at startup' "
+                            "WHERE mode='live' AND status='pending' AND submitted_at IS NULL AND client_order_id IS NOT NULL",
+                            (stamp, stamp))
         return cursor.rowcount
 
 

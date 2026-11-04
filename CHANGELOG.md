@@ -108,6 +108,54 @@ Fixed
   second apiece on Kraken). A read taken in the same tick within three
   seconds now serves the next exit; a booked sell lowers the cached free
   amount of its own asset.
+* **`recovery.py --clear-halt` refuses an intent the exchange filled but
+  the ledger never booked** (journal status `filled`: a crash or hard kill
+  between the fill confirmation and the ledger write). It used to mark such
+  an intent reconciled with the rest, which dropped the fill from the ledger:
+  a bought holding stayed untracked with no stop, or a sold position stayed
+  tracked. The refusal names each fill (side, pair, quantity, price, intent);
+  the report now shows `submitted_at`, `acked_at`, `filled_quantity` and
+  `filled_price` per unresolved intent and an `unbooked_fill_count`. After
+  the position has been corrected by hand, `--acknowledge-unbooked-fills`
+  lets the reset proceed and the audit line records the acknowledgement.
+* **A settings file that lacks a cap the operator had changed is treated as
+  damaged, not as a request for the default.** Once a last-good copy exists,
+  a file written by an older build or edited by hand that omits a
+  later-added key (the notional caps, the realised-loss and drawdown limits,
+  the three new controls, the Trend sizing option) silently put that key
+  back to its default. Now such a file requires a settings review and the
+  last-good values stay in force, as for any other damaged file; a file
+  missing only keys whose last-good value is the default is still adopted
+  without review (a first upgrade).
+* **The consecutive-loss streak is read from the trade ledger** (today's
+  booked sells, newest first, back to the last clearing) instead of a
+  separate counter written after the sell committed, so a process stop in
+  between can no longer lose a loss, and a streak already at the limit
+  latches at the next entry check even if no exit was observed. Every
+  booked sell now counts, including the micro strategy's PAPER exits. A
+  limit set below the streak already run blocks the next entry at once;
+  `RESUME TRADING` restarts the count after the last booked sell.
+* **Live positions are visible and warned about in paper mode** (hardening
+  review finding 20). The app always starts in paper mode, where the
+  dashboard listed only paper positions, so live holdings with stored
+  stops sat unmonitored and unmentioned. The state now carries
+  `live_positions`; the dashboard shows a warning in paper mode when it is
+  non-zero, and the activity log says so at start, on a switch to paper and
+  on an exchange change.
+* **A live order intent that never left the process no longer halts live
+  trading until the offline tool is run.** `submitted_at` is stamped just
+  before the request leaves, so a `pending` live intent without it (a crash
+  between the intent and the request) provably sent nothing; it is closed
+  at start-up with the note `never sent; closed at startup`, as the micro
+  recovery already did for its own intents. Rows without a client order id
+  (from before the stamp existed) still wait for reconciliation.
+* **The ledger is checked for damage before any migration or write**
+  (`PRAGMA quick_check`). A damaged `portfolio.sqlite3` now fails the start
+  with `DatabaseDamaged`, a console line that says to restore the data
+  folder from a backup, and no change to the file; it used to be opened and
+  migrated as it was.
+* **An exchange change closes the stale paper intents of the exchange now
+  in use**, as start-up does for the configured one.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

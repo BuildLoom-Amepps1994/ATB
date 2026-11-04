@@ -75,9 +75,16 @@ Change them while the bot is stopped.
 | `streaming_quotes` | off | Websocket best bid/ask while running. REST remains the fallback. |
 | `max_entry_atr_pct` | 15 % | Abnormal-volatility breaker: no entry while the signal candle's ATR exceeds this share of the price (0 = off). Exits are never judged on it. |
 | `max_volume_share_pct` | 0.5 % | Liquidity cap: an order may not exceed this share of the pair's 24 h quote turnover from the quote it was priced from; a quote with no turnover fails closed (0 = off). |
-| `max_consecutive_losses` | 4 | After this many losing exits in a row in one UTC day (automatic or manual), new entries are blocked for the rest of the day or until `RESUME TRADING` (`clear_loss_streak_stop`); a winning or flat exit resets the count (0 = off). |
+| `max_consecutive_losses` | 4 | After this many losing exits in a row in one UTC day (automatic, manual or micro), new entries are blocked for the rest of the day or until `RESUME TRADING` (`clear_loss_streak_stop`); a winning or flat exit resets the count (0 = off). The count is read from the trade ledger, so a limit set below a streak already run blocks the next entry at once. |
 
 The minimum order is 12 USDT on both exchanges and is enforced as well.
+
+Once a last-good copy of the settings exists, a settings file that omits a
+later-added key whose approved value differs from its default (an older
+build's save, a hand edit) counts as damaged: the last-good limits stay in
+force and a review is required before live trading, exactly as for an
+unreadable file. A file missing only keys that were at their defaults is
+adopted without review.
 
 ## 4. Kill switch, latches and breakers
 
@@ -182,6 +189,12 @@ How the feed subscribes:
   is owed; the breaker counters note it.
 * `uncertain` means the engine could not establish the outcome. In live mode
   this halts live trading durably. Do not restart it hoping it clears.
+* `filled` without `accounted` means the exchange filled the order but the
+  ledger never booked it (a crash or hard kill in between). The holding, or
+  the sale, is missing from positions and trades. `--clear-halt` refuses
+  while such an intent exists and names its fill.
+* A live `pending` intent with no `submitted_at` never left the process; the
+  engine closes it at start-up (`never sent; closed at startup`).
 
 To clear a live halt, with the app closed and after checking every listed
 order against the exchange's own order history:
@@ -190,6 +203,15 @@ order against the exchange's own order history:
 python recovery.py                     # read-only report first
 python recovery.py --clear-halt mexc --confirm "I HAVE RECONCILED MEXC ORDERS"
 ```
+
+The report lists, per unresolved intent, when it was submitted and
+acknowledged and what it filled (`submitted_at`, `acked_at`,
+`filled_quantity`, `filled_price`), plus `unbooked_fill_count`. For a
+`filled` intent, first bring the ledger in line with the exchange (the
+holding and its stop for a buy; the sale for a sell), then add
+`--acknowledge-unbooked-fills` to the command above; the audit line records
+the acknowledgement. There is deliberately no automatic booking from the
+journal: it does not hold the fill's fee.
 
 The probe on **Connect** helps: for each unresolved intent it reports whether
 the exchange knows an order with that client order id and what state it is in.
@@ -310,7 +332,13 @@ Each hardening step is one commit on the feature branch, so a rollback is a
   migrates the file forward again at its next start. Reverting only commits
   from after the schema change needs none of this.
 * New settings keys are optional and have defaults; an older build ignores
-  them without requiring a settings review.
+  them. If a later-added cap had been changed from its default, the older
+  build's save drops it, and the next start of this build treats the file as
+  damaged: the last-good limits are shown and a settings review is required
+  before live trading (section 3).
+* A start that fails with `DatabaseDamaged` means `portfolio.sqlite3` failed
+  SQLite's integrity check before anything was migrated or written. Restore
+  the data folder from a backup; do not run an older build against it.
 * The event log and the decision log are informational and can be deleted.
 
 ## 10. Known limits

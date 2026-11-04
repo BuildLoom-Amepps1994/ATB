@@ -179,9 +179,15 @@ def test_streak_stop_is_off_at_zero_and_counts_manual_exits(engine):
         losing_round_trip(engine)
     assert engine.risk.loss_streak('paper') == {'date': risk._today(), 'count': 6, 'latched_at': None}
     engine.cfg['max_consecutive_losses'] = 2
+    # A limit set below the streak already run blocks the next entry at once.
+    assert not engine._buy('BTC/USDT', 200, 100, .04, volume=20000000)
+    assert engine.risk.loss_streak_stop('paper')
+    engine.risk.clear_loss_streak_stop('paper', risk.RELEASE_PHRASE)
     assert engine._buy('BTC/USDT', 200, 100, .04, volume=20000000)
     engine.public.price = 90
     engine.manual_trade('BTC/USDT', 'sell', request_id=str(uuid.uuid4()))
+    assert engine.risk.loss_streak('paper')['count'] == 1 and not engine.risk.loss_streak_stop('paper')
+    losing_round_trip(engine)
     assert engine.risk.loss_streak_stop('paper')
 
 

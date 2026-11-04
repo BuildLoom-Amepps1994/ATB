@@ -5,11 +5,17 @@ reconciliation a person has already completed against the exchange's own
 order history; it never retries, cancels or guesses an order outcome.
 --prepare-downgrade returns the order journal to the layout builds before
 schema 3 can write, after saving a full copy of the database.
+
+An intent the exchange filled but the ledger never booked (status 'filled')
+makes --clear-halt refuse: reconciling it would drop the fill from the
+ledger. The report shows each intent's fill so it can be booked by hand
+first; --acknowledge-unbooked-fills then lets --clear-halt proceed.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sqlite3
 import sys
@@ -49,6 +55,34 @@ def _timestamp(value):
     return value if isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\+00:00|Z)', value) else None
 
 
+def _number(value):
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0 else None
+
+
+def _symbol(value):
+    return value if isinstance(value, str) and re.fullmatch(r'[A-Z0-9][A-Z0-9._-]{0,23}/USDT', value) else None
+
+
+def _intent_id(value):
+    return value if isinstance(value, str) and re.fullmatch('[0-9a-f]{32}', value) else None
+
+
+def _unbooked_fill_message(exchange: str, rows, with_fills: bool) -> str:
+    lines = []
+    for row in rows[:20]:
+        fill = ''
+        if with_fills:
+            quantity, price = _number(row['filled_quantity']), _number(row['filled_price'])
+            fill = f' {quantity:.8g} at {price:.8g}' if quantity and price else ' (fill size unrecorded)'
+        lines.append(f"{row['side'] if row['side'] in ('BUY', 'SELL') else 'unknown side'} "
+                     f"{_symbol(row['symbol']) or 'unknown pair'}{fill} (intent {_intent_id(row['intent_id']) or 'unknown'})")
+    more = f' and {len(rows) - 20} more' if len(rows) > 20 else ''
+    return (f'{len(rows)} order intent(s) on {exchange.upper()} were filled at the exchange but never booked in the '
+            'ledger: ' + '; '.join(lines) + more + '. Marking them reconciled would drop those fills from the ledger, '
+            'leaving a bought holding untracked and unprotected or a sold position still tracked. Book or correct the '
+            'position by hand first (RUNBOOK section 6), then rerun with --acknowledge-unbooked-fills.')
+
+
 def _manual_requests(connection):
     counts = {'pending': 0, 'failed': 0, 'malformed': 0}
     requests = []
@@ -83,7 +117,7 @@ def _read_report(folder: Path) -> dict:
     database = folder / 'portfolio.sqlite3'
     report = {'notice': NOTICE, 'data_folder': str(folder), 'database_exists': database.is_file(), 'schema_version': None,
               'configured_exchange': None, 'portfolio_scopes': [], 'unresolved_orders': [],
-              'unresolved_order_count': 0, 'legacy_live_record_count': 0,
+              'unresolved_order_count': 0, 'unbooked_fill_count': 0, 'legacy_live_record_count': 0,
               'live_halt_exchanges': [], 'incomplete_manual_request_counts': {'pending': 0, 'failed': 0, 'malformed': 0},
               'incomplete_manual_requests': [], 'report_warnings': [],
               'settings_review_recorded': False, 'settings_recovery_reason': None}
@@ -153,14 +187,24 @@ def _read_report(folder: Path) -> dict:
             # Paper intents (schema 3+) have no exchange-side effect and never block live trading.
             live_only = " AND mode='live'" if 'mode' in columns else ''
             report['unresolved_order_count'] = connection.execute("SELECT COUNT(*) FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled')" + live_only).fetchone()[0]
-            orders = connection.execute("SELECT intent_id,created_at,exchange,symbol,side,status FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled')" + live_only + " ORDER BY created_at LIMIT 1000")
+            report['unbooked_fill_count'] = connection.execute("SELECT COUNT(*) FROM order_journal WHERE status='filled'" + live_only).fetchone()[0]
+            # When the request left, when the exchange acknowledged it and what
+            # it filled: a 'filled' intent that was never booked, or a 'pending'
+            # one that never left, is then recognisable before --clear-halt.
+            detail = [name for name in ('submitted_at', 'acked_at', 'filled_quantity', 'filled_price') if name in columns]
+            orders = connection.execute("SELECT intent_id,created_at,exchange,symbol,side,status" + ''.join(',' + name for name in detail)
+                                        + " FROM order_journal WHERE status NOT IN ('accounted','rejected','reconciled')" + live_only + " ORDER BY created_at LIMIT 1000")
             for row in orders:
                 report['unresolved_orders'].append({
-                    'intent_id': row['intent_id'] if isinstance(row['intent_id'], str) and re.fullmatch('[0-9a-f]{32}', row['intent_id']) else None,
+                    'intent_id': _intent_id(row['intent_id']),
                     'created_at': _timestamp(row['created_at']), 'exchange': _exchange(row['exchange']),
-                    'symbol': row['symbol'] if isinstance(row['symbol'], str) and re.fullmatch(r'[A-Z0-9][A-Z0-9._-]{0,23}/USDT', row['symbol']) else None,
+                    'symbol': _symbol(row['symbol']),
                     'side': row['side'] if row['side'] in ('BUY', 'SELL') else 'unknown',
                     'status': row['status'] if row['status'] in STATUSES else 'unknown',
+                    'submitted_at': _timestamp(row['submitted_at']) if 'submitted_at' in detail else None,
+                    'acked_at': _timestamp(row['acked_at']) if 'acked_at' in detail else None,
+                    'filled_quantity': _number(row['filled_quantity']) if 'filled_quantity' in detail else None,
+                    'filled_price': _number(row['filled_price']) if 'filled_price' in detail else None,
                 })
         return report
     finally:
@@ -181,12 +225,15 @@ def report(folder: Path | None = None) -> dict:
         return _read_report(location)
 
 
-def clear_halt(folder: Path | None, exchange: str, confirmation: str) -> dict:
+def clear_halt(folder: Path | None, exchange: str, confirmation: str, *, acknowledge_unbooked_fills: bool = False) -> dict:
     """Record a completed manual reconciliation for one exchange.
 
     Unresolved order intents become 'reconciled' and the durable halt flag is
     removed, in one transaction with an audit entry. Legacy live records are
-    untouched: they need a reviewed ledger repair, not a reset.
+    untouched: they need a reviewed ledger repair, not a reset. An intent in
+    status 'filled' (the exchange filled it, the ledger never booked it) makes
+    the tool refuse unless ``acknowledge_unbooked_fills`` says the position
+    has been corrected by hand; the refusal names each fill.
     """
     if exchange not in EXCHANGES:
         raise ValueError('Unsupported exchange.')
@@ -208,13 +255,22 @@ def clear_halt(folder: Path | None, exchange: str, confirmation: str) -> dict:
             placeholders = ','.join('?' * len(RESOLVED))
             journal_columns = {row[1] for row in connection.execute('PRAGMA table_info(order_journal)')}
             live_only = " AND mode='live'" if 'mode' in journal_columns else ''
+            with_fills = {'filled_quantity', 'filled_price'} <= journal_columns
+            unbooked = connection.execute(
+                'SELECT intent_id,symbol,side' + (',filled_quantity,filled_price' if with_fills else '')
+                + " FROM order_journal WHERE exchange=? AND status='filled'" + live_only + ' ORDER BY created_at LIMIT 1000',
+                (exchange,)).fetchall()
+            if unbooked and not acknowledge_unbooked_fills:
+                raise ValueError(_unbooked_fill_message(exchange, unbooked, with_fills))
             reconciled = connection.execute(
                 f'UPDATE order_journal SET status=?,updated_at=? WHERE exchange=? AND status NOT IN ({placeholders})' + live_only,
                 ('reconciled', timestamp, exchange, *RESOLVED)).rowcount
             removed = connection.execute('DELETE FROM meta WHERE key=? AND value=?', ('live_halt.' + exchange, '1')).rowcount
             connection.execute('INSERT INTO audit(created_at,level,message) VALUES (?,?,?)',
                                (timestamp, 'warning', f'{exchange.upper()} live halt cleared by the recovery tool after confirmed manual reconciliation; '
-                                                      f'{reconciled} order intent(s) marked reconciled.'))
+                                                      f'{reconciled} order intent(s) marked reconciled'
+                                                      + (f'; {len(unbooked)} filled-but-unbooked intent(s) acknowledged by the operator' if unbooked else '')
+                                                      + '.'))
             legacy = 0
             for table in ('positions', 'trades'):
                 if table in tables and {'mode', 'exchange'} <= {row[1] for row in connection.execute(f'PRAGMA table_info({table})')}:
@@ -235,8 +291,9 @@ def clear_halt(folder: Path | None, exchange: str, confirmation: str) -> dict:
                   'another exchange still block live trading; reconcile that exchange and run --clear-halt for it.')
     else:
         notice = 'Live trading for this exchange is no longer halted by the journal.'
-    return {'exchange': exchange, 'reconciled_orders': reconciled, 'halt_flag_removed': bool(removed),
-            'legacy_live_record_count': legacy, 'other_exchange_unresolved': others, 'notice': notice}
+    return {'exchange': exchange, 'reconciled_orders': reconciled, 'unbooked_fills_acknowledged': len(unbooked),
+            'halt_flag_removed': bool(removed), 'legacy_live_record_count': legacy, 'other_exchange_unresolved': others,
+            'notice': notice}
 
 
 def prepare_downgrade(folder: Path | None, confirmation: str) -> dict:
@@ -324,12 +381,18 @@ def main(argv=None) -> int:
     parser.add_argument('--confirm', default='',
                         help='Required with --clear-halt: the exact phrase "I HAVE RECONCILED <EXCHANGE> ORDERS". '
                              f'Required with --prepare-downgrade: "{DOWNGRADE_PHRASE}".')
+    parser.add_argument('--acknowledge-unbooked-fills', action='store_true',
+                        help='With --clear-halt: also mark intents the exchange filled but the ledger never booked as '
+                             'reconciled, after the position has been corrected by hand. Without it they make --clear-halt refuse.')
     parser.add_argument('--prepare-downgrade', action='store_true',
                         help='Before running a build older than schema 3: save a copy of the database and return the '
                              'order journal to the layout that build writes.')
     args = parser.parse_args(argv)
     try:
         folder = data_directory().resolve()
+        if args.acknowledge_unbooked_fills and not args.clear_halt:
+            print('--acknowledge-unbooked-fills only applies with --clear-halt.', file=sys.stderr)
+            return 1
         if args.prepare_downgrade:
             if args.clear_halt or args.output is not None:
                 print('Use --prepare-downgrade on its own, with --confirm.', file=sys.stderr)
@@ -341,7 +404,7 @@ def main(argv=None) -> int:
             if args.output is not None:
                 print('Use --output with a report, not with --clear-halt.', file=sys.stderr)
                 return 1
-            result = clear_halt(folder, args.clear_halt, args.confirm)
+            result = clear_halt(folder, args.clear_halt, args.confirm, acknowledge_unbooked_fills=args.acknowledge_unbooked_fills)
             print(json.dumps(result, indent=2, allow_nan=False))
             return 0
         destination = args.output.expanduser().resolve() if args.output is not None else None

@@ -105,7 +105,11 @@ class TradingEngine:
         self.last_universe_update = 0.0
         self.discovered: list[str] = []
         self.risk_block = None
+        closed = storage.reject_never_sent_live_intents()
+        if closed:
+            storage.audit('warning', f'{closed} live order intent(s) that were never handed to the exchange were closed at startup; nothing was sent.')
         self.live_halted = self._durable_live_block()
+        self._audit_hidden_live_positions()
         self.risk = risk.RiskGate(self)
         self.metrics = observability.METRICS
         self._last_authorization: risk.Authorization | None = None
@@ -255,6 +259,16 @@ class TradingEngine:
         if storage.get_meta(self._key('live_halt')) == '1':
             parts.append(f'{self.exchange_name}: durable halt flag')
         return '; '.join(parts) or 'see the recovery report'
+
+    def _audit_hidden_live_positions(self) -> int:
+        """Say when live holdings exist while the app is in paper mode: their stored stops are not monitored."""
+        if self.mode != 'paper':
+            return 0
+        hidden = len(self._active_positions('live'))
+        if hidden:
+            storage.audit('warning', f'{hidden} live position(s) are stored for {self.exchange_name.upper()} while the app is in paper '
+                                     'mode; their stored stops are not monitored until live trading is enabled and the bot is started.')
+        return hidden
 
     def _busy(self) -> bool:
         return bool(self.control_busy or self.running or (self.thread and self.thread.is_alive()) or self.scan_lock.locked())
@@ -447,6 +461,7 @@ class TradingEngine:
                 self.risk_block = None
                 storage.audit('info', 'Trading mode: PAPER (simulation).')
                 observability.event('mode.changed', mode='paper', exchange=self.exchange_name)
+                self._audit_hidden_live_positions()
             elif mode == 'live':
                 refusal = micro_policy.live_refusal('live', horizon=self.cfg.get('time_horizon'))
                 if refusal:
@@ -515,6 +530,7 @@ class TradingEngine:
             changed_from = self.exchange_name
             if changed_exchange:
                 self.exchange_name = revised['exchange']
+                storage.abandon_stale_paper_intents(self.exchange_name)   # as at start-up, for the exchange now in use
                 self.public, self.data = candidate_public, candidate_data
                 self.paper = self._new_paper_exchange()
                 self._stop_feed()
@@ -529,6 +545,7 @@ class TradingEngine:
                 self.market_rows, self.discovered = [], []
                 self.last_universe_update = self.markets_loaded_at = self.markets_retry_at = 0
                 self.live_halted = self._durable_live_block()
+                self._audit_hidden_live_positions()
                 self._restore_from_keyring()
                 # The micro explanations and per-pair memory belong to the exchange they were made for.
                 self.micro.reset_memory()
@@ -2683,6 +2700,8 @@ class TradingEngine:
                         'state': 'off', 'enabled': bool(self.cfg.get('streaming_quotes'))},
                     'unresolved_orders': len(unresolved), 'unresolved_probe': list(self.unresolved_probe),
                     'legacy_live_records': storage.legacy_live_records(),
+                    # Live holdings exist whatever the mode; in paper mode their stops are not monitored.
+                    'live_positions': len(positions) if mode == 'live' else len(self._active_positions('live')),
                     'micro': micro_status,
                     'trades': storage.rows('SELECT * FROM trades WHERE exchange=? AND mode=? ORDER BY id DESC LIMIT 70',
                                            (exchange, mode)),

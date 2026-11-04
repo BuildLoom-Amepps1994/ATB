@@ -46,6 +46,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='milliseconds')
 
 
+_STREAK_SCAN = 1000     # sells read per streak count; the limit's bound is 50
+
+
 def _finite(value) -> float | None:
     try:
         number = float(value)
@@ -248,51 +251,85 @@ class RiskGate:
         return None
 
     # ------------------------------------------------------- loss streak
-    def loss_streak(self, mode: str) -> dict:
-        """Today's run of consecutive losing exits: ``{'date', 'count', 'latched_at'}``."""
+    def _streak_record(self, mode: str) -> dict:
+        """Today's stored streak state: only the latch time and the clearing point."""
         try:
             record = json.loads(storage.get_meta(self._key('loss_streak', mode)) or 'null')
         except ValueError:
             record = None
         if not isinstance(record, dict) or record.get('date') != _today():
-            return {'date': _today(), 'count': 0, 'latched_at': None}
-        count = _finite(record.get('count'))
-        return {'date': _today(), 'count': int(count) if count and count > 0 else 0,
-                'latched_at': record.get('latched_at') or None}
+            return {'date': _today(), 'latched_at': None, 'after_trade_id': 0}
+        after = _finite(record.get('after_trade_id'))
+        return {'date': _today(), 'latched_at': record.get('latched_at') or None,
+                'after_trade_id': int(after) if after and after > 0 else 0}
+
+    def _streak_count(self, mode: str, record: dict) -> int:
+        rows = storage.rows("SELECT realized FROM trades WHERE exchange=? AND mode=? AND side='SELL' AND id>? AND created_at>=? "
+                            'ORDER BY id DESC LIMIT ?',
+                            (self.engine.exchange_name, mode, record['after_trade_id'], record['date'], _STREAK_SCAN))
+        count = 0
+        for row in rows:
+            value = _finite(row['realized'])
+            if value is None or value >= 0:
+                break
+            count += 1
+        return count
+
+    def loss_streak(self, mode: str) -> dict:
+        """Today's run of consecutive losing exits: ``{'date', 'count', 'latched_at'}``.
+
+        The count is read from the trade ledger (today's booked sells, newest
+        first, back to the last cleared one), never from a separate counter, so
+        a crash after a booked exit cannot lose a loss. Every booked sell
+        counts, automatic, manual or micro. Only the latch time and the
+        clearing point are stored.
+        """
+        record = self._streak_record(mode)
+        return {'date': record['date'], 'count': self._streak_count(mode, record), 'latched_at': record['latched_at']}
 
     def loss_streak_stop(self, mode: str) -> str | None:
-        """ISO time at which today's consecutive-loss stop latched, or None."""
-        return self.loss_streak(mode)['latched_at']
+        """ISO time at which today's consecutive-loss stop latched, or None.
+
+        A streak already at the limit that was never latched (the process
+        stopped after the exit was booked) latches here, so the check that
+        reads it blocks the entry.
+        """
+        return self._latch_at_limit(mode)['latched_at']
 
     def observe_exit(self, mode: str, realized: float) -> str | None:
-        """Count a booked exit's realised P/L and latch the consecutive-loss stop at the limit.
+        """Re-read today's streak after a booked exit and latch the consecutive-loss stop at the limit.
 
-        Called by the engine after every booked sell (automatic or manual). A
-        losing exit extends today's streak, any other exit ends it. When the
-        streak reaches ``max_consecutive_losses`` (0 = off) new entries are
-        blocked for the rest of the UTC day, or until ``RESUME TRADING``
-        clears it (``clear_loss_streak_stop``); exits are never blocked.
-        Returns the latch time.
+        Called by the engine after every booked sell (automatic or manual);
+        ``realized`` is that sell's booked P/L, already in the ledger the
+        count is read from. When the streak reaches ``max_consecutive_losses``
+        (0 = off) new entries are blocked for the rest of the UTC day, or until
+        ``RESUME TRADING`` clears it (``clear_loss_streak_stop``); exits are
+        never blocked. Returns the latch time.
         """
+        return self._latch_at_limit(mode)['latched_at']
+
+    def _latch_at_limit(self, mode: str) -> dict:
         limit = int(self.engine.cfg.get('max_consecutive_losses', storage.DEFAULTS['max_consecutive_losses']) or 0)
-        current = self.loss_streak(mode)
-        value = _finite(realized)
-        count = current['count'] + 1 if value is not None and value < 0 else 0
-        latched_at = current['latched_at']
+        record = self._streak_record(mode)
+        count = self._streak_count(mode, record)
+        latched_at = record['latched_at']
         if limit > 0 and count >= limit and not latched_at:
             latched_at = _now_iso()
-        storage.set_meta(self._key('loss_streak', mode), json.dumps({'date': _today(), 'count': count, 'latched_at': latched_at}))
-        if latched_at and not current['latched_at']:
+            storage.set_meta(self._key('loss_streak', mode), json.dumps({**record, 'latched_at': latched_at}))
             storage.audit('error', f'{mode.upper()} consecutive-loss stop latched: {count} losing exits in a row today '
                                    f'(limit {limit}). New entries are blocked until the next UTC day or until cleared with {RELEASE_PHRASE}.')
             observability.event('risk.loss_streak_stop', level='error', mode=mode, count=count, limit=limit)
             self.metrics.incr('risk.loss_streak_stop_latched')
-        return latched_at
+        return {'date': record['date'], 'count': count, 'latched_at': latched_at}
 
     def clear_loss_streak_stop(self, mode: str, confirmation: str) -> None:
         if confirmation != RELEASE_PHRASE:
             raise storage.ConfigValidationError(f'Type {RELEASE_PHRASE} to clear the consecutive-loss stop.')
-        storage.set_meta(self._key('loss_streak', mode), json.dumps({'date': _today(), 'count': 0, 'latched_at': None}))
+        # The streak restarts after the last booked sell: earlier losses stay in the ledger but no longer count.
+        latest = storage.rows("SELECT COALESCE(MAX(id),0) AS id FROM trades WHERE exchange=? AND mode=? AND side='SELL'",
+                              (self.engine.exchange_name, mode))[0]['id']
+        storage.set_meta(self._key('loss_streak', mode),
+                         json.dumps({'date': _today(), 'latched_at': None, 'after_trade_id': int(latest or 0)}))
         storage.audit('warning', f'{mode.upper()} consecutive-loss stop cleared after explicit confirmation; the streak restarts at zero.')
         observability.event('risk.loss_streak_stop_cleared', level='warning', mode=mode)
 

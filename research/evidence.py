@@ -7,7 +7,10 @@ split, the statistics of its closed trades: count, win rate, profit factor,
 expectancy, payoff ratio, worst trade, trade-level expected shortfall, the
 t statistic and a bootstrap interval of the mean trade. It also counts the
 trials those files record, which is the number a deflated Sharpe ratio has to
-be read against.
+be read against, and for the portfolio-level studies (``trend-portfolio-v1``,
+``trend-rotation-v1``), which store an annualised Sharpe ratio per variant
+and split, it reports the expected maximum Sharpe ratio of that many
+variants with no skill and each variant's deflated Sharpe ratio.
 
 The files hold each trade's net return on its own budget, not an equity
 series, so Sharpe, Sortino, Calmar and drawdown duration cannot be computed
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -75,8 +79,72 @@ def _row(file: str, candidate: str, split: str, trades: list[float]) -> dict:
             'mean_ci95_pct': None if ci['low'] is None else [round(100 * ci['low'], 3), round(100 * ci['high'], 3)]}
 
 
+def _account_sharpes(payload: dict) -> list[tuple[str, str, dict]]:
+    """(variant, split, figures) for portfolio-level files that store a Sharpe ratio per split.
+
+    ``trend-portfolio-v1`` and ``trend-rotation-v1`` keep, per variant and
+    split, the account return, the annualised Sharpe ratio, the maximum
+    drawdown and the trade count instead of a trade list.
+    """
+    out = []
+    for key, block in (payload.get('results') or {}).items():
+        if not isinstance(block, dict):
+            continue
+        for split, entry in block.items():
+            if isinstance(entry, dict) and isinstance(entry.get('sharpe'), (int, float)) and 'return_pct' in entry:
+                out.append((key, split, entry))
+    return out
+
+
+def _validation_days(payload: dict) -> int | None:
+    splits = (payload.get('protocol') or {}).get('splits') if isinstance(payload.get('protocol'), dict) else None
+    window = (splits or {}).get('validation') if isinstance(splits, dict) else None
+    if not (isinstance(window, (list, tuple)) and len(window) == 2 and all(window)):
+        return None
+    try:
+        from datetime import date
+        return (date.fromisoformat(window[1]) - date.fromisoformat(window[0])).days
+    except (TypeError, ValueError):
+        return None
+
+
+def selection_adjusted(files: dict[str, dict], *, periods_per_year: int = 365) -> dict | None:
+    """Read every validation Sharpe ratio of the portfolio-level studies against the number of variants tried.
+
+    The expected maximum Sharpe ratio of ``n`` variants with no skill
+    (Bailey and Lopez de Prado, 2014) is computed from the spread of the
+    recorded validation Sharpe ratios; each variant's deflated Sharpe ratio
+    is the probability that its true Sharpe ratio exceeds that maximum,
+    judged over the validation window at daily resolution. A deflated value
+    near 0.5 means the variant is about what the best of ``n`` noise trials
+    would show.
+    """
+    trials, days = [], None
+    for name, payload in files.items():
+        for variant, split, entry in _account_sharpes(payload):
+            if split == 'validation':
+                trials.append((name, variant, float(entry['sharpe']), entry))
+                days = days or _validation_days(payload)
+    if len(trials) < 2 or not days:
+        return None
+    annual = [sharpe for _, _, sharpe, _ in trials]
+    variance = metrics.statistics.variance(annual)
+    rows = []
+    for name, variant, sharpe, entry in sorted(trials, key=lambda t: -t[2]):
+        per_period = sharpe / math.sqrt(periods_per_year)
+        deflated = metrics.deflated_sharpe(per_period, days, trials=len(trials), sharpe_variance=variance / periods_per_year)
+        rows.append({'file': name, 'variant': variant, 'validation_sharpe': round(sharpe, 3),
+                     'validation_return_pct': entry.get('return_pct'), 'max_drawdown_pct': entry.get('max_drawdown_pct'),
+                     'trades': entry.get('trades'),
+                     'probabilistic_sharpe': metrics.probabilistic_sharpe(per_period, days),
+                     'deflated_sharpe': deflated['deflated_sharpe']})
+    return {'trials': len(trials), 'validation_days': days, 'sharpe_mean': round(metrics.statistics.fmean(annual), 3),
+            'sharpe_sd': round(math.sqrt(variance), 3),
+            'expected_max_sharpe_of_noise': metrics.expected_max_sharpe(len(trials), variance), 'rows': rows}
+
+
 def collect(directory: Path = RESULTS) -> dict:
-    rows, trials = [], {}
+    rows, trials, account_files = [], {}, {}
     for path in sorted(directory.glob('*.json')):
         try:
             payload = json.loads(path.read_text(encoding='utf-8'))
@@ -90,8 +158,15 @@ def collect(directory: Path = RESULTS) -> dict:
             rows.append(_row(path.name, candidate, split, trades))
             if split in ('development', 'validation'):
                 trials.setdefault(protocol or path.name, set()).add(candidate)
+        account = _account_sharpes(payload)
+        if account:
+            account_files[path.name] = payload
+            for variant, split, _ in account:
+                if split in ('development', 'validation'):
+                    trials.setdefault(protocol or path.name, set()).add(variant)
     counted = {name: sorted(values) for name, values in trials.items()}
     return {'rows': rows, 'trials': counted, 'trial_count': sum(len(v) for v in counted.values()),
+            'selection_adjusted': selection_adjusted(account_files),
             'note': ('Trade-level statistics only: each file stores every closed trade\'s net return on its own '
                      'budget, not an equity series, so Sharpe, Sortino, Calmar and drawdown duration are not '
                      'derivable here. The trial count is the number of distinct candidate variants that read the '
@@ -119,6 +194,21 @@ def markdown(report: dict) -> str:
     lines.append('')
     lines.append(f'Trials recorded on development or validation data: {report["trial_count"]} '
                  + ', '.join(f'{name}: {len(values)}' for name, values in report['trials'].items()))
+    adjusted = report.get('selection_adjusted')
+    if adjusted:
+        lines.append('')
+        lines.append(f'Portfolio-level studies: {adjusted["trials"]} variants read the validation window '
+                     f'({adjusted["validation_days"]} days); their annualised Sharpe ratios average '
+                     f'{adjusted["sharpe_mean"]:+.2f} (sd {adjusted["sharpe_sd"]:.2f}), so the best of that many '
+                     f'variants with no skill would be expected to show about '
+                     f'{adjusted["expected_max_sharpe_of_noise"]:.2f}.')
+        lines.append('')
+        lines.append('| File | Variant | Validation Sharpe | Return % | Max drawdown % | Trades | Probabilistic Sharpe | Deflated Sharpe |')
+        lines.append('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |')
+        for r in adjusted['rows']:
+            lines.append('| ' + ' | '.join(_fmt(r[k]) for k in (
+                'file', 'variant', 'validation_sharpe', 'validation_return_pct', 'max_drawdown_pct', 'trades',
+                'probabilistic_sharpe', 'deflated_sharpe')) + ' |')
     lines.append('')
     lines.append(report['note'])
     return '\n'.join(lines)

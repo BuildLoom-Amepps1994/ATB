@@ -104,7 +104,30 @@ def test_evidence_reads_every_result_format(data_dir, tmp_path):
     assert 'Trials recorded' in text and 'trend.json' in text
 
 
+def test_evidence_reads_portfolio_level_sharpes_against_the_number_of_variants(tmp_path):
+    results = tmp_path / 'results'
+    results.mkdir()
+    variants = {f'v{i}': {'development': {'return_pct': 10.0, 'sharpe': 1.0, 'max_drawdown_pct': 30.0, 'trades': 50},
+                          'validation': {'return_pct': i - 5.0, 'sharpe': (i - 5) / 10, 'max_drawdown_pct': 40.0, 'trades': 20}}
+                for i in range(12)}
+    (results / 'portfolio.json').write_text(json.dumps({
+        'protocol': {'version': 'trend-portfolio-v1',
+                     'splits': {'development': [None, '2024-01-01'], 'validation': ['2024-01-01', '2025-05-01']}},
+        'results': variants}))
+    report = evidence.collect(results)
+    adjusted = report['selection_adjusted']
+    assert adjusted['trials'] == 12 and adjusted['validation_days'] == 486
+    assert report['trial_count'] == 12 and report['rows'] == []
+    assert adjusted['rows'][0]['variant'] == 'v11' and adjusted['rows'][0]['validation_sharpe'] == 0.6
+    assert 0 < adjusted['expected_max_sharpe_of_noise'] < 1
+    assert all(0 < r['deflated_sharpe'] < 1 for r in adjusted['rows'])
+    assert adjusted['rows'][0]['deflated_sharpe'] > adjusted['rows'][-1]['deflated_sharpe']
+    assert 'Deflated Sharpe' in evidence.markdown(report)
+    assert evidence.collect(tmp_path / 'empty')['selection_adjusted'] is None
+
+
 def test_evidence_on_the_committed_results_runs():
     report = evidence.collect()
     assert report['rows'], 'research/results/classic must hold walk-forward results'
     assert all(r['trades'] >= 0 for r in report['rows'])
+    assert report['selection_adjusted']['trials'] >= 26          # trend-portfolio-v1 and trend-rotation-v1

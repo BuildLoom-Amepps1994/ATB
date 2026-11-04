@@ -194,7 +194,9 @@ def ensure_ok(action):
         raise HTTPException(status_code=503, detail='Market data is temporarily unavailable. Try again after the cooldown.', headers={'Retry-After': '30'}) from None
     except credentials.CredentialStoreUnavailable:
         raise HTTPException(status_code=400, detail='Saved credential access or removal could not be verified. Check the operating-system credential manager.') from None
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError) as exc:
+        # The message sends the operator to the activity list: write the line it promises (type name only).
+        _record_failure(exc)
         raise HTTPException(status_code=400, detail='Action unavailable. Check settings, stop the bot if necessary, and review local activity.') from None
     except Exception as exc:
         # Log the exception type only. Exchange text can contain signed requests.
@@ -258,7 +260,7 @@ def reset_paper():
 
 
 class RiskAction(StrictModel):
-    action: str = Field(pattern='^(engage|release|clear_drawdown_stop|clear_realized_stop)$')
+    action: str = Field(pattern='^(engage|release|clear_drawdown_stop|clear_realized_stop|clear_loss_streak_stop)$')
     confirmation: str = Field(default='', max_length=40)
     allow_exits: bool = True
     reason: str = Field(default='', max_length=200)
@@ -274,6 +276,8 @@ def risk_action(req: RiskAction):
             return engine.risk.release_kill_switch(req.confirmation)
         if req.action == 'clear_realized_stop':
             engine.risk.clear_realized_stop(engine.mode, req.confirmation)
+        elif req.action == 'clear_loss_streak_stop':
+            engine.risk.clear_loss_streak_stop(engine.mode, req.confirmation)
         else:
             engine.risk.clear_drawdown_stop(engine.mode, req.confirmation)
         return engine.risk.status()

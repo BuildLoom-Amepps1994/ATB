@@ -17,6 +17,8 @@ import math
 import time
 from typing import Any
 
+import json
+
 import ccxt
 
 FINAL_STATUSES = ('closed', 'canceled', 'cancelled', 'expired', 'rejected')
@@ -36,15 +38,55 @@ def _positive(value) -> float:
     return number if math.isfinite(number) and number > 0 and not isinstance(value, bool) else 0.0
 
 
+class ConfirmedRefusal(Exception):
+    """The venue answered the request with an error and a successful lookup found no order under its client id.
+
+    Raised by the engine in place of the venue's own error so the submit path
+    journals the intent as rejected instead of uncertain: the venue processed
+    the request and refused it, and its order lists hold nothing for the id.
+    """
+
+    def __init__(self, original: Exception):
+        super().__init__(f'{type(original).__name__}; the venue refused the request and holds no order for its client id')
+        self.original = original
+
+
 def definite_rejections() -> tuple[type, ...]:
     """CCXT errors that document the exchange refused the request outright.
 
     Transport errors, timeouts and unrecognized responses are never in this
-    list: the exchange may have accepted the order anyway.
+    list: the exchange may have accepted the order anyway. ``ConfirmedRefusal``
+    is the engine's own class for a venue error response confirmed by a lookup.
     """
-    return tuple(cls for name in ('InsufficientFunds', 'InvalidOrder', 'AuthenticationError', 'PermissionDenied',
-                                  'BadSymbol', 'BadRequest', 'NotSupported')
-                 if isinstance(cls := getattr(ccxt, name, None), type))
+    return (ConfirmedRefusal, *(cls for name in ('InsufficientFunds', 'InvalidOrder', 'AuthenticationError', 'PermissionDenied',
+                                                 'BadSymbol', 'BadRequest', 'NotSupported')
+                                if isinstance(cls := getattr(ccxt, name, None), type)))
+
+
+def venue_error_response(exc: Exception) -> bool:
+    """True when ``exc`` is the venue's own answer to the request, not a transport or parsing failure.
+
+    CCXT raises ``ExchangeError`` (and its subclasses) for an error body the
+    venue returned; transport failures, timeouts, rate limits, nonce errors
+    and unreadable responses are ``OperationFailed`` siblings, outside it.
+    Such an answer plus an order list that holds nothing for the client order
+    id means nothing was accepted.
+    """
+    if not isinstance(exc, ccxt.ExchangeError) or isinstance(exc, getattr(ccxt, 'OperationFailed', ())):
+        return False
+    # CCXT also raises a bare ExchangeError for a failed transport it could not
+    # classify (an HTML 5xx page, a redirect loop, a TLS error), with the text
+    # "<id> <method> <url>" and no body. Only an answer that carries the venue's
+    # own JSON body (a code, a message or an error list) is the venue's refusal.
+    text = str(exc)
+    start = text.find('{')
+    if start < 0:
+        return False
+    try:
+        body = json.loads(text[start:])
+    except ValueError:
+        return False
+    return isinstance(body, dict) and any(key in body for key in ('code', 'msg', 'error', 'errors'))
 
 
 def classify(order: Any) -> str:
@@ -74,7 +116,7 @@ def order_params(exchange_name: str, client_order_id: str) -> dict:
 
 
 def supports_client_id_lookup(client) -> bool:
-    """MEXC resolves fetchOrder by origClientOrderId; Kraken maps clientOrderId to userref."""
+    """MEXC resolves fetchOrder by origClientOrderId; CCXT 4.5 sends Kraken's clientOrderId as cl_ord_id, which its order lookups do not take."""
     return getattr(client, 'id', None) == 'mexc' and bool(getattr(client, 'has', {}).get('fetchOrder'))
 
 

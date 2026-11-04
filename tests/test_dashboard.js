@@ -147,6 +147,18 @@ test('every element the dashboard script looks up exists in the page', () => {
   assert.deepEqual(used.filter(id => !ids.has(id)), []);
 });
 
+test('open circuit breakers become one warning each and a closed one is silent', () => {
+  const {breakerWarnings} = require('../static/dashboard-core.js');
+  assert.deepEqual(breakerWarnings(undefined), []);
+  assert.deepEqual(breakerWarnings({breakers_open: {}}), []);
+  assert.deepEqual(breakerWarnings({breakers_open: {slippage: 0, reject_spike: -3, failures: 'soon'}}), []);
+  const warnings = breakerWarnings({breakers_open: {failures: 1799.4, reject_spike: 600, other: 12}});
+  assert.equal(warnings.length, 3);
+  assert.match(warnings[0], /^Entries paused by the execution-failure circuit breaker for another 1800 s; protective exits continue/);
+  assert.match(warnings[1], /rejection-spike circuit breaker for another 600 s/);
+  assert.match(warnings[2], /the other circuit breaker/);
+});
+
 test('micro amounts never hide a sign or a non-zero value behind rounding', () => {
   assert.equal(microAmount('-0.00003'), '-0.00003');
   assert.equal(microAmount('0'), '0.0000');

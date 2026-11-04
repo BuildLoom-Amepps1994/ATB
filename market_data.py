@@ -39,6 +39,8 @@ class MarketData:
         self.concurrency = max(1, int(concurrency))
         self._inflight: dict = {}
         self._prefetch_errors: dict = {}
+        self._clock_measured: float | None = None
+        self._clock_measured_mono = float('-inf')
         if self.concurrency == 1:
             self._bulk_slots = self._quote_slots = threading.Lock()
         else:
@@ -147,13 +149,57 @@ class MarketData:
     def markets(self):
         return self.read('load_markets')
 
-    def _clock_offset(self):
-        """Local-minus-exchange seconds, as CCXT measured it (MEXC); else zero."""
+    OFFSET_REFRESH_SECONDS = 900
+    FORCED_REFRESH_SECONDS = 60      # a rejected exchange timestamp may ask for an early re-measurement
+
+    def clock_offset(self) -> float:
+        """Local-minus-exchange seconds: the latest server-time measurement, else CCXT's figure (MEXC), else zero."""
+        with self.lock:
+            measured = self._clock_measured
+        if measured is not None:
+            return measured
         options = getattr(self.client, 'options', None)
         difference = options.get('timeDifference') if isinstance(options, dict) else None
         if isinstance(difference, bool) or not isinstance(difference, (int, float)) or not math.isfinite(difference):
             return 0.0
         return difference / 1000
+
+    _clock_offset = clock_offset
+
+    def refresh_clock_offset(self, *, force: bool = False) -> float | None:
+        """Measure local-minus-exchange seconds from the public server time, at most every 15 minutes.
+
+        Exchanges stamp candles and quotes with their own clock, and CCXT
+        measures the difference only for MEXC and only when it loads the
+        catalogue. Without a measurement a PC clock that runs ahead treats
+        a still-open Kraken candle as complete. A failed read keeps the last
+        measurement; a client without a server-time endpoint keeps CCXT's
+        figure or zero.
+        """
+        fetch = getattr(self.client, 'fetch_time', None)
+        has = getattr(self.client, 'has', None)
+        if not callable(fetch) or (isinstance(has, dict) and has.get('fetchTime') is False):
+            return None
+        with self.lock:
+            window = self.FORCED_REFRESH_SECONDS if force else self.OFFSET_REFRESH_SECONDS
+            if self.monotonic() < self._clock_measured_mono + window:
+                return self._clock_measured
+            # One attempt per refresh window, whatever its outcome.
+            self._clock_measured_mono = self.monotonic()
+        before = self.clock()
+        try:
+            server_ms = self.read('fetch_time', attempts=1)
+        except Exception:
+            self.metrics['clock_offset_failures'] += 1
+            return self._clock_measured
+        after = self.clock()
+        if isinstance(server_ms, bool) or not isinstance(server_ms, (int, float)) or not math.isfinite(server_ms) or server_ms <= 0:
+            return self._clock_measured
+        offset = (before + after) / 2 - server_ms / 1000
+        with self.lock:
+            self._clock_measured = offset
+        self.metrics['clock_offset_measurements'] += 1
+        return offset
 
     def _received(self, ticker, received):
         # Exchanges without ticker timestamps are aged from the response time.
@@ -269,7 +315,8 @@ class MarketData:
         # Candle times are exchange time. The completion cut-off is taken
         # before the request: a candle that closed while the response was
         # in flight was still open when the exchange assembled it.
-        offset, duration = self._clock_offset(), SECONDS[timeframe]
+        self.refresh_clock_offset()
+        offset, duration = self.clock_offset(), SECONDS[timeframe]
         cutoff = stamp - offset
         raw = self.read('fetch_ohlcv',symbol,timeframe,limit=limit)
         stamp = self.clock()
@@ -289,11 +336,13 @@ class MarketData:
                 self.cache.pop(next(iter(self.cache)))
         return result.copy()
 
-    def prefetch(self, requests):
+    def prefetch(self, requests, *, cancelled=None):
         """Download uncached candle frames in the background, ``concurrency``-1 at a time.
 
         Returns at once. Results land in the cache; ``candles`` waits for a
         download in flight and re-raises a failure once instead of repeating it.
+        ``cancelled`` (a callable) stops the remaining downloads once it
+        returns true, so a Stop does not keep spending the rate budget.
         """
         if self.concurrency < 2:
             return []
@@ -303,7 +352,8 @@ class MarketData:
         def drain():
             while True:
                 with lock:
-                    if not work:
+                    if not work or (cancelled is not None and cancelled()):
+                        work.clear()
                         return
                     symbol, timeframe, limit = work.pop(0)
                 if self.cached_candles(symbol, timeframe, limit) is not None:

@@ -132,7 +132,16 @@
     const stops = [];
     if (risk?.drawdown_stop) stops.push({action: 'clear_drawdown_stop', label: 'drawdown stop'});
     if (risk?.realized_stop) stops.push({action: 'clear_realized_stop', label: 'daily realised-loss stop'});
+    if (risk?.loss_streak_stop) stops.push({action: 'clear_loss_streak_stop', label: 'consecutive-loss stop'});
     return stops;
+  }
+  // One warning per open circuit breaker, so a paused bot never looks like a strategy with no setups.
+  const BREAKER_NAMES = {failures: 'execution-failure', reject_spike: 'rejection-spike', slippage: 'slippage'};
+  function breakerWarnings(risk) {
+    const open = risk && typeof risk.breakers_open === 'object' && risk.breakers_open ? risk.breakers_open : {};
+    return Object.entries(open).filter(([, seconds]) => Number.isFinite(Number(seconds)) && Number(seconds) > 0)
+      .map(([name, seconds]) => 'Entries paused by the ' + (BREAKER_NAMES[name] || String(name)) + ' circuit breaker for another '
+        + Math.ceil(Number(seconds)) + ' s; protective exits continue. A restart does not clear the cause.');
   }
   // A decimal amount from the micro status (a string such as '24.9750'). Never hides a sign or a
   // non-zero amount behind rounding: precision grows up to 8 places, then '<0.00000001' with its sign.
@@ -253,7 +262,7 @@
       warnings, budget, pairs, cycles: cycleRows, results, counters, recovery, recoveryNotes, notes,
       holding: cycleRows.filter(cycle => cycle.holding).length, latched: !!micro.latch};
   }
-  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops, microAmount, microDuration, microView, microRecoveryPrompt};
+  const api = {escapeHtml, errorMessage, requestJson, singleFlight, latestTask, selectedValue, manualOrderDraft, researchReportHtml, updateSummary, updateFooter, updateToast, latchedStops, breakerWarnings, microAmount, microDuration, microView, microRecoveryPrompt};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CryptoPilotUI = api;
 })(typeof window === 'undefined' ? globalThis : window);

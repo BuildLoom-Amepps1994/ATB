@@ -73,8 +73,18 @@ Change them while the bot is stopped.
 | `max_orders_per_minute` | 6 | Order-rate limit per exchange and mode (exits are allowed three times that). |
 | `data_max_age_seconds` | 120 | A quote older than this is stale; stale quotes block entries and fall back to REST for exits. |
 | `streaming_quotes` | off | Websocket best bid/ask while running. REST remains the fallback. |
+| `max_entry_atr_pct` | 15 % | Abnormal-volatility breaker: no entry while the signal candle's ATR exceeds this share of the price (0 = off). Exits are never judged on it. |
+| `max_volume_share_pct` | 0.5 % | Liquidity cap: an order may not exceed this share of the pair's 24 h quote turnover from the quote it was priced from; a quote with no turnover fails closed (0 = off). |
+| `max_consecutive_losses` | 4 | After this many losing exits in a row in one UTC day (automatic, manual or micro), new entries are blocked for the rest of the day or until `RESUME TRADING` (`clear_loss_streak_stop`); a winning or flat exit resets the count (0 = off). The count is read from the trade ledger, so a limit set below a streak already run blocks the next entry at once. |
 
 The minimum order is 12 USDT on both exchanges and is enforced as well.
+
+Once a last-good copy of the settings exists, a settings file that omits a
+later-added key whose approved value differs from its default (an older
+build's save, a hand edit) counts as damaged: the last-good limits stay in
+force and a review is required before live trading, exactly as for an
+unreadable file. A file missing only keys that were at their defaults is
+adopted without review.
 
 ## 4. Kill switch, latches and breakers
 
@@ -97,12 +107,14 @@ POST /api/risk  {"action": "release", "confirmation": "RESUME TRADING"}
 ```
 
 **Clear a drawdown stop** the same way with `"action": "clear_drawdown_stop"`,
-and **a realised-loss stop** with `"action": "clear_realized_stop"`, or with
+**a realised-loss stop** with `"action": "clear_realized_stop"` and **a
+consecutive-loss stop** with `"action": "clear_loss_streak_stop"`, or with
 the dashboard's **Clear latched stop** button, which appears only while one
-is latched and asks for the same phrase. Both latches are shown in
-`GET /api/state` under `risk.drawdown_stop` and `risk.realized_stop` and as a
-dashboard warning. The daily equity guard clears
-itself at the next UTC day.
+is latched and asks for the same phrase. The latches are shown in
+`GET /api/state` under `risk.drawdown_stop`, `risk.realized_stop` and
+`risk.loss_streak_stop` (with today's run under `risk.loss_streak`) and as a
+dashboard warning. The daily equity guard and the consecutive-loss stop clear
+themselves at the next UTC day.
 
 **Breakers** pause entries only, never exits, and close on their own.
 `GET /api/state` lists each open one under `risk.breakers_open` with the
@@ -177,6 +189,17 @@ How the feed subscribes:
   is owed; the breaker counters note it.
 * `uncertain` means the engine could not establish the outcome. In live mode
   this halts live trading durably. Do not restart it hoping it clears.
+* `filled` without `accounted` means the exchange filled the order but the
+  ledger never booked it (a crash or hard kill in between). The holding, or
+  the sale, is missing from positions and trades. `--clear-halt` refuses
+  while such an intent exists and names its fill.
+* A live `pending` intent with no `submitted_at` never left the process; the
+  engine closes it at start-up (`never sent; closed at startup`).
+* `Trading worker stopped: ...` in the activity log with no unresolved live
+  intent is a fault outside the order path (a locked database during a
+  protective poll, for example). It is not a durable halt: review the cause,
+  then press Start to resume the stored exits. The halt is durable only while
+  a live order outcome is open or the journal cannot be read.
 
 To clear a live halt, with the app closed and after checking every listed
 order against the exchange's own order history:
@@ -186,6 +209,22 @@ python recovery.py                     # read-only report first
 python recovery.py --clear-halt mexc --confirm "I HAVE RECONCILED MEXC ORDERS"
 ```
 
+The report lists, per unresolved intent, when it was submitted and
+acknowledged and what it filled (`submitted_at`, `acked_at`,
+`filled_quantity`, `filled_price`), plus `unbooked_fill_count`. For a
+`filled` intent, first bring the ledger in line with the exchange (the
+holding and its stop for a buy; the sale for a sell), then add
+`--acknowledge-unbooked-fills` to the command above; the audit line records
+the acknowledgement. There is deliberately no automatic booking from the
+journal: it does not hold the fill's fee. The refusal covers `filled` rows
+only: an `acked`, `submitted` or `uncertain` row may also have filled at the
+exchange without the journal knowing, so check each one in the exchange's
+order history and book any fill the same way before clearing. Bringing the
+ledger in line means editing `portfolio.sqlite3` by hand (a position row
+with its stop and target for a buy; a trade row and the position change
+for a sell) after copying the data folder; a reviewed repair command is
+roadmap item R-2 in `docs/audit/IMPROVEMENT_ROADMAP.md`.
+
 The probe on **Connect** helps: for each unresolved intent it reports whether
 the exchange knows an order with that client order id and what state it is in.
 
@@ -193,7 +232,8 @@ the exchange knows an order with that client order id and what state it is in.
 
 * **Activity log** (dashboard and `audit` table): human-readable, redacted,
   bounded.
-* **Event log** `logs/events.jsonl` (rotated, 5 MB × 3): one JSON object per
+* **Event log** `logs/events.jsonl` (rotated at 5 MB, the current file plus
+  three backups, 20 MB in all): one JSON object per
   line with `ts`, `kind`, `level` and fields. Secrets and key-like strings are
   redacted before writing. Event kinds: `engine.start`, `engine.started`,
   `engine.stopped`, `mode.changed`, `settings.saved`, `paper.reset`,
@@ -305,7 +345,13 @@ Each hardening step is one commit on the feature branch, so a rollback is a
   migrates the file forward again at its next start. Reverting only commits
   from after the schema change needs none of this.
 * New settings keys are optional and have defaults; an older build ignores
-  them without requiring a settings review.
+  them. If a later-added cap had been changed from its default, the older
+  build's save drops it, and the next start of this build treats the file as
+  damaged: the last-good limits are shown and a settings review is required
+  before live trading (section 3).
+* A start that fails with `DatabaseDamaged` means `portfolio.sqlite3` failed
+  SQLite's integrity check before anything was migrated or written. Restore
+  the data folder from a backup; do not run an older build against it.
 * The event log and the decision log are informational and can be deleted.
 
 ## 10. Known limits

@@ -47,6 +47,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import strategy  # noqa: E402
+from research import metrics as perf  # noqa: E402
 
 DAY_MS = 86_400_000
 TF_MS = {'1h': 3_600_000, '4h': 14_400_000, '1d': DAY_MS, '1w': 7 * DAY_MS}
@@ -156,7 +157,9 @@ def split_bounds(name: str, rows: list) -> tuple[int | None, int | None]:
 
 
 def run_pair(base: str, profile: str, data: Path, cost: str, splits: list[str], *, filters: bool = True,
-             with_random: bool = False, backtest=None, now_ms: int | None = None) -> dict:
+             with_random: bool = False, backtest=None, now_ms: int | None = None,
+             with_metrics: bool = False) -> dict:
+    """One pair through every split; ``with_metrics`` adds ``research.metrics.summarize_backtest``."""
     tf, higher_tf = PROFILES[profile]
     rows, filled = load(data, base, tf)
     higher, filled_h = load(data, base, higher_tf)
@@ -177,7 +180,7 @@ def run_pair(base: str, profile: str, data: Path, cost: str, splits: list[str], 
             start = rows[0][0] + 130 * TF_MS[tf]            # warmup inside the data, never before it
         try:
             res = run(rows, settings, timeframe=tf, higher_rows=higher, higher_timeframe=higher_tf,
-                      now_ms=now_ms, start_ms=start, end_ms=end, market_rows=market)
+                      now_ms=now_ms, start_ms=start, end_ms=end, market_rows=market, keep_curve=with_metrics)
         except ValueError as exc:
             report['splits'][name] = {'skipped': str(exc)}
             continue
@@ -186,6 +189,10 @@ def run_pair(base: str, profile: str, data: Path, cost: str, splits: list[str], 
                  'max_drawdown_pct': res['max_drawdown_pct'], 'trades': trades,
                  'evaluation_bars': res['coverage']['evaluation_candles'],
                  'open_at_end': res['open_position_count']}
+        if with_metrics:
+            # Daily-resampled risk statistics, trade statistics, calendar returns and
+            # the probabilistic Sharpe ratio of this pair on this split.
+            entry['metrics'] = perf.summarize_backtest(res, period_ms=TF_MS[tf])
         if with_random and trades:
             p = len(trades) / max(1, res['coverage']['evaluation_candles'])
             randoms = []
@@ -199,7 +206,7 @@ def run_pair(base: str, profile: str, data: Path, cost: str, splits: list[str], 
     return report
 
 
-def summarize(pairs: dict, split: str) -> dict:
+def summarize(pairs: dict, split: str, *, trials: int = 1, sharpe_variance: float | None = None) -> dict:
     rows = [r['splits'][split] for r in pairs.values() if 'return_pct' in r['splits'].get(split, {})]
     if not rows:
         return {'pairs': 0}
@@ -213,6 +220,43 @@ def summarize(pairs: dict, split: str) -> dict:
         sd = statistics.stdev(trades) if len(trades) > 1 else 0.0
         out.update(mean_trade_pct=round(100 * mean, 4),
                    t_stat=round(mean / (sd / math.sqrt(len(trades))), 2) if sd > 0 else None)
+    if all('metrics' in r for r in rows):
+        # Equal-weight sleeve statistics: the mean of the pairs' daily-resampled
+        # equity statistics, the pooled trade statistics and the selection-bias
+        # adjustment for the number of candidate variants that read this data.
+        sharpes = [r['metrics']['equity']['sharpe'] for r in rows if r['metrics']['equity']['sharpe'] is not None]
+        per_period = [r['metrics']['equity']['sharpe_per_period'] for r in rows
+                      if r['metrics']['equity']['sharpe_per_period'] is not None]
+        pooled = perf.trade_statistics(trades)
+        out['metrics'] = {
+            'sharpe_mean': round(statistics.mean(sharpes), 3) if sharpes else None,
+            'sortino_mean': round(statistics.mean(v), 3) if (v := [r['metrics']['equity']['sortino'] for r in rows
+                                                                    if r['metrics']['equity']['sortino'] is not None]) else None,
+            'calmar_mean': round(statistics.mean(v), 3) if (v := [r['metrics']['equity']['calmar'] for r in rows
+                                                                   if r['metrics']['equity']['calmar'] is not None]) else None,
+            'max_drawdown_periods_worst': max(r['metrics']['equity']['max_drawdown_periods'] for r in rows),
+            'exposure_mean': round(statistics.mean(v), 3) if (v := [r['metrics']['equity']['exposure'] for r in rows
+                                                                     if r['metrics']['equity']['exposure'] is not None]) else None,
+            'turnover_per_year_mean': round(statistics.mean(v), 3) if (v := [r['metrics'].get('turnover_per_year') for r in rows
+                                                                              if r['metrics'].get('turnover_per_year') is not None]) else None,
+            'profit_factor': pooled['profit_factor'], 'expectancy_pct': None if pooled['expectancy'] is None else round(100 * pooled['expectancy'], 4),
+            'payoff_ratio': pooled['payoff_ratio'], 'expected_shortfall_5pct': None if pooled['expected_shortfall'] is None else round(100 * pooled['expected_shortfall'], 3),
+            'max_consecutive_losses': pooled['max_consecutive_losses'],
+            'mean_trade_ci95_pct': [round(100 * v, 4) for v in (perf.bootstrap_mean_ci(trades)['low'], perf.bootstrap_mean_ci(trades)['high'])] if len(trades) > 1 else None,
+            'probabilistic_sharpe_mean': round(statistics.mean(v), 3) if (v := [r['metrics'].get('probabilistic_sharpe') for r in rows
+                                                                                 if r['metrics'].get('probabilistic_sharpe') is not None]) else None,
+            'trials': trials,
+        }
+        if per_period and trials > 1 and sharpe_variance is not None:
+            periods = min(r['metrics']['equity']['periods'] for r in rows)
+            out['metrics']['deflated_sharpe_of_mean'] = perf.deflated_sharpe(
+                statistics.mean(per_period), periods, trials=trials, sharpe_variance=sharpe_variance)
+        if len(trades) >= 10:
+            # Risk of ruin at the app's largest position size over as many trades as the
+            # split holds (its whole length, not one year), pooled across the pairs.
+            out['metrics']['monte_carlo'] = perf.monte_carlo(
+                trades, capital_fraction=PROTOCOL['sizing']['max_position_pct'] / 100,
+                horizon=max(10, len(trades)), ruin_fraction=0.2, runs=2000, seed=0)
     if all('random_returns' in r for r in rows if r['trades']):
         # equal-weight portfolio of the pairs' random runs, seed by seed
         runs = [r['random_returns'] for r in rows if r.get('random_returns')]
@@ -224,6 +268,16 @@ def summarize(pairs: dict, split: str) -> dict:
     return out
 
 
+def trial_sharpe_variance(results: dict) -> float | None:
+    """Variance of the per-period Sharpe ratios of every pair/candidate run on development or validation."""
+    values = [entry['metrics']['equity']['sharpe_per_period']
+              for block in results.values() for pair in block['pairs'].values()
+              for split, entry in pair['splits'].items()
+              if split != 'holdout' and isinstance(entry.get('metrics'), dict)
+              and entry['metrics']['equity']['sharpe_per_period'] is not None]
+    return round(statistics.variance(values), 8) if len(values) > 1 else None
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Classic strategy walk-forward (offline, public candles)')
     parser.add_argument('--data', required=True)
@@ -233,6 +287,12 @@ def main(argv=None) -> int:
     parser.add_argument('--splits', default='development,validation')
     parser.add_argument('--no-filters', action='store_true', help='turn the efficiency and BTC market filters off')
     parser.add_argument('--random', action='store_true', help='add the random-entry baseline')
+    parser.add_argument('--metrics', action='store_true',
+                        help='add research.metrics statistics (Sharpe, Sortino, Calmar, drawdown duration, '
+                             'profit factor, expectancy, tail risk, bootstrap, Monte Carlo, deflated Sharpe)')
+    parser.add_argument('--trials', type=int, default=None,
+                        help='number of candidate variants that have read the development/validation data '
+                             '(default: the protocol candidate list); feeds the deflated Sharpe ratio')
     parser.add_argument('--out', required=True)
     args = parser.parse_args(argv)
     if 'holdout' in args.splits.split(','):
@@ -242,16 +302,27 @@ def main(argv=None) -> int:
     data = Path(args.data)
     result = {'protocol': PROTOCOL, 'protocol_sha256': protocol_hash(), 'filters': not args.no_filters,
               'generated_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'results': {}}
+    trials = args.trials or len(PROTOCOL['candidates'])
     for profile in args.profiles.split(','):
         for cost in args.costs.split(','):
             pairs = {}
             for base in args.pairs.split(','):
                 pairs[base] = run_pair(base, profile, data, cost, args.splits.split(','),
-                                       filters=not args.no_filters, with_random=args.random, now_ms=now_ms)
+                                       filters=not args.no_filters, with_random=args.random, now_ms=now_ms,
+                                       with_metrics=args.metrics)
             key = f'{profile}/{cost}'
-            result['results'][key] = {'pairs': pairs,
-                                      'summary': {s: summarize(pairs, s) for s in args.splits.split(',')}}
-            print(key, json.dumps(result['results'][key]['summary']), flush=True)
+            result['results'][key] = {'pairs': pairs}
+    if args.metrics:
+        # The variance of the per-period Sharpe ratios across every pair and
+        # candidate run here, on development and validation: the spread of
+        # trials the deflated Sharpe ratio discounts for.
+        result['trials'] = trials
+        result['trial_sharpe_variance'] = trial_sharpe_variance(result['results'])
+    for key, block in result['results'].items():
+        block['summary'] = {s: summarize(block['pairs'], s, trials=trials,
+                                         sharpe_variance=result.get('trial_sharpe_variance'))
+                            for s in args.splits.split(',')}
+        print(key, json.dumps(block['summary']), flush=True)
     result['runtime_s'] = round(time.time() - started, 1)
     Path(args.out).write_text(json.dumps(result, indent=1), encoding='utf-8')
     print('wrote', args.out)

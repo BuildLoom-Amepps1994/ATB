@@ -148,8 +148,8 @@ class QuoteFeed:
     def set_symbols(self, symbols) -> None:
         with self.lock:
             wanted = self._capped(symbols)
-            if wanted == self.symbols:
-                return
+            if set(wanted) == set(self.symbols):
+                return                       # the same set in another order needs no resubscription
             self.symbols = wanted
             self._wanted_changed = True
             for symbol in list(self.quotes):

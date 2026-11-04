@@ -27,6 +27,13 @@ _LOG_LOCK = threading.Lock()
 _correlation: contextvars.ContextVar[dict] = contextvars.ContextVar('cryptopilot_correlation', default={})
 
 MAX_EVENT_BYTES = 16_000          # a full decision record is ~2-3 KB
+MAX_FIELD_CHARS = 2_000           # one string field; a venue's error body can run to kilobytes
+_WRITE_STATE: dict = {'error': None, 'at': None}   # the last append failure, cleared by the next success
+
+
+def last_write_error() -> str | None:
+    """The type of the last failed event write, until a later write succeeds."""
+    return _WRITE_STATE['error']
 MAX_LOG_BYTES = 5_000_000
 LOG_BACKUPS = 3
 
@@ -58,9 +65,28 @@ def _append(text: str) -> None:
             if path.exists() and path.stat().st_size + len(text) + 1 > MAX_LOG_BYTES:
                 _rotate(path)
         except OSError:
-            pass
+            # Another process holds the file (an editor, a scanner): the cap
+            # stops applying until it lets go. Counted, so the gap is visible.
+            METRICS.incr('observability.rotate_failed')
         with path.open('a', encoding='utf8') as handle:
             handle.write(text + '\n')
+
+
+def _note_write(exc: Exception | None) -> None:
+    """Record whether the event trail is being written; one audit line per change of state."""
+    if exc is None:
+        if _WRITE_STATE['error'] is not None:
+            _WRITE_STATE['error'] = _WRITE_STATE['at'] = None
+        return
+    METRICS.incr('observability.write_failed')
+    first = _WRITE_STATE['error'] is None
+    _WRITE_STATE['error'], _WRITE_STATE['at'] = type(exc).__name__, datetime.now(timezone.utc).isoformat(timespec='seconds')
+    if first:
+        try:
+            storage.audit('error', f'Event log not being written ({type(exc).__name__}); orders continue but the '
+                                   'incident trail is incomplete until it is writable again.')
+        except Exception:
+            pass
 
 
 def correlation() -> dict:
@@ -107,7 +133,10 @@ def event(kind: str, level: str = 'info', **fields) -> dict:
         elif isinstance(value, (int, bool)):
             record[key] = value
         elif isinstance(value, str):
-            record[key] = storage.redact(value)
+            # Bounded before serialisation, so the line never has to be cut
+            # inside a string literal to fit MAX_EVENT_BYTES.
+            text_value = storage.redact(value)
+            record[key] = text_value if len(text_value) <= MAX_FIELD_CHARS else text_value[:MAX_FIELD_CHARS] + '...[truncated]'
         else:
             # Strings are redacted before serialization, so a masked value can
             # never run into a JSON delimiter and break the line.
@@ -125,11 +154,13 @@ def event(kind: str, level: str = 'info', **fields) -> dict:
         slim = {key: value if isinstance(value, (int, float, bool, str)) or value is None
                 else f'<omitted {len(json.dumps(value, default=str))} bytes>' for key, value in record.items()}
         slim['truncated'] = True
-        text = storage.redact(json.dumps(slim, separators=(',', ':'), default=str))[:MAX_EVENT_BYTES]
+        text = storage.redact(json.dumps(slim, separators=(',', ':'), default=str))   # bounded fields: never sliced
     try:
         _append(text)
-    except Exception:
-        pass  # Logging must never take down the order path.
+    except Exception as exc:
+        _note_write(exc)   # Logging must never take down the order path, but its failure is recorded.
+    else:
+        _note_write(None)
     return record
 
 

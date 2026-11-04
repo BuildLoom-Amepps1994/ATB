@@ -4,6 +4,307 @@ Releases are numbered `1.5.<commits on main>` by the release workflow; this
 file records what changed in substance. Earlier history is in the README and
 the review documents it links.
 
+## Unreleased: independent risk controls, research statistics
+
+Added
+
+* **Three risk-gate controls**, enforced by `risk.RiskGate` on every engine
+  entry path (automatic and manual, paper and live; a micro (PAPER) entry
+  carries neither an ATR nor a turnover, so only the consecutive-loss
+  control reaches it) and each with an off switch (0, which also releases a
+  stored consecutive-loss latch): `max_entry_atr_pct` (default 15 %) refuses an entry while the signal
+  candle's ATR exceeds that share of the price; `max_volume_share_pct`
+  (default 0.5 %) refuses an order above that share of the pair's 24 h quote
+  turnover and fails closed on a quote without turnover;
+  `max_consecutive_losses` (default 4) blocks new entries for the rest of the
+  UTC day after that many losing exits in a row, automatic or manual, until
+  the day ends or `RESUME TRADING` clears it (`clear_loss_streak_stop`, also
+  behind the dashboard's **Clear latched stop** button). The latch is durable
+  and shown as `risk.loss_streak_stop`; exits are never blocked by any of the
+  three. At the defaults the volatility and liquidity controls do not bind
+  in ordinary conditions (the scan's own ATR filter and the 1,000,000 USDT
+  turnover floor sit inside them); four losing exits in a UTC day across
+  all pairs is possible in a choppy market, and the latch is then the
+  designed outcome (`tests/test_risk_governance.py`).
+* **Research statistics** (`research/metrics.py`, hand-worked tests in
+  `tests/test_metrics.py`): profit factor, expectancy, payoff, win rate,
+  trade-level expected shortfall, bootstrap interval of the mean trade, CAGR,
+  Sharpe, Sortino, Calmar, maximum drawdown and its duration, calendar
+  returns, exposure, turnover, the probabilistic and deflated Sharpe ratios
+  and a Monte Carlo risk of ruin with stated assumptions.
+  `research/classic_walkforward.py --metrics --trials N` attaches them per
+  pair and split; `python -m research.evidence` tabulates what the committed
+  result files already support. `strategy.backtest(keep_curve=True)` keeps
+  the bar-level curve for them; the dashboard payload is unchanged.
+
+Fixed
+
+* **A MEXC buy whose trade fees cannot be read is booked net of the fee**
+  (hardening review finding 13, open since 2026-10-26). MEXC bills a market
+  buy's commission in the asset received, so the old quote-side estimate
+  tracked units the account never held and every exit of such a position
+  left an unsellable phantom remainder that kept the pair `held`. The
+  fallback now deducts the configured rate from the base quantity on MEXC
+  buys only (`execution.fee_estimated` carries `base_fee`); Kraken buys and
+  every sell keep the quote estimate. A live exit that sells everything the
+  account holds also writes off a tracked shortfall below the exchange
+  minimum (`ledger.shortfall_written_off`), realising its cost basis on that
+  exit; a larger shortfall stays tracked with the existing warning.
+* **A manual buy that merges a retained remainder anchors the stop, target
+  and trailing high on the new fill** (finding 7). They were anchored on the
+  blended average entry, which a remainder from a higher earlier entry could
+  put above the current bid, so the merged position was sold at the next
+  protective poll. The blended cost basis is kept for P/L
+  (`tests/test_accounting_fixes.py`).
+* **The runaway exit-rate bound counts each pair's own orders.** It counted
+  every order on the exchange, so one protective exit that the venue kept
+  rejecting every poll used up the allowance (three times
+  `max_orders_per_minute`) and every other position's protective exit was
+  refused with "Runaway order rate; exits paused for review" until the
+  minute passed. The bound is unchanged per pair.
+* **An automated entry consolidates a verified dust remainder** (a tracked
+  quantity below the exchange minimum, which can never be sold on its own)
+  instead of withholding the pair as `held` for good; the merge is the one a
+  manual buy performs, anchored on the new fill. A tracked position above the
+  dust limit still withholds the pair.
+* **The live state snapshot survives a corrupt paper cash row** (it is
+  reported as `paper_cash: null`); in paper mode the corrupt ledger still
+  raises, as before.
+* **A paper reset clears the consecutive-loss record** along with the other
+  paper latches (`tests/test_audit_fixes.py`).
+* **The protective monitor no longer trails Trend positions.** The scan
+  passed no ATR for the Trend horizon (its exit is a close 5 % below the
+  100-day average, with a 25 % disaster stop and no trailing stop), but the
+  monitor, which runs every few seconds, passed the cached daily ATR, so a
+  Trend position that had gained one ATR was given a trailing stop 2.5 ATRs
+  under its high and sold on an ordinary pullback. The research shows that
+  price stops inside the band lose; the forward paper run was testing a
+  rule the app did not apply.
+* **Candle completion and scan timing use a measured exchange clock
+  offset** (hardening review findings 8, 9, 14 and 15). CCXT measures the
+  PC-to-exchange difference only for MEXC and only when it loads the
+  catalogue; on Kraken the cut-off was the PC clock, so a PC clock a few
+  seconds ahead treated a still-open candle as complete and its partial
+  close became the signal for the whole candle. The market-data layer now
+  measures local-minus-server from the exchange's public server time with
+  the candle downloads, at most every 15 minutes, keeps the last value on a
+  failed read and falls back to CCXT's figure; the scan schedule and the
+  same-candle re-entry marker use the same offset. A quote whose exchange
+  timestamp is rejected as stale or future-dated (the sign of a PC clock
+  correction) triggers a re-measurement at most once a minute, so trailing
+  and trend exits no longer wait up to an hour for the next catalogue load.
+* **A failed protective exit is reported as such.** Any exception on the
+  exit path inside the protective tick (an adapter without market exits, an
+  unverified market, a balance or credential problem) was counted as a quote
+  failure and shown as "Protective quotes unavailable"; it is now reported
+  as `Protective exit failed for <pair>: <error>` on the dashboard, in the
+  audit log and as a `monitor.exit_error` event.
+* **Kraken's bulk ticker read asks only for listed pairs**; one unknown
+  symbol in the watchlist used to fail the whole read every scan and push
+  every quote through the one-request-per-second fallback.
+* **Streaming quotes keep their subscription when the symbol set is
+  unchanged but reordered** (every buy or sell reordered it and rebuilt the
+  websocket client).
+* **Candle prefetch stops at Stop** instead of finishing its queue against
+  the rate budget.
+* **Protective exits of one tick share a single live balance read**
+  (hardening review finding 6). Each exit read the account balance before
+  selling, so the exits of several positions waited one round trip each (a
+  second apiece on Kraken). A read taken in the same tick within three
+  seconds now serves the next exit; a booked sell lowers the cached free
+  amount of its own asset.
+* **`recovery.py --clear-halt` refuses an intent the exchange filled but
+  the ledger never booked** (journal status `filled`: a crash or hard kill
+  between the fill confirmation and the ledger write). It used to mark such
+  an intent reconciled with the rest, which dropped the fill from the ledger:
+  a bought holding stayed untracked with no stop, or a sold position stayed
+  tracked. The refusal names each fill (side, pair, quantity, price, intent);
+  the report now shows `submitted_at`, `acked_at`, `filled_quantity` and
+  `filled_price` per unresolved intent and an `unbooked_fill_count`. After
+  the position has been corrected by hand, `--acknowledge-unbooked-fills`
+  lets the reset proceed and the audit line records the acknowledgement.
+* **A settings file that lacks a cap the operator had changed is treated as
+  damaged, not as a request for the default.** Once a last-good copy exists,
+  a file written by an older build or edited by hand that omits a
+  later-added key (the notional caps, the realised-loss and drawdown limits,
+  the three new controls, the Trend sizing option) silently put that key
+  back to its default. Now such a file requires a settings review and the
+  last-good values stay in force, as for any other damaged file. The guard
+  holds when the last-good copy still carries the changed value (a hand
+  edit, a restored or copied `settings.json`, a build from before the
+  last-good copy existed); a save by an older build that already kept a
+  last-good copy rewrote both files, and that case is not detectable. A file
+  missing only keys whose last-good value is the default is still adopted
+  without review (a first upgrade).
+* **The consecutive-loss streak is read from the trade ledger** (today's
+  booked sells, newest first, back to the last clearing) instead of a
+  separate counter written after the sell committed, so a process stop in
+  between can no longer lose a loss, and a streak already at the limit
+  latches at the next entry check even if no exit was observed. Every
+  booked sell now counts, including the micro strategy's PAPER exits. A
+  limit set below the streak already run blocks the next entry at once;
+  `RESUME TRADING` restarts the count after the last booked sell.
+* **Live positions are visible and warned about in paper mode** (hardening
+  review finding 20). The app always starts in paper mode, where the
+  dashboard listed only paper positions, so live holdings with stored
+  stops sat unmonitored and unmentioned. The state now carries
+  `live_positions`; the dashboard shows a warning in paper mode when it is
+  non-zero, and the activity log says so at start, on a switch to paper and
+  on an exchange change.
+* **A live order intent that never left the process no longer halts live
+  trading until the offline tool is run.** `submitted_at` is stamped just
+  before the request leaves, so a `pending` live intent without it (a crash
+  between the intent and the request) provably sent nothing; it is closed
+  at start-up with the note `never sent; closed at startup`, as the micro
+  recovery already did for its own intents. Rows without a client order id
+  (from before the stamp existed) still wait for reconciliation.
+* **The ledger is checked for damage before any migration or write**
+  (`PRAGMA quick_check`). A damaged `portfolio.sqlite3` now fails the start
+  with `DatabaseDamaged`, a console line that says to restore the data
+  folder from a backup, and no change to the file; it used to be opened and
+  migrated as it was.
+* **An exchange change closes the stale paper intents of the exchange now
+  in use**, as start-up does for the configured one.
+* **A Stop that lands while the worker is closing its quote stream no
+  longer leaves the dashboard on "Stopping" for good** (with the in-app
+  update refused as busy) although nothing was in flight.
+* **A dashboard scan keeps its candle prefetch after a Stop.** The stop
+  signal stays set while the bot is idle, so the prefetch cancellation added
+  for Stop also cancelled every later manual scan's prefetch; only the
+  worker's scans are cancelled now.
+* **An integer too large for a float in a settings field is reported as
+  "must be between ..."** instead of a spurious "Exchange or local service
+  request failed" and an error audit line.
+* **A venue error response confirmed by an order lookup is a rejection,
+  not a durable live halt.** When the venue answered a market order with an
+  error that CCXT maps to a bare `ExchangeError` (MEXC code 30000, "suspended
+  transaction for the symbol", among others) the intent was journaled
+  `uncertain`, which halts live trading durably and with it every
+  protective exit of every other position until the offline tool is run.
+  The engine already looked the order up by its client order id after such
+  an error; now, when both the open and the recent order lists answered and
+  neither holds the id, the intent is journaled `rejected` with the note
+  `<error> (refused; no order at the venue)` and the rejection breaker
+  counts it. A transport failure, a timeout, a rate limit, a nonce error, an
+  unreadable answer or a failed lookup still end as `uncertain`, and an
+  order the lookup does find is booked from the venue's record as before.
+* **Leveraged tokens with any single-digit multiple are excluded from
+  discovery** (`BTC4L`, `ETH2S`); the suffix list knew only 3x and 5x.
+* **A remainder below one amount step counts as dust**, so it is merged by
+  the next entry instead of blocking the pair as a protective exit that can
+  never be expressed in an order.
+* **Micro (PAPER): a float rounding residue no longer reads as a late
+  fill** (the late-fill check applies the orphan check's tolerance), and
+  the fallback that claims every paper position for the micro cycles when
+  the cycle table cannot be read now writes a warning and a metric, since
+  the protective monitor leaves those positions alone while it holds.
+* **The kill switch stays usable while a state poll fails.** A failed or
+  slow `GET /api/state` greyed it out with every other control, leaving
+  **Emergency stop**, which ends stop monitoring, as the only live control.
+  Engaging the kill switch needs nothing from the page, so it now follows
+  the Stop button's rule; **Clear latched stop** still waits for a fresh
+  state.
+* **Open circuit breakers are shown.** The warning banner carries one line
+  per open breaker (execution failures, rejection spike, slippage) with the
+  seconds remaining, so a paused bot no longer looks like a strategy with
+  no setups and a restart to "fix" it is not the first reflex.
+* **A corrupt paper-cash row no longer takes the dashboard offline.** The
+  state read returned 400, which the page showed as a lost connection and
+  disabled every control while the engine kept running; it now answers
+  with cash and equity unavailable and a `ledger_error` line. An action
+  that fails with a `ValueError` writes the activity line its answer
+  promises ("review local activity"), type name only.
+* **A tracked dust remainder is shown at its real size** (`0.00000004`)
+  instead of a row of zeros in the positions and trade tables.
+* **The scan itself now reaches a dust remainder.** The earlier fix let the
+  entry pass consolidate one, but the scan's decision still read the
+  remainder as a holding and abstained, so the pass never saw the pair
+  (found by the verification run); the decision now ignores a verified
+  dust remainder, and a position above dust is still "held".
+* **A failed audit write inside the protective tick no longer ends the
+  tick** before the other positions are checked.
+* **The shared balance read of a protective tick carries each sale's cash
+  forward.** A later exit in the same tick valued the account without the
+  earlier exits' proceeds, so its realised-loss check could latch the
+  durable daily stop early (verification of the one-read-per-tick change);
+  the cached read now gains the proceeds and gives up the units consumed
+  including a base-denominated fee, and a live buy discards it.
+* **Research: the rotation and stop simulator bought a stopped coin back at
+  the same day's open** (`research/trend_rotation.py`, now
+  `trend-rotation-v2`), so every stop was charged without removing the
+  exposure. The committed `trend-rotation-v1` results overstate the cost
+  of the 15 % and 10 % stops; the "tighter stops hurt" conclusion in
+  `docs/CLASSIC_WALKFORWARD.md` is marked unsupported until the study is
+  rerun on the candle data. No app setting changes: the 25 % stop was the
+  shipped value before the study.
+* **Failures on the protective path leave a durable record.** A protective
+  exit that failed during the scan was shown only as "Scan unavailable" in
+  the market table; it is now reported exactly like a monitor failure
+  (activity line, event, counter, dashboard warning). A quote failure in
+  the protective tick writes a counter, an event and one activity line
+  (repetitions collapse), so an outage that ends before the operator looks
+  still leaves a trace. A paper worker stopped by an exception writes the
+  activity line that explains why, and the worker's end is an
+  `engine.stopped` event.
+* **A failed trailing-level write no longer halts live trading.** Nothing
+  had been sent to the venue, yet the failure was classed as an order
+  uncertainty: live trading halted durably with a message naming no
+  symbol, and every stop stopped being monitored. It is now a monitoring
+  fault: the activity line names the symbol and the stored stop that still
+  applies, the next poll retries the write, and the execution-failure
+  breaker counts it.
+* **A confirmed venue refusal stays a refusal when its report line fails to
+  write.** The journal row was already `rejected` but a failing activity
+  write escalated the outcome to `uncertain` and a durable live halt.
+* **A venue refusal is recognised by the venue's own body.** CCXT raises
+  the same bare `ExchangeError` for a transport it could not classify (an
+  HTML 5xx page, a redirect loop, a TLS error) with no body; only an answer
+  carrying the venue's JSON body (a code, a message or an error list) now
+  counts as the venue's refusal after the lookup; everything else stays
+  `uncertain`.
+* **The event log reports when it cannot be written.** A failed append was
+  swallowed; it now counts, is shown in the state (`event_log_error`) and
+  on the dashboard, and writes one activity line per change of state. A
+  failed rotation is counted. A string field is bounded before
+  serialisation, so an oversized event is never cut inside a string
+  literal into an invalid JSON line.
+* **Repeated activity lines collapse within the recent window.** Two lines
+  alternating every poll (one failing exit per position) flushed the
+  300-row activity history in minutes; a line repeated within the last 20
+  rows now moves to the top as one copy.
+* **The execution-failure breaker survives a restart.** Its 30-minute hold
+  lived in memory, so a restart lifted the pause before its cause was
+  understood; it is now stored like the slippage hold.
+* **The submit path accepts only an authorization the gate issued** for the
+  same request (symbol, side, kind, mode, notional); a hand-built
+  authorization object is refused and counted.
+* **A filled-but-unbooked live intent is named at start-up** (side, symbol,
+  quantity, price, intent) with the reminder that no stop is monitored for
+  it until it is booked.
+* **A fault outside the order path no longer halts live trading durably.**
+  Any exception that escaped the worker loop (a locked database during a
+  protective poll, for example) was treated as an unresolved order: the
+  durable `live_halt` flag was written, every stored exit stopped being
+  checked, and Start and the manual ticket were refused until the offline
+  tool was run although the journal held nothing to reconcile. Such a fault
+  now stops the worker and is recorded (audit line, `engine.worker_error`
+  event, `engine.worker_errors` metric); Start resumes the stored exits once
+  the cause has been reviewed. The durable halt is kept while a live order
+  outcome is open and when the journal cannot be read.
+* **A settings save that changes the exchange commits nothing until its one
+  database write has succeeded.** The stale-intent clean-up ran after the
+  settings file, the configuration and the ledger scope had moved to the new
+  exchange, so a failure left the engine scoped to it while quoting and
+  simulating on the old one.
+* **The scan's trailing pass no longer resubmits a stored exit at the bid the
+  protective poll just tried.** A stuck exit (a venue that keeps refusing the
+  sell) drew three orders per scan instead of two, each counting toward the
+  rejection-spike breaker and the per-pair exit-rate bound.
+* **Trend assessments carry no regime gate.** Every Trend pair was reported
+  with regime `weak` and its recorded confidence halved for a confirmation
+  timeframe the Trend rule does not read; the field is now empty for Trend
+  and the decision record states that no gate applied. No order changes.
+
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 
 Changed

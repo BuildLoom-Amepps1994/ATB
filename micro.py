@@ -329,7 +329,14 @@ class MicroManager:
                 row['residual_base'] is not None
                 and math.isclose(float(row['qty']), float(_dec(row['residual_base'], money.ZERO)),
                                  rel_tol=1e-9, abs_tol=1e-12))}
-        except Exception:
+        except Exception as exc:
+            # Said out loud: while this fallback holds, the legacy monitor leaves every paper position alone.
+            try:
+                self.engine.metrics.incr('micro.owned_symbols_fallback')
+                storage.audit('warning', f'Micro cycle table unreadable ({type(exc).__name__}); every paper position counts as '
+                                         'micro-owned and the protective monitor leaves them alone until it reads again.')
+            except Exception:
+                pass
             return {row['symbol'] for row in storage.rows("SELECT symbol FROM positions WHERE exchange=? AND mode='paper'",
                                                           (exchange,))}
 
@@ -712,7 +719,9 @@ class MicroManager:
                     raise VenueRecordUnreadable(type(exc).__name__) from exc
                 continue
             booked = money.parse(float(intent['filled_quantity']), field='booked fill')
-            if venue_filled > booked:
+            # The journal holds a float of the exact venue quantity; the same
+            # tolerance as _orphans keeps a rounding residue from reading as a fill.
+            if venue_filled > booked * (1 + Decimal('1e-12')):
                 found.append((intent, view, money.sub(venue_filled, booked)))
         return found
 

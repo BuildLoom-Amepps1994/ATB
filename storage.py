@@ -46,6 +46,11 @@ DEFAULTS = {
     'micro_book_max_age_seconds': 5,
     # Trend only: scale each entry by min(1, target / annualised 20-day volatility); 0 = fixed size.
     'trend_vol_target_pct': 0.0,
+    # Independent risk-gate controls added 2026-11-04 (0 switches each one off):
+    # no entry while the signal candle's ATR exceeds this share of the price,
+    # no order above this share of the pair's 24 h quote turnover, and no new
+    # entries for the rest of the UTC day after this many losing exits in a row.
+    'max_entry_atr_pct': 15.0, 'max_volume_share_pct': 0.5, 'max_consecutive_losses': 4,
 }
 MICRO_FIELDS = ('micro_budget_usdt', 'micro_max_cycles', 'micro_target_net_bps', 'micro_max_loss_bps',
                 'micro_max_hold_minutes', 'micro_cooldown_seconds', 'micro_max_consecutive_losses',
@@ -72,19 +77,26 @@ BOUNDS = {
     'micro_max_consecutive_losses': (2, 20), 'micro_daily_loss_limit_usdt': (0.1, 25.0),
     'micro_latency_bps': (0.0, 50.0), 'micro_book_max_age_seconds': (1, 30),
     'trend_vol_target_pct': (0.0, 500.0),
+    'max_entry_atr_pct': (0.0, 100.0), 'max_volume_share_pct': (0.0, 10.0), 'max_consecutive_losses': (0, 50),
 }
 # Fields added after 1.3.0 whose default is the stricter choice. A saved
 # profile from before they existed adopts the default without a review latch.
 LATER_FIELDS = {'market_filters', 'max_order_notional_usdt', 'max_asset_notional_usdt',
                 'max_orders_per_minute', 'daily_realized_loss_limit_pct', 'max_drawdown_pct',
-                'streaming_quotes', 'trend_vol_target_pct', *MICRO_FIELDS}
+                'streaming_quotes', 'trend_vol_target_pct', 'max_entry_atr_pct', 'max_volume_share_pct',
+                'max_consecutive_losses', *MICRO_FIELDS}
 INTEGER_FIELDS = {'discovered_pairs', 'scan_seconds', 'max_positions', 'data_max_age_seconds',
                   'protective_poll_seconds', 'max_orders_per_minute', 'micro_max_cycles', 'micro_max_hold_minutes',
-                  'micro_cooldown_seconds', 'micro_max_consecutive_losses', 'micro_book_max_age_seconds'}
+                  'micro_cooldown_seconds', 'micro_max_consecutive_losses', 'micro_book_max_age_seconds',
+                  'max_consecutive_losses'}
 
 
 class ConfigValidationError(ValueError):
     """Only messages constructed here are safe to show in the browser."""
+
+
+class DatabaseDamaged(sqlite3.DatabaseError):
+    """The portfolio database failed SQLite's integrity check; nothing was changed."""
 
 
 def validate_settings(data: dict, base: dict | None = None, allow_paper_start: bool = False) -> dict:
@@ -106,7 +118,11 @@ def validate_settings(data: dict, base: dict | None = None, allow_paper_start: b
         raise ConfigValidationError('Only USDT spot pairs such as BTC/USDT are supported.')
     for key, (lo, hi) in BOUNDS.items():
         value = cfg[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not lo <= value <= hi:
+        try:
+            finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+        except OverflowError:         # an integer too large for a float is just out of bounds
+            finite = False
+        if not finite or not lo <= value <= hi:
             raise ConfigValidationError(f'{key} must be between {lo} and {hi}.')
         if key in INTEGER_FIELDS:
             if value != int(value):
@@ -166,8 +182,13 @@ def _atomic_json(path: Path, value: dict) -> None:
     _atomic_bytes(path, json.dumps(value, indent=2, allow_nan=False).encode('utf8'))
 
 
-def _read_settings_file(path: Path, *, require_complete: bool = False):
-    """Return validated values, a safe error code, raw evidence and exchange."""
+def _read_settings_file(path: Path, *, require_complete: bool = False, protected=()):
+    """Return validated values, a safe error code, raw evidence and exchange.
+
+    ``protected`` names later-added keys whose last-good value is not the
+    default; a file without them (an older build's save, a hand edit) would
+    silently put that cap back to its default, so it is treated as damaged.
+    """
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
@@ -184,7 +205,7 @@ def _read_settings_file(path: Path, *, require_complete: bool = False):
     try:
         if not isinstance(saved, dict):
             raise ConfigValidationError('Invalid saved settings.')
-        if require_complete and set(DEFAULTS) - LATER_FIELDS - set(saved):
+        if require_complete and (set(DEFAULTS) - LATER_FIELDS - set(saved) or set(protected) - set(saved)):
             raise ConfigValidationError('Previously validated settings are incomplete.')
         safe = validate_settings({k: v for k, v in saved.items() if k in DEFAULTS}, allow_paper_start=True)
         return safe, None, raw, exchange
@@ -256,8 +277,11 @@ def _settings_state():
     backup_path, recovery_path = _settings_paths()
     backup, backup_fault, backup_raw, _ = _read_settings_file(backup_path)
     # Legacy partial configurations can be adopted once. After a last-good
-    # copy was ever written, removed risk fields must not silently use defaults.
-    current, fault, raw, exchange = _read_settings_file(CONFIG_PATH, require_complete=backup_fault != 'missing')
+    # copy was ever written, removed risk fields must not silently use defaults,
+    # and neither may a later-added cap the operator changed from its default.
+    protected = {key for key in LATER_FIELDS if backup is not None and backup.get(key) != DEFAULTS.get(key)}
+    current, fault, raw, exchange = _read_settings_file(CONFIG_PATH, require_complete=backup_fault != 'missing',
+                                                        protected=protected)
     record = _read_recovery_record()
     # Only a genuinely new profile may be initialized without explicit review.
     if (fault == 'missing' and not backup_path.exists() and not recovery_path.exists()
@@ -360,12 +384,24 @@ def _create_positions(db):
         PRIMARY KEY (exchange,mode,symbol))''')
 
 
+def _require_intact(db) -> None:
+    """Refuse a damaged ledger before any migration or write touches it."""
+    try:
+        verdict = db.execute('PRAGMA quick_check(1)').fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        verdict = f'{type(exc).__name__}: {exc}'
+    if verdict != 'ok':
+        raise DatabaseDamaged('The portfolio database failed its integrity check (' + str(verdict)[:200] + '). Nothing was '
+                              'changed. Restore portfolio.sqlite3 from a backup of the data folder before starting.')
+
+
 def init_db():
     # Preserve old rows; live records without an exchange/account identity are
     # quarantined until manually reconciled, never guessed from current settings.
     cfg = settings()
     exchange, paper_start = cfg['exchange'], cfg['paper_start_usdt']
     with connection() as db:
+        _require_intact(db)
         db.execute('PRAGMA journal_mode=WAL')
         # SQLite DDL is transactional only inside an explicit transaction. A
         # crash between rename and copy must not strand the old position table.
@@ -479,12 +515,18 @@ def redact(message: object) -> str:
 def audit(level: str, message: str):
     level, message = str(level)[:20], redact(message)[:500]
     with connection() as db:
-        # A condition reported every poll (a stale quote, a retained remainder)
-        # refreshes its latest entry instead of flushing the 300-row history.
-        latest = db.execute('SELECT id,level,message FROM audit ORDER BY id DESC LIMIT 1').fetchone()
-        if latest and latest['level'] == level and latest['message'] == message:
-            db.execute('UPDATE audit SET created_at=? WHERE id=?', (_now(), latest['id']))
-            return
+        # A condition reported every poll (a stale quote, a retained remainder,
+        # one failing exit per position) refreshes its recent entry instead of
+        # flushing the 300-row history; the window covers lines that alternate.
+        for index, recent in enumerate(db.execute('SELECT id,level,message FROM audit ORDER BY id DESC LIMIT 20').fetchall()):
+            if recent['level'] == level and recent['message'] == message:
+                if index == 0:
+                    db.execute('UPDATE audit SET created_at=? WHERE id=?', (_now(), recent['id']))
+                    return
+                # Moved to the top as one copy: the list still shows it as the
+                # latest activity without a second row for every repetition.
+                db.execute('DELETE FROM audit WHERE id=?', (recent['id'],))
+                break
         db.execute('INSERT INTO audit(created_at,level,message) VALUES (?,?,?)', (_now(), level, message))
         db.execute('DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT 300)')
 
@@ -593,6 +635,25 @@ def abandon_stale_paper_intents(exchange: str) -> int:
         return cursor.rowcount
 
 
+def reject_never_sent_live_intents() -> int:
+    """Close live intents that provably never reached the exchange.
+
+    ``submitted_at`` is stamped immediately before the request leaves
+    (``trader._submit``), by the same build that introduced the column and
+    ``client_order_id``. A live row still 'pending' with a client order id
+    and no stamp therefore sent nothing: a crash between the intent and the
+    request. Closing it at start-up keeps it from halting live trading until
+    the offline tool is run. Rows without a client order id predate the stamp
+    and are left to the reconciliation.
+    """
+    with connection() as db:
+        stamp = _now()
+        cursor = db.execute("UPDATE order_journal SET status='rejected',updated_at=?,final_at=?,note='never sent; closed at startup' "
+                            "WHERE mode='live' AND status='pending' AND submitted_at IS NULL AND client_order_id IS NOT NULL",
+                            (stamp, stamp))
+        return cursor.rowcount
+
+
 def legacy_live_records() -> int:
     return sum(rows("SELECT COUNT(*) AS count FROM " + table + " WHERE mode='live' AND exchange='legacy-unassigned'")[0]['count'] for table in ('positions', 'trades'))
 
@@ -604,7 +665,7 @@ def reset_paper(exchange: str):
         db.execute("DELETE FROM positions WHERE mode='paper' AND exchange=?", (exchange,))
         db.execute("DELETE FROM trades WHERE mode='paper' AND exchange=?", (exchange,))
         db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (scope_key('paper_cash', exchange), str(paper_start)))
-        db.execute("DELETE FROM meta WHERE (key LIKE 'last_entry.paper.%' OR key LIKE 'last_exit.paper.%' OR key LIKE 'manual_request.paper.%' OR key LIKE 'baseline.paper.%' OR key LIKE 'breached.paper.%' OR key LIKE 'peak_equity.paper.%' OR key LIKE 'drawdown_stop.paper.%' OR key LIKE 'realized_stop.paper.%' OR key LIKE 'realized_stop_cleared.paper.%' OR key LIKE 'slippage_breaker.paper.%') AND key LIKE ?", ('%.' + exchange,))
+        db.execute("DELETE FROM meta WHERE (key LIKE 'last_entry.paper.%' OR key LIKE 'last_exit.paper.%' OR key LIKE 'manual_request.paper.%' OR key LIKE 'baseline.paper.%' OR key LIKE 'breached.paper.%' OR key LIKE 'peak_equity.paper.%' OR key LIKE 'drawdown_stop.paper.%' OR key LIKE 'realized_stop.paper.%' OR key LIKE 'realized_stop_cleared.paper.%' OR key LIKE 'slippage_breaker.paper.%' OR key LIKE 'loss_streak.paper.%') AND key LIKE ?", ('%.' + exchange,))
         db.execute("DELETE FROM order_journal WHERE mode='paper' AND exchange=?", (exchange,))
         db.execute("DELETE FROM micro_cycle_events WHERE cycle_id IN (SELECT cycle_id FROM micro_cycles WHERE mode='paper' AND exchange=?)", (exchange,))
         db.execute("DELETE FROM micro_cycles WHERE mode='paper' AND exchange=?", (exchange,))

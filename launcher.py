@@ -145,9 +145,11 @@ def report_startup_failure(exc: BaseException) -> None:
         pass
     stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
     line = f'{stamp} CryptoPilot could not start: {type(exc).__name__}'
-    print(line + (f' (data folder: {folder}).' if folder else '.')
-          + ' Check that the data folder is writable and the portfolio database is intact; '
-            'the redacted traceback is in logs/startup.log inside the data folder.')
+    # The integrity verdict names the damaged page and the remedy; it never carries a secret.
+    detail = (str(exc)[:400] if type(exc).__name__ == 'DatabaseDamaged'
+              else 'Check that the data folder is writable and the portfolio database is intact;')
+    print(line + (f' (data folder: {folder}).' if folder else '.') + ' ' + detail
+          + ' the redacted traceback is in logs/startup.log inside the data folder.')
     if folder is None:
         return
     try:

@@ -66,9 +66,14 @@ def test_unavailable_trade_fees_fall_back_to_the_configured_estimate(engine):
     client.fill.update(fee=None, fees=[])
     client.fetch_order_trades = lambda *args: (_ for _ in ()).throw(ccxt.NetworkError('fee read failed'))
     assert engine._buy('BTC/USDT', 800, 100, .04)
-    assert engine._active_positions('live')[0]['cost'] == pytest.approx(100.1)
+    # MEXC bills a buy's commission in the asset received: the estimate is a base
+    # deduction (finding 13), so the quantity is net and no quote fee is booked.
+    position = engine._active_positions('live')[0]
+    assert position['qty'] == pytest.approx(1 - engine.cfg['fee_pct'] / 100)
+    assert position['cost'] == pytest.approx(100)
     assert not engine.live_halted
     assert any('fee estimate' in row['message'] for row in storage.rows('SELECT message FROM audit'))
+    assert any('booked as a deduction' in row['message'] for row in storage.rows('SELECT message FROM audit'))
 
 
 def test_kraken_orders_request_quote_currency_fees(engine):
@@ -151,6 +156,7 @@ def test_unloaded_catalogue_never_raises_from_scans_or_snapshots(engine):
 @pytest.mark.parametrize('symbol,allowed', [
     ('JUP/USDT', True), ('PUP/USDT', True), ('DOWN/USDT', True),
     ('BTC3L/USDT', False), ('ETHBULL/USDT', False), ('SOLUP/USDT', False),
+    ('BTC4L/USDT', False), ('ETH2S/USDT', False), ('DOGE5S/USDT', False), ('A3L/USDT', True), ('3L/USDT', True),
 ])
 def test_leveraged_token_suffixes_need_a_real_base(symbol, allowed):
     market = {'spot': True, 'active': True, 'contract': False}
@@ -341,7 +347,8 @@ def test_repeated_identical_audit_entries_refresh_instead_of_flooding(db):
         storage.audit('warning', 'quote stale')
     storage.audit('warning', 'other')
     storage.audit('warning', 'quote stale')
-    assert [row['message'] for row in storage.rows('SELECT message FROM audit ORDER BY id')] == ['quote stale', 'other', 'quote stale']
+    # A line repeated within the recent window moves to the top as one copy (observability lens, 2026-11-04).
+    assert [row['message'] for row in storage.rows('SELECT message FROM audit ORDER BY id')] == ['other', 'quote stale']
 
 
 def test_damaged_last_good_copy_is_preserved_and_requires_review(db):

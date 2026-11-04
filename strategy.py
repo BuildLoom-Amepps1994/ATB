@@ -369,13 +369,16 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
              now_ms: int | None = None,
              start_ms: int | None = None,
              end_ms: int | None = None,
-             market_rows: list[list[float]] | None = None) -> dict[str, Any]:
+             market_rows: list[list[float]] | None = None,
+             keep_curve: bool = False) -> dict[str, Any]:
     """Simulate next-open signals and conservative stop/target candle fills.
 
     A trailing stop is updated only after testing the existing stop for the bar.
     Ambiguous stop-and-target candles take the stop. Spread, order-book depth,
     exchange rounding and portfolio-wide limits are not modeled. ``market_rows``
     are BTC candles on the confirmation timeframe for the live market gate.
+    ``keep_curve`` adds the unsampled bar-level ``curve_full`` and the per-bar
+    ``in_market`` flags for the research statistics (``research.metrics``).
     """
     x = indicators(frame_from_ohlcv(rows, timeframe=timeframe, now_ms=now_ms))
     if len(x) < 125:
@@ -434,6 +437,7 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
     pending_trend_exit = False
     fees_paid = slippage_costs = 0.0
     curve: list[dict[str, float]] = []
+    in_market: list[bool] = []
     executions: list[dict[str, Any]] = []
     profits: list[float] = []
     peak, max_dd = starting, 0.0
@@ -460,7 +464,7 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
         profits.append(pnl)
         executions.append({'type': 'sell', 'time': int(bar['timestamp']),
                            'price': price, 'pnl': pnl, 'reason': reason,
-                           'fee_usdt': exit_fee})
+                           'fee_usdt': exit_fee, 'quantity': qty, 'proceeds': gross - exit_fee})
         qty = entry_basis = highest = stop = target = 0.0
         pending_trend_exit = False
 
@@ -529,6 +533,7 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
         peak = max(peak, equity)
         max_dd = max(max_dd, 100 * (peak - equity) / peak)
         curve.append({'time': int(bar['timestamp']) + duration, 'equity': round(equity, 2)})
+        in_market.append(qty > 0)
     final = records[evaluated[-1]]
     last_equity = cash + qty * float(final['close']) * (1 - slip) * (1 - fee)
     first_open = float(records[evaluated[0]]['open'])
@@ -549,7 +554,9 @@ def backtest(rows: list[list[float]], settings: dict[str, Any], *,
     if regime_mode != 'primary_ema_proxy' and ready_count < len(evaluated):
         warning = ('Some evaluation candles lack completed, warmed-up higher-timeframe coverage; '
                    'entries are blocked on those candles. ' + warning)
+    extra = {'curve_full': curve, 'in_market': in_market} if keep_curve else {}
     return {
+        **extra,
         'starting_equity': starting, 'ending_equity': round(last_equity, 2),
         'return_pct': round((last_equity / starting - 1) * 100, 2),
         'buy_hold_pct': round((benchmark_end / starting - 1) * 100, 2),

@@ -333,3 +333,32 @@ def test_a_booked_sell_lowers_the_cached_free_amount_of_its_own_asset(engine):
     assert engine._sell(remainder, 110, 'rest')                    # the cached read still serves within the window
     assert client.orders[-1][1][3] == pytest.approx(.6)
     assert engine._active_positions('live') == []
+
+
+# ------------------------------------------------------- stop and prefetch
+def test_a_stop_during_the_workers_final_feed_close_does_not_stick_as_stopping(engine):
+    class Closing:                                     # the worker thread after it cleared `running`
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            pass
+
+    engine.thread = Closing()
+    engine.running = False
+    engine.stop()
+    assert engine.stopping is False and engine.running is False
+    engine.running = True                              # a worker still in its loop is stopping
+    engine.stop()
+    assert engine.stopping is True
+
+
+def test_only_the_workers_prefetch_is_cancelled_by_stop(engine, monkeypatch):
+    seen = []
+    monkeypatch.setattr(engine.data, 'prefetch', lambda requests, cancelled=None: seen.append(cancelled))
+    engine.stop_event.set()                            # stays set while idle after the last Stop
+    engine.scan_once(allow_orders=False)
+    assert seen == [None]
+    engine.stop_event.clear()
+    engine.scan_once(allow_orders=True)
+    assert seen[-1] == engine.stop_event.is_set

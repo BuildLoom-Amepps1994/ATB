@@ -264,3 +264,7 @@ def test_an_exchange_switch_closes_the_target_exchanges_stale_paper_intents(engi
     row = storage.order_intent(stale)
     assert row['status'] == 'rejected' and row['note'] == 'abandoned at startup'
 
+
+def test_an_oversized_integer_setting_is_a_validation_error(profile):
+    with pytest.raises(storage.ConfigValidationError, match='max_positions must be between'):
+        storage.validate_settings({'max_positions': 10 ** 400})

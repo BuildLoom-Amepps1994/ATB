@@ -156,6 +156,16 @@ Fixed
   migrated as it was.
 * **An exchange change closes the stale paper intents of the exchange now
   in use**, as start-up does for the configured one.
+* **A Stop that lands while the worker is closing its quote stream no
+  longer leaves the dashboard on "Stopping" for good** (with the in-app
+  update refused as busy) although nothing was in flight.
+* **A dashboard scan keeps its candle prefetch after a Stop.** The stop
+  signal stays set while the bot is idle, so the prefetch cancellation added
+  for Stop also cancelled every later manual scan's prefetch; only the
+  worker's scans are cancelled now.
+* **An integer too large for a float in a settings field is reported as
+  "must be between ..."** instead of a spurious "Exchange or local service
+  request failed" and an error audit line.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

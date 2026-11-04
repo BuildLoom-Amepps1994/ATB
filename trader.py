@@ -620,7 +620,9 @@ class TradingEngine:
         with self.lock:
             thread = self.thread
             self.stop_generation += 1
-            self.stopping = bool(thread and thread.is_alive())
+            # A worker that has already cleared `running` is only closing its
+            # quote stream; nothing is in flight, so this Stop is not "stopping".
+            self.stopping = bool(thread and thread.is_alive() and self.running)
             self.stop_event.set()
             if not self.stopping:
                 self.running = False
@@ -2026,7 +2028,9 @@ class TradingEngine:
                     wanted.append((MARKET_SYMBOL, higher_tf, 85))
             # Background downloads overlap round trips; the loop below still
             # runs each symbol's protective checks before using its candles.
-            self.data.prefetch(wanted, cancelled=self.stop_event.is_set)
+            # Only the worker's scans stop at Stop; the event stays set while idle,
+            # and a dashboard scan must not lose its prefetch to the last Stop.
+            self.data.prefetch(wanted, cancelled=self.stop_event.is_set if allow_orders else None)
             for symbol in symbols:
                 if allow_orders and self.stop_event.is_set():
                     break

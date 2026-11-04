@@ -118,7 +118,11 @@ def validate_settings(data: dict, base: dict | None = None, allow_paper_start: b
         raise ConfigValidationError('Only USDT spot pairs such as BTC/USDT are supported.')
     for key, (lo, hi) in BOUNDS.items():
         value = cfg[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not lo <= value <= hi:
+        try:
+            finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+        except OverflowError:         # an integer too large for a float is just out of bounds
+            finite = False
+        if not finite or not lo <= value <= hi:
             raise ConfigValidationError(f'{key} must be between {lo} and {hi}.')
         if key in INTEGER_FIELDS:
             if value != int(value):

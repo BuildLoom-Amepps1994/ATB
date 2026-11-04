@@ -155,3 +155,10 @@ def test_a_profile_saved_before_the_volatility_target_existed_loads_without_revi
     storage._SETTINGS_CACHE = None
     cfg = storage.settings()
     assert cfg['trend_vol_target_pct'] == 0.0 and not storage.settings_health()['review_required']
+
+
+def test_the_portfolio_risk_cap_accepts_up_to_20_percent_for_eight_full_trend_slots():
+    assert storage.validate_settings({'max_portfolio_risk_pct': 16})['max_portfolio_risk_pct'] == 16
+    with pytest.raises(storage.ConfigValidationError):
+        storage.validate_settings({'max_portfolio_risk_pct': 20.5})
+    assert storage.DEFAULTS['max_portfolio_risk_pct'] == 3.0          # the default is unchanged

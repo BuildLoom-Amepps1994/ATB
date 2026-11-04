@@ -59,7 +59,9 @@ BOUNDS = {
     'max_meme_position_pct': (0.5, 10.0), 'max_meme_exposure_pct': (1.0, 25.0),
     'daily_loss_limit_pct': (0.5, 8.0), 'fee_pct': (0, 1.0),
     'slippage_pct': (0, 2.0), 'paper_start_usdt': (100, 100000000),
-    'max_portfolio_risk_pct': (0.5, 8), 'data_max_age_seconds': (30, 600),
+    # Up to 20 since 2026-11-04: the cap counts each position's distance to its stored stop, and
+    # Trend's 25 % disaster stop needs 16 % for eight full-size 8 % positions.
+    'max_portfolio_risk_pct': (0.5, 20), 'data_max_age_seconds': (30, 600),
     'protective_poll_seconds': (2, 60),
     'max_order_notional_usdt': (12, 10000000), 'max_asset_notional_usdt': (12, 10000000),
     'max_orders_per_minute': (1, 60), 'daily_realized_loss_limit_pct': (0.5, 20.0),

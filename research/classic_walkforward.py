@@ -252,7 +252,8 @@ def summarize(pairs: dict, split: str, *, trials: int = 1, sharpe_variance: floa
             out['metrics']['deflated_sharpe_of_mean'] = perf.deflated_sharpe(
                 statistics.mean(per_period), periods, trials=trials, sharpe_variance=sharpe_variance)
         if len(trades) >= 10:
-            # Risk of ruin at the app's largest position size, over a year of trades at this rate.
+            # Risk of ruin at the app's largest position size over as many trades as the
+            # split holds (its whole length, not one year), pooled across the pairs.
             out['metrics']['monte_carlo'] = perf.monte_carlo(
                 trades, capital_fraction=PROTOCOL['sizing']['max_position_pct'] / 100,
                 horizon=max(10, len(trades)), ruin_fraction=0.2, runs=2000, seed=0)

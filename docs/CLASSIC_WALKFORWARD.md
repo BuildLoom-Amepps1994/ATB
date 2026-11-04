@@ -209,12 +209,25 @@ holdout not read.
 | Rotation 180 d, 25 % stop, volatility-scaled | +649 % (1.00, 86 %) | +9.5 % (0.40, 41 %) | 107, 41 |
 | Any rotation with a 15 % or 10 % stop | lower | negative | |
 
-Three findings. **Tighter stops hurt** on both splits: every variant with a
-15 % or 10 % stop loses on validation, and even the 25 % stop costs about
-ten points against the same rule without one (the portfolio study above:
-+6.5 % and +20.1 % without a stop against -4.6 % and +13.7 % with it). A
-trend rule's exit is the band; a price stop inside the band mostly sells
-dips. **Rotation by momentum did not hold up**: it helped validation only
+**Correction (2026-11-04 audit).** The simulator that produced this table
+(`trend-rotation-v1`) sold a stopped coin and bought it back at the same
+day's open, because the stopped coin's previous close was still above the
+band and only rotation sells were excluded from the day's purchases. Every
+stop was therefore charged without removing the exposure, and the tighter
+the stop the more often. The table's stop rows overstate the cost of the
+15 % and 10 % stops by an unknown amount; the rotation rows are affected
+only where a stop fired. The simulator is fixed (`trend-rotation-v2`,
+`tests/test_trend_rotation.py`) and the study has not been rerun, because
+the candle data is not in the repository (roadmap R-1, R-16). Until it is,
+the stop conclusion below is **unsupported**; the 25 % stop stays because
+it was the shipped value, not because this study showed it best.
+
+Three findings as originally written. **Tighter stops hurt** on both
+splits (unsupported, see above): every variant with a 15 % or 10 % stop
+loses on validation, and even the 25 % stop costs about ten points against
+the same rule without one (the portfolio study above: +6.5 % and +20.1 %
+without a stop against -4.6 % and +13.7 % with it). A trend rule's exit is
+the band; a price stop inside the band mostly sells dips. **Rotation by momentum did not hold up**: it helped validation only
 with volatility-scaled sizing, and lowered the development Sharpe below the
 rule's threshold, so it is not built. The bot already switches coins by the
 rule itself, selling a coin that breaks its trend and buying the next that

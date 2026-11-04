@@ -15,10 +15,20 @@ PROTOCOL (fixed before any result; see ``PROTOCOL``)
 * rotation in {none, 90, 180}: every 7 days, while a qualifying coin that is
   not held has an L-day return at least 10 percentage points above the
   weakest holding's, sell that holding at the next open and buy the coin; at
-  most 2 swaps per rotation day. A coin sold by rotation is not re-bought the
-  same day.
+  most 2 swaps per rotation day. A coin sold today, by its stop, by the band
+  or by rotation, is not re-bought the same day (``trend-rotation-v2``; v1
+  re-bought a stopped coin at the same day's open, see below).
 * stop in {25, 15, 10} %: a day whose low reaches entry x (1 - stop) sells at
   min(open, stop price), checked before the band exit.
+
+Correction (2026-11-04 audit): the v1 simulator sold a stopped coin in
+step 1 and, because its previous close was still above the band, listed it
+as a candidate in step 2 and bought it back in step 4 at the same day's
+open, a price that occurred before the stop fill. Every stop was charged
+without removing the exposure, so the committed v1 results
+(research/results/classic/trend_rotation.json) overstate the cost of the
+15 % and 10 % stops and the "tighter stops hurt" conclusion is unsupported
+until the study is rerun on the candle data with this version.
 * Selection: among variants whose development Sharpe is at least the base's
   (none, 25 %, fixed) minus 0.10, the highest validation Sharpe; ties go to
   the higher validation return.
@@ -39,7 +49,7 @@ if str(ROOT) not in sys.path:
 from research.classic_walkforward import fill_gaps  # noqa: E402
 
 PROTOCOL = {
-    'version': 'trend-rotation-v1',
+    'version': 'trend-rotation-v2',
     'lookback': 100, 'band': 0.05, 'vol_days': 20, 'vol_target': 0.60, 'slots': 8,
     'rotation': [None, 90, 180], 'rotation_days': 7, 'rotation_margin': 0.10, 'rotation_max_swaps': 2,
     'stops': [0.25, 0.15, 0.10], 'size': ['fixed', 'vol'],
@@ -108,6 +118,9 @@ def simulate(data, order, *, rotation, stop, size, start, end, p=PROTOCOL):
     for n_day, day in enumerate(days):
         if n_day == 0:
             continue
+        # A coin sold today is not bought back today: its open preceded the fill
+        # that closed it, and the production backtest's `exited` flag does the same.
+        sold_today = set()
         # 1. stops at today's open or low, judged on today's bar as it unfolds (pessimistic: before the band exit)
         for sym in list(held):
             i = data[sym]['by_day'].get(day)
@@ -117,6 +130,7 @@ def simulate(data, order, *, rotation, stop, size, start, end, p=PROTOCOL):
             level = held[sym]['entry'] * (1 - stop)
             if l <= level:
                 sell(sym, min(o, level))
+                sold_today.add(sym)
         # 2. band exits and candidates from the previous completed day, filled at today's open
         candidates = []
         for sym in order:
@@ -130,11 +144,11 @@ def simulate(data, order, *, rotation, stop, size, start, end, p=PROTOCOL):
                 continue
             if sym in held and close < sma * (1 - band):
                 sell(sym, s['rows'][i][1])
-            elif sym not in held and close > sma * (1 + band) and s['vol'][prev]:
+                sold_today.add(sym)
+            elif sym not in held and sym not in sold_today and close > sma * (1 + band) and s['vol'][prev]:
                 candidates.append(sym)
         equity = cash + sum(h['units'] * data[s]['rows'][data[s]['by_day'][day]][1] for s, h in held.items())
         # 3. rotation: weekly, swap the weakest holding for a stronger qualifying coin
-        sold_today = set()
         if rotation and n_day % p['rotation_days'] == 0 and held:
             mom = data[next(iter(held))]['momentum'][rotation]  # noqa: F841  (shape check)
             for _ in range(p['rotation_max_swaps']):

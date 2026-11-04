@@ -214,6 +214,14 @@ Fixed
   dust remainder, and a position above dust is still "held".
 * **A failed audit write inside the protective tick no longer ends the
   tick** before the other positions are checked.
+* **Research: the rotation and stop simulator bought a stopped coin back at
+  the same day's open** (`research/trend_rotation.py`, now
+  `trend-rotation-v2`), so every stop was charged without removing the
+  exposure. The committed `trend-rotation-v1` results overstate the cost
+  of the 15 % and 10 % stops; the "tighter stops hurt" conclusion in
+  `docs/CLASSIC_WALKFORWARD.md` is marked unsupported until the study is
+  rerun on the candle data. No app setting changes: the 25 % stop was the
+  shipped value before the study.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

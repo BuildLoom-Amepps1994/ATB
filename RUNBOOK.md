@@ -73,6 +73,9 @@ Change them while the bot is stopped.
 | `max_orders_per_minute` | 6 | Order-rate limit per exchange and mode (exits are allowed three times that). |
 | `data_max_age_seconds` | 120 | A quote older than this is stale; stale quotes block entries and fall back to REST for exits. |
 | `streaming_quotes` | off | Websocket best bid/ask while running. REST remains the fallback. |
+| `max_entry_atr_pct` | 15 % | Abnormal-volatility breaker: no entry while the signal candle's ATR exceeds this share of the price (0 = off). Exits are never judged on it. |
+| `max_volume_share_pct` | 0.5 % | Liquidity cap: an order may not exceed this share of the pair's 24 h quote turnover from the quote it was priced from; a quote with no turnover fails closed (0 = off). |
+| `max_consecutive_losses` | 4 | After this many losing exits in a row in one UTC day (automatic or manual), new entries are blocked for the rest of the day or until `RESUME TRADING` (`clear_loss_streak_stop`); a winning or flat exit resets the count (0 = off). |
 
 The minimum order is 12 USDT on both exchanges and is enforced as well.
 
@@ -97,12 +100,14 @@ POST /api/risk  {"action": "release", "confirmation": "RESUME TRADING"}
 ```
 
 **Clear a drawdown stop** the same way with `"action": "clear_drawdown_stop"`,
-and **a realised-loss stop** with `"action": "clear_realized_stop"`, or with
+**a realised-loss stop** with `"action": "clear_realized_stop"` and **a
+consecutive-loss stop** with `"action": "clear_loss_streak_stop"`, or with
 the dashboard's **Clear latched stop** button, which appears only while one
-is latched and asks for the same phrase. Both latches are shown in
-`GET /api/state` under `risk.drawdown_stop` and `risk.realized_stop` and as a
-dashboard warning. The daily equity guard clears
-itself at the next UTC day.
+is latched and asks for the same phrase. The latches are shown in
+`GET /api/state` under `risk.drawdown_stop`, `risk.realized_stop` and
+`risk.loss_streak_stop` (with today's run under `risk.loss_streak`) and as a
+dashboard warning. The daily equity guard and the consecutive-loss stop clear
+themselves at the next UTC day.
 
 **Breakers** pause entries only, never exits, and close on their own.
 `GET /api/state` lists each open one under `risk.breakers_open` with the

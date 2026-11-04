@@ -69,6 +69,7 @@ class OrderRequest:
     stop_fraction: float | None = None
     quote_age_seconds: float | None = None
     spread_pct: float | None = None
+    quote_volume_24h: float | None = None   # the pair's 24 h quote turnover from the quote the order is priced from
     reason: str = ''
     decision_id: str | None = None
     # Micro entries only: the venue-aware sizing verdict (micro_economics.SizingResult.as_dict()).
@@ -245,6 +246,55 @@ class RiskGate:
             self._latch_realized_stop(mode, realized, limit)
             return self.realized_stop(mode)
         return None
+
+    # ------------------------------------------------------- loss streak
+    def loss_streak(self, mode: str) -> dict:
+        """Today's run of consecutive losing exits: ``{'date', 'count', 'latched_at'}``."""
+        try:
+            record = json.loads(storage.get_meta(self._key('loss_streak', mode)) or 'null')
+        except ValueError:
+            record = None
+        if not isinstance(record, dict) or record.get('date') != _today():
+            return {'date': _today(), 'count': 0, 'latched_at': None}
+        count = _finite(record.get('count'))
+        return {'date': _today(), 'count': int(count) if count and count > 0 else 0,
+                'latched_at': record.get('latched_at') or None}
+
+    def loss_streak_stop(self, mode: str) -> str | None:
+        """ISO time at which today's consecutive-loss stop latched, or None."""
+        return self.loss_streak(mode)['latched_at']
+
+    def observe_exit(self, mode: str, realized: float) -> str | None:
+        """Count a booked exit's realised P/L and latch the consecutive-loss stop at the limit.
+
+        Called by the engine after every booked sell (automatic or manual). A
+        losing exit extends today's streak, any other exit ends it. When the
+        streak reaches ``max_consecutive_losses`` (0 = off) new entries are
+        blocked for the rest of the UTC day, or until ``RESUME TRADING``
+        clears it (``clear_loss_streak_stop``); exits are never blocked.
+        Returns the latch time.
+        """
+        limit = int(self.engine.cfg.get('max_consecutive_losses', storage.DEFAULTS['max_consecutive_losses']) or 0)
+        current = self.loss_streak(mode)
+        value = _finite(realized)
+        count = current['count'] + 1 if value is not None and value < 0 else 0
+        latched_at = current['latched_at']
+        if limit > 0 and count >= limit and not latched_at:
+            latched_at = _now_iso()
+        storage.set_meta(self._key('loss_streak', mode), json.dumps({'date': _today(), 'count': count, 'latched_at': latched_at}))
+        if latched_at and not current['latched_at']:
+            storage.audit('error', f'{mode.upper()} consecutive-loss stop latched: {count} losing exits in a row today '
+                                   f'(limit {limit}). New entries are blocked until the next UTC day or until cleared with {RELEASE_PHRASE}.')
+            observability.event('risk.loss_streak_stop', level='error', mode=mode, count=count, limit=limit)
+            self.metrics.incr('risk.loss_streak_stop_latched')
+        return latched_at
+
+    def clear_loss_streak_stop(self, mode: str, confirmation: str) -> None:
+        if confirmation != RELEASE_PHRASE:
+            raise storage.ConfigValidationError(f'Type {RELEASE_PHRASE} to clear the consecutive-loss stop.')
+        storage.set_meta(self._key('loss_streak', mode), json.dumps({'date': _today(), 'count': 0, 'latched_at': None}))
+        storage.audit('warning', f'{mode.upper()} consecutive-loss stop cleared after explicit confirmation; the streak restarts at zero.')
+        observability.event('risk.loss_streak_stop_cleared', level='warning', mode=mode)
 
     def observe_equity(self, mode: str, equity: float) -> dict:
         """Track the durable equity peak and latch the drawdown stop.
@@ -483,6 +533,24 @@ class RiskGate:
                   f'Realised-loss stop latched at {latched_at}; entries blocked until cleared with {RELEASE_PHRASE}'
                   if latched_at else '', realized=round(realized, 2))
             check('drawdown_stop', not self.drawdown_stop(mode), 'Drawdown stop latched; entries blocked until cleared')
+            streak_latched = self.loss_streak_stop(mode)
+            check('consecutive_losses', not streak_latched,
+                  f'Consecutive-loss stop latched at {streak_latched}; entries blocked until the next UTC day or cleared with {RELEASE_PHRASE}'
+                  if streak_latched else '', streak=self.loss_streak(mode)['count'])
+            atr_limit = float(cfg.get('max_entry_atr_pct', storage.DEFAULTS['max_entry_atr_pct']) or 0)
+            atr_value = _finite(request.atr)
+            if atr_limit > 0 and atr_value is not None and request.price > 0:
+                atr_pct = 100 * atr_value / request.price
+                check('volatility', atr_pct <= atr_limit,
+                      f'Abnormal volatility: the signal candle ATR is {atr_pct:.2f}% of the price, above the {atr_limit:g}% limit',
+                      atr_pct=round(atr_pct, 3), limit=atr_limit)
+            share_limit = float(cfg.get('max_volume_share_pct', storage.DEFAULTS['max_volume_share_pct']) or 0)
+            volume = _finite(request.quote_volume_24h)
+            if share_limit > 0 and volume is not None:
+                cap = volume * share_limit / 100
+                check('liquidity_share', volume > 0 and request.notional <= cap + 1e-6,
+                      f'Order notional {request.notional:.2f} exceeds {share_limit:g}% of the pair\'s 24h turnover ({cap:.2f} USDT)',
+                      volume_24h=volume, limit=round(cap, 2))
             if request.spread_pct is not None:
                 check('spread', request.spread_pct <= cfg['max_spread_pct'], 'Bid-ask spread exceeds the configured limit',
                       spread_pct=request.spread_pct)
@@ -538,7 +606,8 @@ class RiskGate:
             if remaining > 0:
                 breakers[name] = round(remaining, 1)
         return {'kill_switch': self.kill_switch(), 'drawdown_stop': self.drawdown_stop(mode),
-                'realized_stop': self.realized_stop(mode),
+                'realized_stop': self.realized_stop(mode), 'loss_streak': self.loss_streak(mode),
+                'loss_streak_stop': self.loss_streak_stop(mode),
                 'peak_equity': _finite(storage.get_meta(self._key('peak_equity', mode))),
                 'blocked_total': self.blocked, 'last_block': self.last_block,
                 'breakers_open': breakers, 'release_phrase': RELEASE_PHRASE,

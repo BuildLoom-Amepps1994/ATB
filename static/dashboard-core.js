@@ -132,6 +132,7 @@
     const stops = [];
     if (risk?.drawdown_stop) stops.push({action: 'clear_drawdown_stop', label: 'drawdown stop'});
     if (risk?.realized_stop) stops.push({action: 'clear_realized_stop', label: 'daily realised-loss stop'});
+    if (risk?.loss_streak_stop) stops.push({action: 'clear_loss_streak_stop', label: 'consecutive-loss stop'});
     return stops;
   }
   // A decimal amount from the micro status (a string such as '24.9750'). Never hides a sign or a

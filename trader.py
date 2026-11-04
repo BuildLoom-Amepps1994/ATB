@@ -1443,7 +1443,8 @@ class TradingEngine:
                    positions: list[dict], cash: float | None, quantity: float | None = None,
                    stop_fraction: float | None = None, signal_close: float | None = None,
                    atr: float | None = None, spread: float | None = None, reason: str = '',
-                   decision_id: str | None = None, sizing: dict | None = None) -> risk.Authorization:
+                   decision_id: str | None = None, sizing: dict | None = None,
+                   volume: float | None = None) -> risk.Authorization:
         """Build the request for the risk gate from the engine's current marks.
 
         Every production caller observes a ticker immediately before pricing
@@ -1461,7 +1462,7 @@ class TradingEngine:
                                     notional=float(notional), price=float(price), quantity=quantity,
                                     signal_close=signal_close, atr=atr, stop_fraction=stop_fraction,
                                     quote_age_seconds=self._price_age(symbol), spread_pct=spread,
-                                    reason=reason, decision_id=decision_id, sizing=sizing)
+                                    quote_volume_24h=volume, reason=reason, decision_id=decision_id, sizing=sizing)
         with self.metrics.timer('risk.authorize_ms'):
             authorization = self.risk.authorize(request, positions=positions, cash=cash, equity=equity,
                                                 marks_fresh=self._marks_fresh(positions),
@@ -1476,7 +1477,8 @@ class TradingEngine:
              reason: str = 'Completed-candle momentum breakout', merge_dust: bool = False,
              completion=None, entry_candle: int | None = None, kind: str = 'entry',
              signal_close: float | None = None, atr: float | None = None,
-             spread: float | None = None, decision_id: str | None = None) -> bool:
+             spread: float | None = None, decision_id: str | None = None,
+             volume: float | None = None) -> bool:
         existing = next((p for p in self._active_positions(self.mode) if p['symbol'] == symbol), None)
         if (not all(finite_positive(v) for v in (budget, price, fraction)) or fraction >= 1
                 or (existing and (not merge_dust or not self._is_dust(
@@ -1487,7 +1489,7 @@ class TradingEngine:
         intent = order_id = None
         positions = self._active_positions(mode)
         gate_fields = dict(stop_fraction=fraction, signal_close=signal_close, atr=atr, spread=spread,
-                           reason=reason, decision_id=decision_id)
+                           reason=reason, decision_id=decision_id, volume=volume)
         if mode == 'paper':
             authorization = self._authorize(symbol, 'BUY', kind, budget, price, positions=positions,
                                             cash=self._cash('paper'), **gate_fields)
@@ -1753,6 +1755,11 @@ class TradingEngine:
             except Exception as exc:
                 self._quiet_audit(f'Realised-loss check after the {symbol} exit failed ({type(exc).__name__}); '
                                   'it runs again at the next valuation.')
+            try:
+                self.risk.observe_exit(mode, pnl)
+            except Exception as exc:
+                self._quiet_audit(f'Consecutive-loss check after the {symbol} exit failed ({type(exc).__name__}); '
+                                  'the streak counts again at the next booked exit.')
             self._observe_fills(mode)
             # Reentry cooldown and fill were committed together above.
             return True
@@ -2223,7 +2230,7 @@ class TradingEngine:
                 filled = self._buy(symbol, amount, refreshed, fraction, reason='Explicit manual spot buy',
                                    merge_dust=position is not None, completion=completion,
                                    entry_candle=int(primary.iloc[-1]['timestamp']), kind='manual_entry',
-                                   spread=spread, decision_id=f'manual_{request_id}')
+                                   spread=spread, decision_id=f'manual_{request_id}', atr=atr, volume=volume)
             else:
                 if not self._orders_allowed():
                     raise error('Order preparation was stopped.')
@@ -2377,7 +2384,8 @@ class TradingEngine:
                 continue
             try:
                 filled = self._buy(symbol, budget, price, fraction, entry_candle=candle, kind='entry',
-                                   signal_close=signal_close, atr=atr, spread=spread, decision_id=decision_id)
+                                   signal_close=signal_close, atr=atr, spread=spread, decision_id=decision_id,
+                                   volume=volume)
             except Exception as exc:
                 # The order path records its own outcome; anything escaping it is
                 # unexpected. Paper continues with the next candidate, live stops

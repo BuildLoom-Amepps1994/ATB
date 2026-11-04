@@ -258,7 +258,7 @@ def reset_paper():
 
 
 class RiskAction(StrictModel):
-    action: str = Field(pattern='^(engage|release|clear_drawdown_stop|clear_realized_stop)$')
+    action: str = Field(pattern='^(engage|release|clear_drawdown_stop|clear_realized_stop|clear_loss_streak_stop)$')
     confirmation: str = Field(default='', max_length=40)
     allow_exits: bool = True
     reason: str = Field(default='', max_length=200)
@@ -274,6 +274,8 @@ def risk_action(req: RiskAction):
             return engine.risk.release_kill_switch(req.confirmation)
         if req.action == 'clear_realized_stop':
             engine.risk.clear_realized_stop(engine.mode, req.confirmation)
+        elif req.action == 'clear_loss_streak_stop':
+            engine.risk.clear_loss_streak_stop(engine.mode, req.confirmation)
         else:
             engine.risk.clear_drawdown_stop(engine.mode, req.confirmation)
         return engine.risk.status()

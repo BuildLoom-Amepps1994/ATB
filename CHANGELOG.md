@@ -4,6 +4,34 @@ Releases are numbered `1.5.<commits on main>` by the release workflow; this
 file records what changed in substance. Earlier history is in the README and
 the review documents it links.
 
+## Unreleased: independent risk controls, research statistics
+
+Added
+
+* **Three risk-gate controls**, each enforced by `risk.RiskGate` on every
+  entry path (automatic, manual, paper and live) and each with an off switch
+  (0): `max_entry_atr_pct` (default 15 %) refuses an entry while the signal
+  candle's ATR exceeds that share of the price; `max_volume_share_pct`
+  (default 0.5 %) refuses an order above that share of the pair's 24 h quote
+  turnover and fails closed on a quote without turnover;
+  `max_consecutive_losses` (default 4) blocks new entries for the rest of the
+  UTC day after that many losing exits in a row, automatic or manual, until
+  the day ends or `RESUME TRADING` clears it (`clear_loss_streak_stop`, also
+  behind the dashboard's **Clear latched stop** button). The latch is durable
+  and shown as `risk.loss_streak_stop`; exits are never blocked by any of the
+  three. At the defaults none of them binds in ordinary conditions
+  (`tests/test_risk_governance.py`).
+* **Research statistics** (`research/metrics.py`, hand-worked tests in
+  `tests/test_metrics.py`): profit factor, expectancy, payoff, win rate,
+  trade-level expected shortfall, bootstrap interval of the mean trade, CAGR,
+  Sharpe, Sortino, Calmar, maximum drawdown and its duration, calendar
+  returns, exposure, turnover, the probabilistic and deflated Sharpe ratios
+  and a Monte Carlo risk of ruin with stated assumptions.
+  `research/classic_walkforward.py --metrics --trials N` attaches them per
+  pair and split; `python -m research.evidence` tabulates what the committed
+  result files already support. `strategy.backtest(keep_curve=True)` keeps
+  the bar-level curve for them; the dashboard payload is unchanged.
+
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 
 Changed

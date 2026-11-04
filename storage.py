@@ -46,6 +46,11 @@ DEFAULTS = {
     'micro_book_max_age_seconds': 5,
     # Trend only: scale each entry by min(1, target / annualised 20-day volatility); 0 = fixed size.
     'trend_vol_target_pct': 0.0,
+    # Independent risk-gate controls added 2026-11-04 (0 switches each one off):
+    # no entry while the signal candle's ATR exceeds this share of the price,
+    # no order above this share of the pair's 24 h quote turnover, and no new
+    # entries for the rest of the UTC day after this many losing exits in a row.
+    'max_entry_atr_pct': 15.0, 'max_volume_share_pct': 0.5, 'max_consecutive_losses': 4,
 }
 MICRO_FIELDS = ('micro_budget_usdt', 'micro_max_cycles', 'micro_target_net_bps', 'micro_max_loss_bps',
                 'micro_max_hold_minutes', 'micro_cooldown_seconds', 'micro_max_consecutive_losses',
@@ -72,15 +77,18 @@ BOUNDS = {
     'micro_max_consecutive_losses': (2, 20), 'micro_daily_loss_limit_usdt': (0.1, 25.0),
     'micro_latency_bps': (0.0, 50.0), 'micro_book_max_age_seconds': (1, 30),
     'trend_vol_target_pct': (0.0, 500.0),
+    'max_entry_atr_pct': (0.0, 100.0), 'max_volume_share_pct': (0.0, 10.0), 'max_consecutive_losses': (0, 50),
 }
 # Fields added after 1.3.0 whose default is the stricter choice. A saved
 # profile from before they existed adopts the default without a review latch.
 LATER_FIELDS = {'market_filters', 'max_order_notional_usdt', 'max_asset_notional_usdt',
                 'max_orders_per_minute', 'daily_realized_loss_limit_pct', 'max_drawdown_pct',
-                'streaming_quotes', 'trend_vol_target_pct', *MICRO_FIELDS}
+                'streaming_quotes', 'trend_vol_target_pct', 'max_entry_atr_pct', 'max_volume_share_pct',
+                'max_consecutive_losses', *MICRO_FIELDS}
 INTEGER_FIELDS = {'discovered_pairs', 'scan_seconds', 'max_positions', 'data_max_age_seconds',
                   'protective_poll_seconds', 'max_orders_per_minute', 'micro_max_cycles', 'micro_max_hold_minutes',
-                  'micro_cooldown_seconds', 'micro_max_consecutive_losses', 'micro_book_max_age_seconds'}
+                  'micro_cooldown_seconds', 'micro_max_consecutive_losses', 'micro_book_max_age_seconds',
+                  'max_consecutive_losses'}
 
 
 class ConfigValidationError(ValueError):

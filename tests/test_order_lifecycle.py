@@ -114,6 +114,7 @@ def test_paper_definite_rejection_is_recorded_without_a_halt(engine):
 def test_ambiguous_live_submit_is_resolved_by_client_order_id_without_resending(engine):
     client = arm_fake_live(engine)
     engine.private = client = LookupExchange()
+    located_before = engine.metrics.snapshot()['counters'].get('execution.located_after_ambiguity', 0)   # process-wide counter
     assert engine._buy('BTC/USDT', 800, 100, .04)
     assert len(client.orders) == 1                      # exactly one request ever left
     assert client.lookups >= 1
@@ -121,7 +122,7 @@ def test_ambiguous_live_submit_is_resolved_by_client_order_id_without_resending(
     row = journal()[0]
     assert row['status'] == 'accounted' and row['order_id'] == 'srv-0'
     assert any('No order was resent' in r['message'] for r in storage.rows('SELECT message FROM audit'))
-    assert engine.metrics.snapshot()['counters']['execution.located_after_ambiguity'] == 1
+    assert engine.metrics.snapshot()['counters']['execution.located_after_ambiguity'] == located_before + 1
 
 
 def test_ambiguous_live_submit_that_cannot_be_located_halts(engine):

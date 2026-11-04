@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import threading
 import time
 import uuid
@@ -102,6 +103,7 @@ class TradingEngine:
         self._entry_trail: dict[tuple, tuple] = {}
         self.latest_balance = self.balance_updated_at = None
         self._tick_balance: tuple[dict | None, float] = (None, 0.0)   # one live balance read per protective tick
+        self._lookup_absent = False   # the last ambiguity lookup succeeded and found no order for the client id
         self.last_universe_update = 0.0
         self.discovered: list[str] = []
         self.risk_block = None
@@ -928,9 +930,11 @@ class TradingEngine:
                 return False
         base = symbol.split('/')[0]
         # Leveraged tokens carry a direction suffix after a real base (BTC3L,
-        # ETHBULL). A base that is only the suffix, or one letter plus it (JUP), is a coin.
+        # BTC4L, ETHBULL). A base that is only the suffix, or one letter plus it (JUP), is a coin.
+        if re.fullmatch(r'.{2,}\d[LS]', base):
+            return False
         return not any(base.endswith(suffix) and len(base) - len(suffix) >= 2
-                       for suffix in ('3L', '3S', '5L', '5S', 'UP', 'DOWN', 'BULL', 'BEAR'))
+                       for suffix in ('UP', 'DOWN', 'BULL', 'BEAR'))
 
     CATALOGUE_RETRY_SECONDS = 300.0
 
@@ -1268,6 +1272,7 @@ class TradingEngine:
         """
         self.metrics.incr('execution.ambiguous_submit')
         observability.event('execution.ambiguous', level='warning', symbol=symbol, error=type(exc).__name__)
+        self._lookup_absent = False
         found = None
         for pause in (0.0, 1.0):
             if pause:
@@ -1280,6 +1285,8 @@ class TradingEngine:
                 return None
             if found is not None:
                 break
+        # Both reads answered and neither list holds the id: the venue did not accept the request.
+        self._lookup_absent = found is None
         if found is not None:
             storage.audit('warning', f'{symbol}: the order request failed with {type(exc).__name__} but the exchange '
                                      'reports the order under its client order id; continuing with the exchange record. '
@@ -1370,6 +1377,11 @@ class TradingEngine:
                             raise
                         located = self._locate_after_ambiguity(client, symbol, client_id, exc)
                         if located is None:
+                            if self._lookup_absent and orders.venue_error_response(exc):
+                                # The venue answered with an error and its order lists hold
+                                # nothing for the id: a refusal, not an unknown outcome. A
+                                # transport failure or a failed lookup stays uncertain.
+                                raise orders.ConfirmedRefusal(exc) from exc
                             raise
                         order, accepted = located, True
                 ack_ms = (time.perf_counter() - sent) * 1000
@@ -1412,13 +1424,15 @@ class TradingEngine:
             # Transport errors and unrecognized responses always remain uncertain.
             if intent and not accepted and isinstance(exc, orders.definite_rejections()):
                 try:
-                    storage.update_order_intent(intent, 'rejected', note=type(exc).__name__)
+                    error_name = (f'{type(exc.original).__name__} (refused; no order at the venue)'
+                                  if isinstance(exc, orders.ConfirmedRefusal) else type(exc).__name__)
+                    storage.update_order_intent(intent, 'rejected', note=error_name)
                     with self.lock:
-                        self.risk_block = f'{side} {symbol} rejected by the exchange: {type(exc).__name__}'
+                        self.risk_block = f'{side} {symbol} rejected by the exchange: {error_name}'
                     storage.audit('warning', self.risk_block)
                     self.risk.record_failure('rejected')
                     observability.event('execution.rejected', level='warning', symbol=symbol, side=side,
-                                        error=type(exc).__name__, intent_id=intent)
+                                        error=error_name, intent_id=intent)
                     return None, None
                 except Exception:
                     pass
@@ -1502,15 +1516,24 @@ class TradingEngine:
 
     @staticmethod
     def _is_dust(position: dict, market: dict | None, price: float) -> bool:
-        """A tracked remainder below an explicit exchange minimum stays owned."""
+        """A tracked remainder below an explicit exchange minimum, or below one amount step, stays owned.
+
+        A quantity under the venue's amount step cannot be expressed in an
+        order at all (``amount_to_precision`` rounds it to nothing), so it is
+        dust whatever the minimums say. Only a fractional step is read as a
+        step; a value of one or more may be a count of decimals on another
+        adapter and is ignored.
+        """
         if not isinstance(market, dict) or not finite_positive(price):
             return False
         quantity = finite_positive(position.get('qty'))
         limits = market.get('limits') or {}
         minimum_amount = finite_positive((limits.get('amount') or {}).get('min'))
         minimum_cost = finite_positive((limits.get('cost') or {}).get('min'))
+        step = finite_positive((market.get('precision') or {}).get('amount'))
         return bool(quantity and ((minimum_amount and quantity < minimum_amount)
-                                  or (minimum_cost and quantity * price < minimum_cost)))
+                                  or (minimum_cost and quantity * price < minimum_cost)
+                                  or (step and step < 1 and quantity < step)))
 
     @staticmethod
     def _complete_manual_request(db, completion, remaining: float):

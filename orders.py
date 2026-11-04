@@ -36,15 +36,41 @@ def _positive(value) -> float:
     return number if math.isfinite(number) and number > 0 and not isinstance(value, bool) else 0.0
 
 
+class ConfirmedRefusal(Exception):
+    """The venue answered the request with an error and a successful lookup found no order under its client id.
+
+    Raised by the engine in place of the venue's own error so the submit path
+    journals the intent as rejected instead of uncertain: the venue processed
+    the request and refused it, and its order lists hold nothing for the id.
+    """
+
+    def __init__(self, original: Exception):
+        super().__init__(f'{type(original).__name__}; the venue refused the request and holds no order for its client id')
+        self.original = original
+
+
 def definite_rejections() -> tuple[type, ...]:
     """CCXT errors that document the exchange refused the request outright.
 
     Transport errors, timeouts and unrecognized responses are never in this
-    list: the exchange may have accepted the order anyway.
+    list: the exchange may have accepted the order anyway. ``ConfirmedRefusal``
+    is the engine's own class for a venue error response confirmed by a lookup.
     """
-    return tuple(cls for name in ('InsufficientFunds', 'InvalidOrder', 'AuthenticationError', 'PermissionDenied',
-                                  'BadSymbol', 'BadRequest', 'NotSupported')
-                 if isinstance(cls := getattr(ccxt, name, None), type))
+    return (ConfirmedRefusal, *(cls for name in ('InsufficientFunds', 'InvalidOrder', 'AuthenticationError', 'PermissionDenied',
+                                                 'BadSymbol', 'BadRequest', 'NotSupported')
+                                if isinstance(cls := getattr(ccxt, name, None), type)))
+
+
+def venue_error_response(exc: Exception) -> bool:
+    """True when ``exc`` is the venue's own answer to the request, not a transport or parsing failure.
+
+    CCXT raises ``ExchangeError`` (and its subclasses) for an error body the
+    venue returned; transport failures, timeouts, rate limits, nonce errors
+    and unreadable responses are ``OperationFailed`` siblings, outside it.
+    Such an answer plus an order list that holds nothing for the client order
+    id means nothing was accepted.
+    """
+    return isinstance(exc, ccxt.ExchangeError) and not isinstance(exc, getattr(ccxt, 'OperationFailed', ()))
 
 
 def classify(order: Any) -> str:

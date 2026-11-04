@@ -156,6 +156,7 @@ def test_unloaded_catalogue_never_raises_from_scans_or_snapshots(engine):
 @pytest.mark.parametrize('symbol,allowed', [
     ('JUP/USDT', True), ('PUP/USDT', True), ('DOWN/USDT', True),
     ('BTC3L/USDT', False), ('ETHBULL/USDT', False), ('SOLUP/USDT', False),
+    ('BTC4L/USDT', False), ('ETH2S/USDT', False), ('DOGE5S/USDT', False), ('A3L/USDT', True), ('3L/USDT', True),
 ])
 def test_leveraged_token_suffixes_need_a_real_base(symbol, allowed):
     market = {'spot': True, 'active': True, 'contract': False}

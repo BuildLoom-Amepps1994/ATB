@@ -166,6 +166,29 @@ Fixed
 * **An integer too large for a float in a settings field is reported as
   "must be between ..."** instead of a spurious "Exchange or local service
   request failed" and an error audit line.
+* **A venue error response confirmed by an order lookup is a rejection,
+  not a durable live halt.** When the venue answered a market order with an
+  error that CCXT maps to a bare `ExchangeError` (MEXC code 30000, "suspended
+  transaction for the symbol", among others) the intent was journaled
+  `uncertain`, which halts live trading durably and with it every
+  protective exit of every other position until the offline tool is run.
+  The engine already looked the order up by its client order id after such
+  an error; now, when both the open and the recent order lists answered and
+  neither holds the id, the intent is journaled `rejected` with the note
+  `<error> (refused; no order at the venue)` and the rejection breaker
+  counts it. A transport failure, a timeout, a rate limit, a nonce error, an
+  unreadable answer or a failed lookup still end as `uncertain`, and an
+  order the lookup does find is booked from the venue's record as before.
+* **Leveraged tokens with any single-digit multiple are excluded from
+  discovery** (`BTC4L`, `ETH2S`); the suffix list knew only 3x and 5x.
+* **A remainder below one amount step counts as dust**, so it is merged by
+  the next entry instead of blocking the pair as a protective exit that can
+  never be expressed in an order.
+* **Micro (PAPER): a float rounding residue no longer reads as a late
+  fill** (the late-fill check applies the orphan check's tolerance), and
+  the fallback that claims every paper position for the micro cycles when
+  the cycle table cannot be read now writes a warning and a metric, since
+  the protective monitor leaves those positions alone while it holds.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

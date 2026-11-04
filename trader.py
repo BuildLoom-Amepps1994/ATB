@@ -819,9 +819,12 @@ class TradingEngine:
                     saved = self.data.cached_candles(symbol, primary_tf, limit=175)
                     if saved is not None and not saved.empty:
                         # Trail with already validated ATR; monitoring never
-                        # downloads candles or weakens a persisted stop.
-                        self._mark_positions(symbol, price, finite_positive(saved.iloc[-1]['atr']), False,
-                                             stored_checked_at=price, source='monitor')
+                        # downloads candles or weakens a persisted stop. Trend
+                        # has no trailing stop (its exit is the close below the
+                        # average), so the monitor passes no ATR for it, as the
+                        # scan does; it used to trail Trend positions anyway.
+                        atr = 0.0 if self.cfg['time_horizon'] == 'trend' else finite_positive(saved.iloc[-1]['atr'])
+                        self._mark_positions(symbol, price, atr, False, stored_checked_at=price, source='monitor')
                 if not any(p['symbol'] == symbol for p in self._active_positions(self.mode)):
                     exited.add(symbol)
             except Exception:
@@ -1039,14 +1042,12 @@ class TradingEngine:
     def _clock_offset(self) -> float:
         """Seconds to add to an exchange timestamp to compare it with this PC's clock.
 
-        CCXT measures local-minus-server once per catalogue load when
-        adjustForTimeDifference is enabled (MEXC). Without it, no offset applies.
+        The market-data layer measures local-minus-server from the exchange's
+        public server time (both exchanges) and refreshes it every 15 minutes
+        with the candle downloads; CCXT's catalogue-load figure (MEXC) is the
+        fallback and zero the last resort.
         """
-        options = getattr(self.public, 'options', None)
-        difference = options.get('timeDifference') if isinstance(options, dict) else None
-        if isinstance(difference, bool) or not isinstance(difference, (int, float)) or not math.isfinite(difference):
-            return 0.0
-        return difference / 1000
+        return self.data.clock_offset()
 
     def _equity(self, mode: str, cash: float, positions: list[dict]) -> float:
         liquidation_factor = (1 - self.cfg['slippage_pct'] / 100) * (1 - self.cfg['fee_pct'] / 100)
@@ -1771,7 +1772,9 @@ class TradingEngine:
                             gross, fee, pnl, reason, order_id))
                 primary_tf = HORIZONS[self.cfg['time_horizon']][0]
                 duration = TIMEFRAME_SECONDS[primary_tf] * 1000
-                candle = (int(time.time() * 1000) // duration - 1) * duration
+                # The marker is compared with exchange-stamped signal candles,
+                # so it is taken on exchange time, not the PC clock.
+                candle = (int((time.time() - self._clock_offset()) * 1000) // duration - 1) * duration
                 db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)',
                            (self._key(f'last_exit.{mode}.{symbol}.{primary_tf}'), str(candle)))
                 self._complete_manual_request(db, completion, remaining)

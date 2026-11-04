@@ -12,11 +12,15 @@
 All exchanges are fakes; no network, no credentials.
 """
 
+import time
+
+import ccxt
 import pytest
 
 import risk
 import storage
 import trader
+from market_data import MarketData
 from test_engine import arm_fake_live, engine  # noqa: F401  (fixture)
 from test_risk_governance import candidate, losing_round_trip, observe
 
@@ -114,3 +118,108 @@ def test_paper_reset_clears_the_consecutive_loss_record(engine):
     assert engine.risk.loss_streak('paper') == {'date': risk._today(), 'count': 0, 'latched_at': None}
     assert engine.risk.loss_streak_stop('paper') is None
     assert engine._buy('BTC/USDT', 200, 100, .04, volume=20000000)
+
+
+# ------------------------------------------------------- trend trailing
+def test_the_monitor_does_not_trail_trend_positions(engine):
+    engine.update_config({'time_horizon': 'trend'})
+    assert engine._buy('BTC/USDT', 200, 100, .25)                  # Trend's 25 % disaster stop
+    engine.data.candles('BTC/USDT', '1d', limit=175)               # the monitor trails from cached candles (ATR 2)
+    engine.running = True
+    stop = engine._active_positions('paper')[0]['stop']            # the 25 % disaster stop under the fill
+    engine.public.price = 110                                      # five ATRs above the fill: a trail would arm
+    engine._monitor_if_due(force=True)
+    position = engine._active_positions('paper')[0]
+    assert position['stop'] == pytest.approx(stop) and stop < 76   # not raised to the bid - 2.5 x ATR
+    engine.public.price = 104                                      # a pullback of three ATRs from the high
+    engine._monitor_if_due(force=True)
+    assert len(engine._active_positions('paper')) == 1             # held: the Trend exit is the close below the average
+
+
+def test_the_monitor_still_trails_the_other_horizons(engine):
+    assert engine._buy('BTC/USDT', 200, 100, .04)
+    engine.data.candles('BTC/USDT', '1h', limit=175)
+    engine.running = True
+    engine.public.price = 110
+    engine._monitor_if_due(force=True)
+    assert engine._active_positions('paper')[0]['stop'] == pytest.approx(110 * .9999 - 5, abs=.01)   # bid - 2.5 x ATR
+    engine.public.price = 104
+    engine._monitor_if_due(force=True)
+    assert engine._active_positions('paper') == []
+
+
+# ------------------------------------------------------- exchange clock
+class TimedExchange:
+    """A public client whose clock runs 120 s behind the PC, with a server-time endpoint."""
+    has = {'fetchTime': True}
+    options = {}
+
+    def __init__(self, clock, behind=120.0):
+        self.clock, self.behind, self.calls, self.fail = clock, behind, 0, False
+
+    def fetch_time(self):
+        self.calls += 1
+        if self.fail:
+            raise ccxt.NetworkError('time endpoint down')
+        return int((self.clock[0] - self.behind) * 1000)
+
+    def fetch_ohlcv(self, symbol, tf, limit):
+        return [[hour * 3600 * 1000, 100, 101, 99, 100, 1000] for hour in range(1, 12)]
+
+
+def test_clock_offset_is_measured_from_the_server_time_and_refreshed_every_fifteen_minutes():
+    clock, mono = [12 * 3600.0], [1000.0]
+    exchange = TimedExchange(clock)
+    data = MarketData(exchange, clock=lambda: clock[0], monotonic=lambda: mono[0], wait=lambda _: False)
+    assert data.clock_offset() == 0.0                              # nothing measured yet, no CCXT figure
+    assert data.refresh_clock_offset() == pytest.approx(120)
+    assert data.clock_offset() == pytest.approx(120)
+    exchange.behind = 30
+    assert data.refresh_clock_offset() == pytest.approx(120) and exchange.calls == 1      # inside the window
+    mono[0] += MarketData.OFFSET_REFRESH_SECONDS + 1
+    assert data.refresh_clock_offset() == pytest.approx(30) and exchange.calls == 2
+    exchange.fail = True
+    mono[0] += MarketData.OFFSET_REFRESH_SECONDS + 1
+    assert data.refresh_clock_offset() == pytest.approx(30)        # a failed read keeps the last measurement
+    assert data.metrics['clock_offset_failures'] == 1
+    mono[0] += 1
+    data.refresh_clock_offset()
+    assert exchange.calls == 3                                     # and is not retried before the next window
+
+
+def test_clock_offset_falls_back_to_ccxts_figure_without_a_server_time_endpoint():
+    class Plain:
+        has = {'fetchTime': False}
+        options = {'timeDifference': 45_000}
+        def fetch_time(self):
+            raise AssertionError('must not be called')
+    data = MarketData(Plain(), wait=lambda _: False)
+    assert data.refresh_clock_offset() is None
+    assert data.clock_offset() == pytest.approx(45)
+    class Bare:
+        has = {}
+    assert MarketData(Bare(), wait=lambda _: False).clock_offset() == 0.0
+
+
+def test_candle_completion_is_judged_on_exchange_time():
+    # 60 s after the 11:00 boundary on the PC clock, but the exchange is still at 10:59: its 10:00 candle is open.
+    clock = [11 * 3600 + 60.0]
+    data = MarketData(TimedExchange(clock), clock=lambda: clock[0], wait=lambda _: False)
+    frame = data.candles('BTC/USDT', '1h', limit=11)
+    assert int(frame.iloc[-1]['timestamp']) == 9 * 3600 * 1000
+    assert data.metrics['clock_offset_measurements'] == 1
+
+
+def test_engine_scan_timing_and_exit_marker_use_the_measured_offset(engine):
+    engine.data._clock_measured = 120.0
+    assert engine._clock_offset() == pytest.approx(120)
+    duration = trader.TIMEFRAME_SECONDS[trader.HORIZONS[engine.cfg['time_horizon']][0]]
+    expected = duration - (time.time() - 120) % duration + engine.CLOSE_GRACE_SECONDS
+    assert engine._seconds_to_next_close() == pytest.approx(expected, abs=1)
+    assert engine._buy('BTC/USDT', 200, 100, .04)
+    position = engine._active_positions('paper')[0]
+    assert engine._sell(position, 110, 'test')
+    primary_tf = trader.HORIZONS[engine.cfg['time_horizon']][0]
+    saved = storage.get_meta(engine._key(f'last_exit.paper.BTC/USDT.{primary_tf}'))
+    step = duration * 1000
+    assert int(float(saved)) == (int((time.time() - 120) * 1000) // step - 1) * step

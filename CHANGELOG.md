@@ -67,6 +67,24 @@ Fixed
   raises, as before.
 * **A paper reset clears the consecutive-loss record** along with the other
   paper latches (`tests/test_audit_fixes.py`).
+* **The protective monitor no longer trails Trend positions.** The scan
+  passed no ATR for the Trend horizon (its exit is a close 5 % below the
+  100-day average, with a 25 % disaster stop and no trailing stop), but the
+  monitor, which runs every few seconds, passed the cached daily ATR, so a
+  Trend position that had gained one ATR was given a trailing stop 2.5 ATRs
+  under its high and sold on an ordinary pullback. The research shows that
+  price stops inside the band lose; the forward paper run was testing a
+  rule the app did not apply.
+* **Candle completion and scan timing use a measured exchange clock
+  offset** (hardening review findings 8, 9, 14 and 15). CCXT measures the
+  PC-to-exchange difference only for MEXC and only when it loads the
+  catalogue; on Kraken the cut-off was the PC clock, so a PC clock a few
+  seconds ahead treated a still-open candle as complete and its partial
+  close became the signal for the whole candle. The market-data layer now
+  measures local-minus-server from the exchange's public server time with
+  the candle downloads, at most every 15 minutes, keeps the last value on a
+  failed read and falls back to CCXT's figure; the scan schedule and the
+  same-candle re-entry marker use the same offset.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

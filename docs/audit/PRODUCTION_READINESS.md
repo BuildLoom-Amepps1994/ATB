@@ -13,8 +13,8 @@ live trading, changes a live-trading setting or places an order. Date:
 |---|---|---|
 | Every confirmed defect fixed or explicitly deferred with rationale | met for the defects confirmed by this audit; deferred items listed with reasons | `CRITICAL_DEFECTS.md`, `AUDIT_REPORT.md` |
 | Risk controls enforced in code and tests | met | `RISK_MANAGEMENT_SPEC.md`; `tests/test_risk_gate.py`, `tests/test_risk_governance.py`, `tests/test_audit_fixes.py` |
-| No fabricated results | met: every number is traced to a committed file, a test or the research document; the walk-forward was not rerun on real candles here and the document says so | `PROFITABILITY_ANALYSIS.md` section 1 |
-| Backtest statistics with selection adjustment | met for the trade-level and portfolio-level files; equity-level statistics need a rerun on the candle data | `BACKTEST_VALIDATION.md` |
+| No fabricated results | met: every number is traced to a committed file, a test or the research document; the walk-forward was not rerun on real candles during the audit and the document said so; the operator's PC reran it on 2026-11-04 and the measured values are in the document with the run record and the data fingerprints | `PROFITABILITY_ANALYSIS.md` sections 1 and 3.4 |
+| Backtest statistics with selection adjustment | met: trade-level and portfolio-level files at the audit, equity-level statistics from the 2026-11-04 rerun on the candle data (shipped Trend on validation: Sharpe 0.45, deflated Sharpe 0.13) | `BACKTEST_VALIDATION.md`, `PROFITABILITY_ANALYSIS.md` section 3.4 |
 | Profitability demonstrated | **not met**: no credible net-positive edge on holdouts or in paper | `PROFITABILITY_ANALYSIS.md` |
 | Tests pass, CI green | see `TEST_RESULTS.md` | |
 | Documentation complete | the twelve documents in `docs/audit/` | |
@@ -26,9 +26,9 @@ A live trial should not start until every row is true. Rows marked
 
 | # | Condition | State |
 |---|---|---|
-| L1 | A forward paper run of the shipped strategy over at least one full trend cycle (months) with a positive net result after costs, reported with the research statistics | **not met** (cycles 1-5 negative or inconclusive) |
+| L1 | A forward paper run of the shipped strategy over at least one full trend cycle (months) with a positive net result after costs, reported with the research statistics | **not met** (cycles 1-5 negative or inconclusive; the one-week soak of R-1, cycle 5 resumed on v1.5.166 on 2026-11-04 16:03 UTC, is running) |
 | L2 | The Trend 5 % band holdout read once and not negative | **not read** (deliberately); the research lens found the same window read at least six times by other runs, so this read carries less weight than the protocol implies and the forward paper run (L1) is the only clean out-of-sample test |
-| L3 | Operator has installed the release that carries this branch and run the paper soak on it with streaming off, then on | operator |
+| L3 | Operator has installed the release that carries this branch and run the paper soak on it with streaming off, then on | in progress: v1.5.166 installed on 2026-11-04, the soak started 16:03 UTC with streaming off; the streaming-on half and the end-of-week report are outstanding |
 | L4 | Exchange API key created **without** withdrawal rights, with an IP allow-list where offered, stored through the dashboard (keyring), never in a file | operator |
 | L5 | Conservative profile saved before enabling live: `risk_pct` 0.25, `daily_loss_limit_pct` 1, `daily_realized_loss_limit_pct` 1, `max_drawdown_pct` 5, `max_positions` 3, `max_order_notional_usdt` at or below 2 % of the account, `max_exposure_pct` 20 | operator (`RISK_MANAGEMENT_SPEC.md` section 4) |
 | L6 | Kill switch engaged with exits allowed for the first week, so only protective exits can be sent while the operator watches | operator |

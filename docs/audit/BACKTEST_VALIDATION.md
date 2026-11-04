@@ -70,7 +70,9 @@ of the protocol dictionary recorded in every result file.
 
 `python -m research.evidence` reads the committed result files and reports
 the trade-level statistics for every candidate and split, the number of
-variants that read the development or validation data (46), and for the
+variants that read the development or validation data (46 at the audit;
+47 since the 2026-11-04 rerun file was committed, see
+`PROFITABILITY_ANALYSIS.md` section 3.3), and for the
 portfolio-level studies the expected maximum Sharpe of that many noise
 trials and each variant's deflated Sharpe ratio (see
 `PROFITABILITY_ANALYSIS.md` section 3.3).
@@ -88,8 +90,16 @@ trials and each variant's deflated Sharpe ratio (see
   unchanged.
 * The candle data (`research/data/`) is not committed and the exchanges
   are unreachable from the audit environment, so **the harness was not
-  rerun on real candles here**. The commands in `PROFITABILITY_ANALYSIS.md`
-  section 3.4 produce the full table on a PC that holds the data.
+  rerun on real candles during the audit**. On 2026-11-04 the operator's
+  PC reran it, read-only, on the real MEXC daily candles (commit
+  `9989537`, v1.5.166; 12 pairs requested, 11 evaluated; Trend and
+  Position; realistic and doubled costs; development and validation;
+  `--metrics --trials 46`). The output is committed as
+  `research/results/classic/wf_metrics.json`; its trade-level figures are
+  identical to the committed 2026-10-29 and 2026-10-31 files, and
+  `PROFITABILITY_ANALYSIS.md` section 3.4 has the run record, the data
+  fingerprints and the tables (shipped Trend on validation: Sharpe 0.45,
+  Sortino 0.70, Calmar 0.53, deflated Sharpe 0.13).
 * Reproducibility note: rerunning `research/micro_research.py` in this
   environment reproduced `research/results/micro_fixtures.json` to five
   decimals but not six (the simulated fee is now booked unrounded, commit

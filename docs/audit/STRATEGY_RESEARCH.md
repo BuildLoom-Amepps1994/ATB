@@ -62,9 +62,12 @@ experiment needs new out-of-sample months first.
 
 1. Run the forward paper cycle of Trend (fixed and scaled arms) for months,
    and report it with the research statistics.
-2. Rerun the walk-forward with `--metrics --trials 46` on the PC that holds
-   the candles, to add Sortino, Calmar, drawdown duration, exposure,
-   turnover and the risk of ruin to the record.
+2. Done on 2026-11-04: the walk-forward rerun with `--metrics --trials 46`
+   on the PC that holds the candles (`research/results/classic/wf_metrics.json`,
+   `PROFITABILITY_ANALYSIS.md` section 3.4). Shipped Trend on validation,
+   mean of 11 single-pair accounts: Sharpe 0.45, Sortino 0.70, Calmar 0.53,
+   longest drawdown 415 days, invested 53 % of the time, deflated
+   Sharpe 0.13; most of the development profit is 2021. The verdict did not change.
 3. Read the Trend 5 % band holdout once, after the paper run has given an
    independent signal.
 4. Wider bands (the 5 % band was the top of the grid) and a regime filter

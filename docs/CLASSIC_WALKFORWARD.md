@@ -162,6 +162,15 @@ returns are unchanged at +18.0 % (development) and +1.8 % (validation), with
 (t 2.9 and 2.1) instead of +18 % and +6 %. 5 % is the top of the grid, so a wider band may be
 better still; that is a question for new data, not for these years.
 
+Rerun with equity statistics on 2026-11-04 on the operator's PC (v1.5.166,
+`research/results/classic/wf_metrics.json`, `--metrics --trials 46`): the
+same trades; on validation the 11 single-pair accounts average a Sharpe of
+0.45, Sortino 0.70, Calmar 0.53, a worst drawdown of 4.5 % and 53 %
+of the time invested, and the deflated Sharpe ratio of the mean against 46
+trials is 0.13; on development every account spent more than half of the
+split in one unbroken drawdown (777 to 1,233 days). `docs/audit/PROFITABILITY_ANALYSIS.md` section 3.4 has the
+run record, the data fingerprints and the tables.
+
 ## Portfolio rules (research/trend_portfolio.py, 2026-11-01)
 
 The app runs Trend over a watchlist with a fixed number of position slots,

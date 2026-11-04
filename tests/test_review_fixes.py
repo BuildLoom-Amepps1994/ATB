@@ -347,7 +347,8 @@ def test_repeated_identical_audit_entries_refresh_instead_of_flooding(db):
         storage.audit('warning', 'quote stale')
     storage.audit('warning', 'other')
     storage.audit('warning', 'quote stale')
-    assert [row['message'] for row in storage.rows('SELECT message FROM audit ORDER BY id')] == ['quote stale', 'other', 'quote stale']
+    # A line repeated within the recent window moves to the top as one copy (observability lens, 2026-11-04).
+    assert [row['message'] for row in storage.rows('SELECT message FROM audit ORDER BY id')] == ['other', 'quote stale']
 
 
 def test_damaged_last_good_copy_is_preserved_and_requires_review(db):

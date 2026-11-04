@@ -110,6 +110,7 @@ class TradingEngine:
         closed = storage.reject_never_sent_live_intents()
         if closed:
             storage.audit('warning', f'{closed} live order intent(s) that were never handed to the exchange were closed at startup; nothing was sent.')
+        self._audit_unbooked_live_fills()
         self.live_halted = self._durable_live_block()
         self._audit_hidden_live_positions()
         self.risk = risk.RiskGate(self)
@@ -261,6 +262,24 @@ class TradingEngine:
         if storage.get_meta(self._key('live_halt')) == '1':
             parts.append(f'{self.exchange_name}: durable halt flag')
         return '; '.join(parts) or 'see the recovery report'
+
+    def _audit_unbooked_live_fills(self) -> None:
+        """Name, at start-up, every live fill the journal holds that the ledger never booked.
+
+        The halt itself is reported elsewhere; this line says what the
+        exchange holds that no position row protects (verification of D-1).
+        It informs only: booking stays the reviewed manual step in RUNBOOK
+        section 6 until roadmap R-2.
+        """
+        try:
+            rows = storage.rows("SELECT side,symbol,filled_quantity,filled_price,intent_id FROM order_journal "
+                                "WHERE mode='live' AND status='filled' ORDER BY created_at")
+            for row in rows:
+                storage.audit('error', f"LIVE {row['side']} {row['symbol']} filled at the exchange but never booked: "
+                                       f"{row['filled_quantity']} at {row['filled_price']} (intent {row['intent_id']}); "
+                                       'no stop is monitored for it. Book it by hand (RUNBOOK section 6) before clearing the halt.')
+        except Exception:
+            pass   # a damaged journal is reported by the integrity check; start-up continues
 
     def _audit_hidden_live_positions(self) -> int:
         """Say when live holdings exist while the app is in paper mode: their stored stops are not monitored."""
@@ -693,6 +712,8 @@ class TradingEngine:
                                        'app to explain unfinished cycles.')
             with self.lock:
                 self.running = self.stopping = False
+                last_error = self.last_error
+            observability.event('engine.stopped', mode=self.mode, error=last_error)
             self._stop_feed()
 
     CLOSE_GRACE_SECONDS = 5.0
@@ -842,8 +863,10 @@ class TradingEngine:
         else:
             try:
                 tickers = self.data.quotes(held)
-            except Exception:
+            except Exception as exc:
                 tickers = {}
+                self.metrics.incr('monitor.bulk_quote_failures')
+                observability.event('monitor.quote_error', level='warning', error=type(exc).__name__, symbols=len(held))
         self.metrics.incr('monitor.source.stream' if streamed else 'monitor.source.rest')
         exit_error = None
         for position in positions:
@@ -858,8 +881,10 @@ class TradingEngine:
                     if not ticker:
                         raise
                     price, _, _ = self._observe_ticker(symbol, self.data.ticker(symbol))
-            except Exception:
+            except Exception as exc:
                 failures += 1
+                self.metrics.incr('monitor.quote_failures')
+                observability.event('monitor.quote_error', level='warning', symbol=symbol, error=type(exc).__name__)
                 continue
             observed += 1
             try:
@@ -883,13 +908,7 @@ class TradingEngine:
                 # balance or credential problem). Say so, instead of
                 # reporting it as a quote outage, so the operator chases the
                 # right cause while the position stays open.
-                exit_error = f'Protective exit failed for {symbol}: {type(exc).__name__}; review required'
-                try:
-                    storage.audit('error', exit_error)
-                except Exception:
-                    pass   # a ledger failure here must not end the tick before the other positions are checked
-                observability.event('monitor.exit_error', level='error', symbol=symbol, error=type(exc).__name__)
-                self.metrics.incr('monitor.exit_errors')
+                exit_error = self._report_exit_failure(symbol, exc, source='monitor')
         # Finish-relative scheduling avoids hot loops on slow or failing reads.
         self._next_monitor = time.monotonic() + interval
         self.metrics.observe('monitor.cycle_ms', (time.monotonic() - started) * 1000)
@@ -900,6 +919,10 @@ class TradingEngine:
                 self.monitor_error = exit_error
             elif failures:
                 self.monitor_error = f'Protective quotes unavailable for {failures} held asset(s)'
+        if failures and not exit_error:
+            # A durable line (the activity list collapses its repetitions), so an
+            # outage that ends before the operator looks still leaves a trace.
+            self._quiet_audit(f'Protective quotes unavailable for {failures} held asset(s); stops were not checked this poll.')
         remaining = self._active_positions(self.mode)
         if self._marks_fresh(remaining) and self._orders_allowed():
             try:
@@ -1171,6 +1194,20 @@ class TradingEngine:
         except Exception:
             pass
 
+    def _report_exit_failure(self, symbol: str, exc: Exception, *, source: str) -> str:
+        """Audit, event and count a failed protective exit; the position stays open."""
+        message = f'Protective exit failed for {symbol}: {type(exc).__name__}; review required'
+        try:
+            storage.audit('error', message)
+        except Exception:
+            pass   # a ledger failure here must not end the pass before the other positions are checked
+        observability.event('monitor.exit_error', level='error', symbol=symbol, error=type(exc).__name__, source=source)
+        self.metrics.incr('monitor.exit_errors')
+        if source != 'monitor':
+            with self.lock:
+                self.monitor_error = message
+        return message
+
     def _ledger_failure(self, description: str, *, intent_id: str | None = None, mode: str | None = None,
                         contain: bool = False):
         """Stop on an order or ledger outcome that needs review; a live one halts durably.
@@ -1192,6 +1229,11 @@ class TradingEngine:
             if contain:
                 storage.audit('error', f'{description}. New micro entries are blocked until it is recovered; open '
                                        'cycles keep their exits.')
+            else:
+                try:
+                    storage.audit('error', description)   # the dashboard's only durable record of why the bot stopped
+                except Exception:
+                    pass
             self.risk.record_failure('ledger')
         observability.event('ledger.failure', level='error', description=description, intent_id=intent_id, mode=mode)
 
@@ -1312,7 +1354,7 @@ class TradingEngine:
         intent = None
         accepted = False   # the counterparty is known to hold the order
         mode = self.mode
-        if authorization is None or not authorization.valid_for(symbol, side):
+        if authorization is None or not authorization.valid_for(symbol, side) or not self.risk.issued(authorization):
             self.metrics.incr('risk.unauthorized_submit')
             storage.audit('error', f'{side} {symbol} refused: no valid risk authorization for this order.')
             observability.event('risk.unauthorized_submit', level='error', symbol=symbol, side=side)
@@ -1426,10 +1468,12 @@ class TradingEngine:
             # A documented exchange rejection confirms no order was accepted.
             # Transport errors and unrecognized responses always remain uncertain.
             if intent and not accepted and isinstance(exc, orders.definite_rejections()):
+                error_name = (f'{type(exc.original).__name__} (refused; no order at the venue)'
+                              if isinstance(exc, orders.ConfirmedRefusal) else type(exc).__name__)
+                journaled = False
                 try:
-                    error_name = (f'{type(exc.original).__name__} (refused; no order at the venue)'
-                                  if isinstance(exc, orders.ConfirmedRefusal) else type(exc).__name__)
                     storage.update_order_intent(intent, 'rejected', note=error_name)
+                    journaled = True
                     with self.lock:
                         self.risk_block = f'{side} {symbol} rejected by the exchange: {error_name}'
                     storage.audit('warning', self.risk_block)
@@ -1437,8 +1481,14 @@ class TradingEngine:
                     observability.event('execution.rejected', level='warning', symbol=symbol, side=side,
                                         error=error_name, intent_id=intent)
                     return None, None
-                except Exception:
-                    pass
+                except Exception as report_exc:
+                    if journaled:
+                        # The journal holds the refusal; a failed report line after
+                        # it must not turn a confirmed refusal into an unknown outcome.
+                        self.metrics.incr('execution.rejection_report_failed')
+                        observability.event('execution.rejected', level='warning', symbol=symbol, side=side,
+                                            error=error_name, intent_id=intent, report_error=type(report_exc).__name__)
+                        return None, None
             if intent:
                 try:
                     storage.update_order_intent(intent, 'uncertain', note=type(exc).__name__)
@@ -1991,7 +2041,19 @@ class TradingEngine:
                         db.execute('UPDATE positions SET highest=?,stop=? WHERE exchange=? AND mode=? AND symbol=?',
                                    (highest, stop, self.exchange_name, self.mode, symbol))
                 except Exception as exc:
-                    self._ledger_failure(f'Trailing stop persistence failed: {type(exc).__name__}')
+                    # Nothing was sent to the venue: a failed level write is a
+                    # monitoring fault, not an order uncertainty, so it does not
+                    # halt live trading. The stored (lower) stop still applies
+                    # and the next poll retries the write.
+                    try:
+                        storage.audit('error', f'Trailing stop for {symbol} could not be saved ({type(exc).__name__}); '
+                                               f'the stored stop {float(position["stop"]):.7g} still applies.')
+                    except Exception:
+                        pass
+                    observability.event('ledger.trail_write_failed', level='error', symbol=symbol,
+                                        error=type(exc).__name__, mode=self.mode)
+                    self.metrics.incr('monitor.trail_write_failures')
+                    self.risk.record_failure('ledger')
                     return
             already_tried = verdict['trigger'] == 'stored' and stored_checked_at is not None and price == stored_checked_at
             if verdict['action'] == 'exit' and not already_tried and self._orders_allowed():
@@ -2090,7 +2152,13 @@ class TradingEngine:
                     protected_at = None
                     if allow_orders and self._orders_allowed():
                         protected_at = self.last_prices[symbol]
-                        self._protect_positions(symbol, protected_at)
+                        try:
+                            self._protect_positions(symbol, protected_at)
+                        except Exception as exc:
+                            # Reported like the monitor's failures, not as a scan
+                            # or data problem: the position stays open and the
+                            # operator must chase the exit, not the candles.
+                            self._report_exit_failure(symbol, exc, source='scan')
                     primary = self.data.candles(symbol, primary_tf, limit=175)
                     if allow_orders:
                         exited_symbols.update(self._monitor_if_due())
@@ -2735,6 +2803,7 @@ class TradingEngine:
                     'last_monitor': self.last_monitor, 'last_successful_monitor': self.last_successful_monitor,
                     'monitor_error': self.monitor_error,
                     'risk_block': self.risk_block, 'ledger_error': ledger_error,
+                    'event_log_error': observability.last_write_error(),
                     'paper_cash': round(paper_cash, 2) if paper_cash is not None else None,
                     'cash': round(cash, 2) if cash is not None else None,
                     'equity': round(equity, 2) if equity is not None else None,

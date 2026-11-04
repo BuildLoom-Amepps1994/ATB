@@ -120,6 +120,7 @@ class RiskGate:
         self.metrics = observability.METRICS
         self._failures: list[float] = []      # monotonic times of exchange/ledger failures
         self._breaker_until: dict[str, float] = {}
+        self._issued: dict[str, tuple] = {}   # token -> the request it was issued for (bounded)
         self.last_block: dict | None = None
         self.blocked = 0
 
@@ -375,8 +376,36 @@ class RiskGate:
                 tripped = False
         self.metrics.incr(f'risk.failure.{kind}')
         if tripped:
+            try:
+                # Durable, so a restart (the reflex when a bot "stops entering")
+                # does not lift the pause before its cause is understood.
+                storage.set_meta(self._key('failure_breaker', self.engine.mode), json.dumps({'until': time.time() + BREAKER_HOLD_S}))
+            except Exception:
+                pass
             storage.audit('error', f'Circuit breaker: {FAILURE_SPIKE_COUNT} execution failures within {FAILURE_SPIKE_WINDOW_S // 60} minutes; new entries pause for {BREAKER_HOLD_S // 60} minutes.')
             observability.event('risk.breaker', level='error', breaker='failures', hold_seconds=BREAKER_HOLD_S)
+
+    def _failure_remaining(self, mode: str) -> float:
+        """Seconds left on the durable execution-failure hold, clock steps capped as for slippage."""
+        raw = storage.get_meta(self._key('failure_breaker', mode))
+        try:
+            record = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            record = {}
+        until, now = _finite((record or {}).get('until')) if isinstance(record, dict) else None, time.time()
+        remaining = (until or 0.0) - now
+        if remaining > BREAKER_HOLD_S:
+            storage.set_meta(self._key('failure_breaker', mode), json.dumps({'until': now + BREAKER_HOLD_S}))
+            remaining = float(BREAKER_HOLD_S)
+        return max(0.0, remaining)
+
+    def issued(self, authorization) -> bool:
+        """True when this gate issued ``authorization`` for the very request it carries."""
+        with self.lock:
+            record = self._issued.get(getattr(authorization, 'token', None))
+        request = getattr(authorization, 'request', None)
+        return (record is not None and request is not None
+                and record == (request.symbol, request.side, request.kind, request.mode, request.notional))
 
     # ------------------------------------------------------------ evaluation
     def _recent_orders(self, mode: str, seconds: float) -> list[dict]:
@@ -606,6 +635,7 @@ class RiskGate:
                   'Circuit breaker: repeated exchange rejections; new entries paused')
             with self.lock:
                 breaker_open = any(until > now_mono for until in self._breaker_until.values())
+            breaker_open = breaker_open or self._failure_remaining(mode) > 0
             check('failure_breaker', not breaker_open, 'Circuit breaker: repeated execution failures; new entries paused')
             slipped, average_slip = self._slippage_breaker(mode)
             check('slippage_breaker', not slipped, 'Circuit breaker: realized slippage far above the assumed cost',
@@ -625,6 +655,12 @@ class RiskGate:
         authorization = Authorization(allowed, request, tuple(failed), tuple(checks), secrets.token_hex(8))
         if allowed:
             self.metrics.incr('risk.authorized')
+            with self.lock:
+                # The submit path accepts only a token this gate issued for the
+                # same request; a hand-built authorization is refused.
+                self._issued[authorization.token] = (request.symbol, request.side, request.kind, request.mode, request.notional)
+                while len(self._issued) > 512:
+                    self._issued.pop(next(iter(self._issued)))
         else:
             self.blocked += 1
             self.metrics.incr('risk.blocked')
@@ -646,9 +682,10 @@ class RiskGate:
             breakers = {name: round(until - now, 1) for name, until in self._breaker_until.items() if until > now}
         mode = self.engine.mode
         for name, remaining in (('reject_spike', self._reject_spike_remaining(mode)),
-                                ('slippage', self._slippage_remaining(mode))):
+                                ('slippage', self._slippage_remaining(mode)),
+                                ('failures', self._failure_remaining(mode))):
             if remaining > 0:
-                breakers[name] = round(remaining, 1)
+                breakers[name] = round(max(remaining, breakers.get(name, 0.0)), 1)
         return {'kill_switch': self.kill_switch(), 'drawdown_stop': self.drawdown_stop(mode),
                 'realized_stop': self.realized_stop(mode), 'loss_streak': self.loss_streak(mode),
                 'loss_streak_stop': self.loss_streak_stop(mode),

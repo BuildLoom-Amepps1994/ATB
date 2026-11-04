@@ -227,7 +227,8 @@ the exchange knows an order with that client order id and what state it is in.
 
 * **Activity log** (dashboard and `audit` table): human-readable, redacted,
   bounded.
-* **Event log** `logs/events.jsonl` (rotated, 5 MB × 3): one JSON object per
+* **Event log** `logs/events.jsonl` (rotated at 5 MB, the current file plus
+  three backups, 20 MB in all): one JSON object per
   line with `ts`, `kind`, `level` and fields. Secrets and key-like strings are
   redacted before writing. Event kinds: `engine.start`, `engine.started`,
   `engine.stopped`, `mode.changed`, `settings.saved`, `paper.reset`,

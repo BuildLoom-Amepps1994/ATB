@@ -17,6 +17,8 @@ import math
 import time
 from typing import Any
 
+import json
+
 import ccxt
 
 FINAL_STATUSES = ('closed', 'canceled', 'cancelled', 'expired', 'rejected')
@@ -70,7 +72,21 @@ def venue_error_response(exc: Exception) -> bool:
     Such an answer plus an order list that holds nothing for the client order
     id means nothing was accepted.
     """
-    return isinstance(exc, ccxt.ExchangeError) and not isinstance(exc, getattr(ccxt, 'OperationFailed', ()))
+    if not isinstance(exc, ccxt.ExchangeError) or isinstance(exc, getattr(ccxt, 'OperationFailed', ())):
+        return False
+    # CCXT also raises a bare ExchangeError for a failed transport it could not
+    # classify (an HTML 5xx page, a redirect loop, a TLS error), with the text
+    # "<id> <method> <url>" and no body. Only an answer that carries the venue's
+    # own JSON body (a code, a message or an error list) is the venue's refusal.
+    text = str(exc)
+    start = text.find('{')
+    if start < 0:
+        return False
+    try:
+        body = json.loads(text[start:])
+    except ValueError:
+        return False
+    return isinstance(body, dict) and any(key in body for key in ('code', 'msg', 'error', 'errors'))
 
 
 def classify(order: Any) -> str:
@@ -100,7 +116,7 @@ def order_params(exchange_name: str, client_order_id: str) -> dict:
 
 
 def supports_client_id_lookup(client) -> bool:
-    """MEXC resolves fetchOrder by origClientOrderId; Kraken maps clientOrderId to userref."""
+    """MEXC resolves fetchOrder by origClientOrderId; CCXT 4.5 sends Kraken's clientOrderId as cl_ord_id, which its order lookups do not take."""
     return getattr(client, 'id', None) == 'mexc' and bool(getattr(client, 'has', {}).get('fetchOrder'))
 
 

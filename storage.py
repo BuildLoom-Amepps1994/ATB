@@ -515,12 +515,18 @@ def redact(message: object) -> str:
 def audit(level: str, message: str):
     level, message = str(level)[:20], redact(message)[:500]
     with connection() as db:
-        # A condition reported every poll (a stale quote, a retained remainder)
-        # refreshes its latest entry instead of flushing the 300-row history.
-        latest = db.execute('SELECT id,level,message FROM audit ORDER BY id DESC LIMIT 1').fetchone()
-        if latest and latest['level'] == level and latest['message'] == message:
-            db.execute('UPDATE audit SET created_at=? WHERE id=?', (_now(), latest['id']))
-            return
+        # A condition reported every poll (a stale quote, a retained remainder,
+        # one failing exit per position) refreshes its recent entry instead of
+        # flushing the 300-row history; the window covers lines that alternate.
+        for index, recent in enumerate(db.execute('SELECT id,level,message FROM audit ORDER BY id DESC LIMIT 20').fetchall()):
+            if recent['level'] == level and recent['message'] == message:
+                if index == 0:
+                    db.execute('UPDATE audit SET created_at=? WHERE id=?', (_now(), recent['id']))
+                    return
+                # Moved to the top as one copy: the list still shows it as the
+                # latest activity without a second row for every repetition.
+                db.execute('DELETE FROM audit WHERE id=?', (recent['id'],))
+                break
         db.execute('INSERT INTO audit(created_at,level,message) VALUES (?,?,?)', (_now(), level, message))
         db.execute('DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT 300)')
 

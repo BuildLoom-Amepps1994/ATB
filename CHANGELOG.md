@@ -237,6 +237,50 @@ Fixed
   `docs/CLASSIC_WALKFORWARD.md` is marked unsupported until the study is
   rerun on the candle data. No app setting changes: the 25 % stop was the
   shipped value before the study.
+* **Failures on the protective path leave a durable record.** A protective
+  exit that failed during the scan was shown only as "Scan unavailable" in
+  the market table; it is now reported exactly like a monitor failure
+  (activity line, event, counter, dashboard warning). A quote failure in
+  the protective tick writes a counter, an event and one activity line
+  (repetitions collapse), so an outage that ends before the operator looks
+  still leaves a trace. A paper worker stopped by an exception writes the
+  activity line that explains why, and the worker's end is an
+  `engine.stopped` event.
+* **A failed trailing-level write no longer halts live trading.** Nothing
+  had been sent to the venue, yet the failure was classed as an order
+  uncertainty: live trading halted durably with a message naming no
+  symbol, and every stop stopped being monitored. It is now a monitoring
+  fault: the activity line names the symbol and the stored stop that still
+  applies, the next poll retries the write, and the execution-failure
+  breaker counts it.
+* **A confirmed venue refusal stays a refusal when its report line fails to
+  write.** The journal row was already `rejected` but a failing activity
+  write escalated the outcome to `uncertain` and a durable live halt.
+* **A venue refusal is recognised by the venue's own body.** CCXT raises
+  the same bare `ExchangeError` for a transport it could not classify (an
+  HTML 5xx page, a redirect loop, a TLS error) with no body; only an answer
+  carrying the venue's JSON body (a code, a message or an error list) now
+  counts as the venue's refusal after the lookup; everything else stays
+  `uncertain`.
+* **The event log reports when it cannot be written.** A failed append was
+  swallowed; it now counts, is shown in the state (`event_log_error`) and
+  on the dashboard, and writes one activity line per change of state. A
+  failed rotation is counted. A string field is bounded before
+  serialisation, so an oversized event is never cut inside a string
+  literal into an invalid JSON line.
+* **Repeated activity lines collapse within the recent window.** Two lines
+  alternating every poll (one failing exit per position) flushed the
+  300-row activity history in minutes; a line repeated within the last 20
+  rows now moves to the top as one copy.
+* **The execution-failure breaker survives a restart.** Its 30-minute hold
+  lived in memory, so a restart lifted the pause before its cause was
+  understood; it is now stored like the slippage hold.
+* **The submit path accepts only an authorization the gate issued** for the
+  same request (symbol, side, kind, mode, notional); a hand-built
+  authorization object is refused and counted.
+* **A filled-but-unbooked live intent is named at start-up** (side, symbol,
+  quantity, price, intent) with the reminder that no stop is monitored for
+  it until it is booked.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

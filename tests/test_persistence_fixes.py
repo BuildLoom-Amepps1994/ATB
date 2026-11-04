@@ -233,6 +233,17 @@ def test_live_intents_that_never_left_are_closed_at_startup(engine):
 
 
 # ------------------------------------------------------------ integrity
+def test_a_filled_but_unbooked_live_fill_is_named_at_startup(engine):
+    intent = storage.create_order_intent(engine.exchange_name, 'BTC/USDT', 'BUY', cost=130, mode='live')
+    storage.update_order_intent(intent, 'pending', submitted_at=storage._now())
+    storage.update_order_intent(intent, 'acked', order_id='venue-7')
+    storage.update_order_intent(intent, 'filled', filled_quantity=.002, filled_price=65000.0)
+    trader.TradingEngine()
+    lines = [row['message'] for row in storage.rows('SELECT message FROM audit ORDER BY id')]
+    assert any(line.startswith(f'LIVE BUY BTC/USDT filled at the exchange but never booked: 0.002 at 65000.0 (intent {intent}); '
+                               'no stop is monitored for it.') for line in lines)
+
+
 def test_a_damaged_ledger_is_refused_before_any_migration(data, capsys):
     for _ in range(40):
         storage.create_order_intent('mexc', 'BTC/USDT', 'BUY', cost=10, mode='paper')

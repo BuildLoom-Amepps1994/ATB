@@ -101,9 +101,14 @@ def test_a_located_order_after_a_venue_error_is_booked(engine, monkeypatch):
 
 
 def test_venue_error_responses_exclude_transport_and_unreadable_answers():
-    assert orders.venue_error_response(ccxt.ExchangeError('x')) and orders.venue_error_response(ccxt.OperationRejected('x'))
-    for exc in (ccxt.NetworkError('x'), ccxt.RequestTimeout('x'), ccxt.RateLimitExceeded('x'), ccxt.InvalidNonce('x'),
-                ccxt.BadResponse('x'), ccxt.ExchangeNotAvailable('x'), RuntimeError('x')):
+    assert orders.venue_error_response(ccxt.ExchangeError('mexc {"code":30000,"msg":"suspended transaction for the symbol"}'))
+    assert orders.venue_error_response(ccxt.OperationRejected('kraken {"error":["EOrder:Insufficient funds"]}'))
+    body = '{"code":30000,"msg":"x"}'
+    for exc in (ccxt.NetworkError(body), ccxt.RequestTimeout(body), ccxt.RateLimitExceeded(body), ccxt.InvalidNonce(body),
+                ccxt.BadResponse(body), ccxt.ExchangeNotAvailable(body), RuntimeError(body),
+                # a bare ExchangeError CCXT synthesised for a transport it could not classify carries no venue body
+                ccxt.ExchangeError('mexc POST https://api.mexc.com/api/v3/order'), ccxt.ExchangeError('x'),
+                ccxt.ExchangeError('kraken <html><body>524 origin time-out</body></html>'), ccxt.ExchangeError('mexc {not json')):
         assert not orders.venue_error_response(exc)
     assert orders.ConfirmedRefusal in orders.definite_rejections()
     assert 'ValueError' in str(orders.ConfirmedRefusal(ValueError('x')))

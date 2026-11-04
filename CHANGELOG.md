@@ -8,6 +8,13 @@ the review documents it links.
 
 Changed
 
+* **The portfolio stop-risk cap can be set up to 20 %** (it was 8 %). The cap
+  counts each position's distance to its stored stop; Trend's 25 % disaster
+  stop made 8 % allow only about four full-size Trend positions. The default
+  (3 %) is unchanged. Research on coin rotation and tighter stops
+  (`research/trend_rotation.py`, `docs/CLASSIC_WALKFORWARD.md`): a 15 % or
+  10 % stop loses on validation, so the stop is not tightened; weekly
+  rotation into stronger coins did not hold up and is not built.
 * **Trend can scale each entry by recent volatility** (`trend_vol_target_pct`,
   off by default): the size target is multiplied by min(1, target /
   annualised 20-day volatility). Tested on development and validation data

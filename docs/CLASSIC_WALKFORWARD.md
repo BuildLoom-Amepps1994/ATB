@@ -186,3 +186,44 @@ rule that sizes volatile coins down must do. The protocol's selection rule
 judged by raw development return and kept the base, so the scaling ships as
 a setting that is off by default (`trend_vol_target_pct`), and the forward
 paper run compares fixed and scaled sizing side by side on the same pairs.
+
+## Coin rotation and the disaster stop (research/trend_rotation.py, 2026-11-04)
+
+Asked for a bot that trades the most profitable coins and switches between
+them freely, this tests active rotation: every 7 days, swap the weakest
+holding for a qualifying coin whose 90- or 180-day return is at least 10
+points higher, at most two swaps a week. It also tests the disaster stop at
+25, 15 and 10 % below entry, because the app's portfolio-risk cap is
+measured against that stop. Same pairs, slots, sizing, costs and splits as
+the portfolio study; protocol `trend-rotation-v1` fixed in advance; the
+holdout not read.
+
+| Variant (8 slots) | Development return (Sharpe, max drawdown) | Validation return (Sharpe, max drawdown) | Validation trades, rotations |
+| --- | --- | --- | --- |
+| No rotation, 25 % stop, fixed size (base) | +1,518 % (1.21, 78 %) | -4.6 % (0.22, 47 %) | 62, 0 |
+| No rotation, 25 % stop, volatility-scaled (selected) | +1,205 % (1.18, 80 %) | +13.7 % (0.45, 38 %) | 62, 0 |
+| No rotation, 15 % stop, fixed | +1,374 % (1.17, 81 %) | -35.7 % (-0.30, 52 %) | 86, 0 |
+| No rotation, 10 % stop, fixed | +774 % (1.01, 89 %) | -32.5 % (-0.24, 50 %) | 115, 0 |
+| Rotation 90 d, 25 % stop, fixed | +567 % (0.97, 85 %) | +9.5 % (0.45, 48 %) | 109, 48 |
+| Rotation 90 d, 25 % stop, volatility-scaled | +876 % (1.06, 85 %) | +27.9 % (0.65, 34 %) | 110, 48 |
+| Rotation 180 d, 25 % stop, volatility-scaled | +649 % (1.00, 86 %) | +9.5 % (0.40, 41 %) | 107, 41 |
+| Any rotation with a 15 % or 10 % stop | lower | negative | |
+
+Three findings. **Tighter stops hurt** on both splits: every variant with a
+15 % or 10 % stop loses on validation, and even the 25 % stop costs about
+ten points against the same rule without one (the portfolio study above:
++6.5 % and +20.1 % without a stop against -4.6 % and +13.7 % with it). A
+trend rule's exit is the band; a price stop inside the band mostly sells
+dips. **Rotation by momentum did not hold up**: it helped validation only
+with volatility-scaled sizing, and lowered the development Sharpe below the
+rule's threshold, so it is not built. The bot already switches coins by the
+rule itself, selling a coin that breaks its trend and buying the next that
+qualifies. **Volatility-scaled sizing is selected again**, by this study's
+own rule, after the portfolio study's raw-return rule had kept fixed sizing.
+
+Consequences in the app: the disaster stop stays at 25 % and is not
+tightened; because the portfolio-risk cap counts that 25 % per position,
+its upper bound rises from 8 % to 20 % so a Trend profile can give all
+eight slots their full size (8 positions x 8 % x 25 % = 16 %). The
+volatility target stays a setting; cycle 5 keeps the fixed and scaled arms
+side by side.

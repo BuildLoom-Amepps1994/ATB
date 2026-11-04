@@ -41,6 +41,11 @@ TIMEFRAME_SECONDS = {'1m': 60, '5m': 300, '1h': 3600, '4h': 14400,
                      '1d': 86400, '1w': 604800}
 
 
+# Venues that bill a market buy's commission in the asset received (the base),
+# so an unreadable fee on a buy is a base deduction, not a quote debit.
+BASE_FEE_ON_BUY_EXCHANGES = ('mexc',)
+
+
 def is_meme(symbol: str) -> bool:
     return symbol.split('/')[0] in KNOWN_MEMES
 
@@ -1358,7 +1363,7 @@ class TradingEngine:
                                  intent_id=intent, contain=micro_client)
             return None, None
 
-    def _fill_details(self, order: dict, symbol: str) -> tuple[float, float, float, float, float, float, float]:
+    def _fill_details(self, order: dict, symbol: str, side: str | None = None) -> tuple[float, float, float, float, float, float, float]:
         """Return filled quantity, price, gross, quote/base fees, fee value in USDT, and its estimated part.
 
         The last value is the estimate booked for a fee billed in a third
@@ -1378,7 +1383,19 @@ class TradingEngine:
         if not fees:
             fees = [order['fee']] if isinstance(order.get('fee'), dict) else []
         if not fees:
-            return filled, price, gross, gross * self.cfg['fee_pct'] / 100, 0.0, gross * self.cfg['fee_pct'] / 100, 0.0
+            rate = self.cfg['fee_pct'] / 100
+            if side == 'BUY' and self.exchange_name in BASE_FEE_ON_BUY_EXCHANGES:
+                # The venue deducts a buy's commission from the units received. Booking
+                # the gross quantity would track units the account never held, which
+                # the exit could not sell (finding 13). The configured rate is booked
+                # as a base deduction: the tracked quantity is at most what was received.
+                base_fee = filled * rate
+                storage.audit('warning', f'{symbol}: executed fee unreadable; the configured {self.cfg["fee_pct"]:g}% is '
+                                         f'booked as a deduction of {base_fee:.8g} {symbol.split("/")[0]} from the quantity received.')
+                observability.event('execution.fee_estimated', level='warning', symbol=symbol, side=side,
+                                    base_fee=base_fee, rate_pct=self.cfg['fee_pct'])
+                return filled, price, gross, 0.0, base_fee, base_fee * price, 0.0
+            return filled, price, gross, gross * rate, 0.0, gross * rate, 0.0
         if not isinstance(fees, list):
             raise ValueError('Unrecognized exchange fee response')
         quote_fee = base_fee = 0.0
@@ -1503,7 +1520,7 @@ class TradingEngine:
             if order is None:
                 return False
             try:
-                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol)
+                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol, 'BUY')
                 qty = filled - base_fee
                 # A cost-bounded simulated buy spends exactly its budget; a
                 # partial simulated fill (failure injection) spends what filled.
@@ -1549,7 +1566,7 @@ class TradingEngine:
             if order is None:
                 return False
             try:
-                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol)
+                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol, 'BUY')
                 qty, cost = filled - base_fee, gross + quote_fee
                 if qty <= 0 or cost > budget * 1.03:
                     raise ValueError('Executed quantity/cost differs from the reserved budget')
@@ -1558,7 +1575,7 @@ class TradingEngine:
                 self._ledger_failure(f'BUY {symbol}: {type(exc).__name__}; fill/fee accounting requires review',
                                      intent_id=intent, mode='live')
                 return False
-        booked = False
+        booked, merged_note = False, None
         try:
             with storage.connection() as db:
                 if mode == 'paper':
@@ -1577,11 +1594,18 @@ class TradingEngine:
                             or float(current['cost']) != float(existing['cost'])):
                         raise ValueError('Tracked remainder changed before consolidation')
                     total_qty, total_cost = qty + float(existing['qty']), cost + estimated + float(existing['cost'])
-                    average = (qty * fill_price + float(existing['qty']) * float(existing['entry_price'])) / total_qty
+                    # The merged row keeps the blended cost basis for P/L, but its
+                    # entry reference, high, stop and target come from the fill that
+                    # just happened: anchored on the blended average, a remainder from
+                    # a higher earlier entry put the stop above the current bid and
+                    # the merged position was sold at the next poll (finding 7).
                     db.execute('''UPDATE positions SET qty=?,entry_price=?,cost=?,highest=?,stop=?,target=?,opened_at=?
                                   WHERE exchange=? AND mode=? AND symbol=?''',
-                               (total_qty, average, total_cost, max(average, fill_price), average * (1 - fraction),
-                                average * self._target_multiple(fraction), now(), exchange, mode, symbol))
+                               (total_qty, fill_price, total_cost, fill_price, fill_price * (1 - fraction),
+                                fill_price * self._target_multiple(fraction), now(), exchange, mode, symbol))
+                    merged_note = (f'{mode.upper()} {symbol}: {float(existing["qty"]):.8g} retained units (cost '
+                                   f'{float(existing["cost"]):.2f} USDT) merged into the new position; stop, target '
+                                   f'and trail are anchored on the new fill {fill_price:.7g}, the cost basis is blended.')
                 else:
                     db.execute('''INSERT INTO positions(exchange,mode,symbol,qty,entry_price,cost,highest,stop,target,opened_at)
                                   VALUES (?,?,?,?,?,?,?,?,?,?)''',
@@ -1608,6 +1632,8 @@ class TradingEngine:
                 observability.event('ledger.accounted', intent_id=intent, decision_id=decision_id, mode=mode, symbol=symbol,
                                     side='BUY', order_id=order_id, qty=qty, price=fill_price, cost=cost, fee=fee)
                 storage.audit('trade', f'{mode.upper()} BUY {symbol}: {qty:.7g} at {fill_price:.7g}; cost {cost:.2f} USDT.')
+                if merged_note:
+                    storage.audit('info', merged_note)
             except Exception as exc:
                 self._after_booking_failed(mode, 'BUY', symbol, exc, intent)
             self._observe_fills(mode)
@@ -1641,7 +1667,7 @@ class TradingEngine:
             if order is None:
                 return False
             try:
-                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol)
+                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol, 'SELL')
                 consumed = filled + base_fee
                 if consumed > tracked * (1 + 1e-10):
                     raise ValueError('Simulated fill would consume untracked holdings')
@@ -1692,7 +1718,7 @@ class TradingEngine:
             if order is None:
                 return False
             try:
-                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol)
+                filled, fill_price, gross, quote_fee, base_fee, fee, estimated = self._fill_details(order, symbol, 'SELL')
                 consumed = filled + base_fee
                 if consumed > tracked * (1 + 1e-10) or filled > amount * (1 + 1e-10):
                     raise ValueError('Fill or base fee would consume untracked holdings')
@@ -1701,13 +1727,31 @@ class TradingEngine:
                 self._ledger_failure(f'SELL {symbol}: {type(exc).__name__}; fill/fee accounting requires review',
                                      intent_id=intent, mode='live')
                 return False
-        ratio = min(1.0, consumed / tracked)
+        # Units the ledger tracked but the exchange did not hold (a fee deducted in
+        # the base asset that could not be read) cannot be sold later. Once
+        # everything the account held is sold, a shortfall below the exchange
+        # minimum is realised on this exit instead of being kept as a phantom
+        # remainder that marks the pair 'held' for good (finding 13). A larger
+        # shortfall (units locked in another order, an outside transfer) stays
+        # tracked with the warning above, as before.
+        phantom = 0.0
+        if mode == 'live' and available < tracked * (1 - 1e-9) and consumed >= available * (1 - 1e-9):
+            shortfall = tracked - available
+            if (min_quantity and shortfall < min_quantity) or (min_cost and shortfall * market_price < min_cost):
+                phantom = shortfall
+        ratio = min(1.0, (consumed + phantom) / tracked)
         basis = float(position['cost']) * ratio
         # Cash receives the exact proceeds; P/L also bears a third-asset fee estimate.
         proceeds, pnl = gross - quote_fee, gross - quote_fee - estimated - basis
-        remaining = max(0.0, tracked - consumed)
+        remaining = max(0.0, tracked - consumed - phantom)
         if remaining <= tracked * 1e-12:
             remaining = 0.0
+        if phantom:
+            storage.audit('warning', f'{symbol}: the exchange held {available:.8g} of the {tracked:.8g} tracked units; the '
+                                     f'{phantom:.8g} untracked units and their cost basis {float(position["cost"]) * phantom / tracked:.4f} '
+                                     'USDT are written off on this exit. Compare the ledger with the exchange account history.')
+            observability.event('ledger.shortfall_written_off', level='warning', symbol=symbol, tracked=tracked,
+                                available=available, phantom=phantom, intent_id=intent)
         booked = False
         try:
             with storage.connection() as db:

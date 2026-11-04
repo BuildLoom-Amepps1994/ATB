@@ -32,6 +32,26 @@ Added
   result files already support. `strategy.backtest(keep_curve=True)` keeps
   the bar-level curve for them; the dashboard payload is unchanged.
 
+Fixed
+
+* **A MEXC buy whose trade fees cannot be read is booked net of the fee**
+  (hardening review finding 13, open since 2026-10-26). MEXC bills a market
+  buy's commission in the asset received, so the old quote-side estimate
+  tracked units the account never held and every exit of such a position
+  left an unsellable phantom remainder that kept the pair `held`. The
+  fallback now deducts the configured rate from the base quantity on MEXC
+  buys only (`execution.fee_estimated` carries `base_fee`); Kraken buys and
+  every sell keep the quote estimate. A live exit that sells everything the
+  account holds also writes off a tracked shortfall below the exchange
+  minimum (`ledger.shortfall_written_off`), realising its cost basis on that
+  exit; a larger shortfall stays tracked with the existing warning.
+* **A manual buy that merges a retained remainder anchors the stop, target
+  and trailing high on the new fill** (finding 7). They were anchored on the
+  blended average entry, which a remainder from a higher earlier entry could
+  put above the current bid, so the merged position was sold at the next
+  protective poll. The blended cost basis is kept for P/L
+  (`tests/test_accounting_fixes.py`).
+
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 
 Changed

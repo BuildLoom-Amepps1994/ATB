@@ -66,9 +66,14 @@ def test_unavailable_trade_fees_fall_back_to_the_configured_estimate(engine):
     client.fill.update(fee=None, fees=[])
     client.fetch_order_trades = lambda *args: (_ for _ in ()).throw(ccxt.NetworkError('fee read failed'))
     assert engine._buy('BTC/USDT', 800, 100, .04)
-    assert engine._active_positions('live')[0]['cost'] == pytest.approx(100.1)
+    # MEXC bills a buy's commission in the asset received: the estimate is a base
+    # deduction (finding 13), so the quantity is net and no quote fee is booked.
+    position = engine._active_positions('live')[0]
+    assert position['qty'] == pytest.approx(1 - engine.cfg['fee_pct'] / 100)
+    assert position['cost'] == pytest.approx(100)
     assert not engine.live_halted
     assert any('fee estimate' in row['message'] for row in storage.rows('SELECT message FROM audit'))
+    assert any('booked as a deduction' in row['message'] for row in storage.rows('SELECT message FROM audit'))
 
 
 def test_kraken_orders_request_quote_currency_fees(engine):

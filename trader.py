@@ -884,7 +884,10 @@ class TradingEngine:
                 # reporting it as a quote outage, so the operator chases the
                 # right cause while the position stays open.
                 exit_error = f'Protective exit failed for {symbol}: {type(exc).__name__}; review required'
-                storage.audit('error', exit_error)
+                try:
+                    storage.audit('error', exit_error)
+                except Exception:
+                    pass   # a ledger failure here must not end the tick before the other positions are checked
                 observability.event('monitor.exit_error', level='error', symbol=symbol, error=type(exc).__name__)
                 self.metrics.incr('monitor.exit_errors')
         # Finish-relative scheduling avoids hot loops on slow or failing reads.
@@ -2112,7 +2115,12 @@ class TradingEngine:
                     decided_at = time.time()
                     with self.lock:
                         quote_ts = self.last_price_times.get(symbol)
-                    held_now = any(p['symbol'] == symbol for p in self._active_positions(self.mode))
+                    # A verified dust remainder is not a holding the gate protects:
+                    # the entry pass consolidates it (see _enter_candidates), so
+                    # the decision must not read it as "held" and abstain.
+                    held_now = any(p['symbol'] == symbol
+                                   and not self._is_dust(p, catalogue.get(symbol), self.last_prices.get(symbol) or mark)
+                                   for p in self._active_positions(self.mode))
                     verdict = decision.evaluate_entry(
                         symbol=symbol, last=last, regime_ok=regime_ok, market_ok=market_ok, rapid=horizon == 'rapid',
                         trend_rule=horizon == 'trend',
@@ -2668,8 +2676,15 @@ class TradingEngine:
         with self.lock:
             mode, exchange = self.mode, self.exchange_name
             positions = self._active_positions(mode)
+            ledger_error = None
             if mode == 'paper':
-                cash = paper_cash = self._cash('paper')
+                # A corrupt paper-cash row must not take the whole state read, and
+                # with it every control including the kill switch, offline.
+                try:
+                    cash = paper_cash = self._cash('paper')
+                except (ValueError, TypeError):
+                    cash = paper_cash = None
+                    ledger_error = 'The paper cash ledger is invalid; reset the paper account or restore the data folder.'
             else:
                 # The paper ledger is informational here; a corrupt row must
                 # not take the live state (positions, halts, equity) offline.
@@ -2710,7 +2725,7 @@ class TradingEngine:
                     'last_successful_scan': self.last_successful_scan, 'error': self.last_error,
                     'last_monitor': self.last_monitor, 'last_successful_monitor': self.last_successful_monitor,
                     'monitor_error': self.monitor_error,
-                    'risk_block': self.risk_block,
+                    'risk_block': self.risk_block, 'ledger_error': ledger_error,
                     'paper_cash': round(paper_cash, 2) if paper_cash is not None else None,
                     'cash': round(cash, 2) if cash is not None else None,
                     'equity': round(equity, 2) if equity is not None else None,

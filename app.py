@@ -194,7 +194,9 @@ def ensure_ok(action):
         raise HTTPException(status_code=503, detail='Market data is temporarily unavailable. Try again after the cooldown.', headers={'Retry-After': '30'}) from None
     except credentials.CredentialStoreUnavailable:
         raise HTTPException(status_code=400, detail='Saved credential access or removal could not be verified. Check the operating-system credential manager.') from None
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError) as exc:
+        # The message sends the operator to the activity list: write the line it promises (type name only).
+        _record_failure(exc)
         raise HTTPException(status_code=400, detail='Action unavailable. Check settings, stop the bot if necessary, and review local activity.') from None
     except Exception as exc:
         # Log the exception type only. Exchange text can contain signed requests.

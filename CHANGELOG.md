@@ -189,6 +189,31 @@ Fixed
   the fallback that claims every paper position for the micro cycles when
   the cycle table cannot be read now writes a warning and a metric, since
   the protective monitor leaves those positions alone while it holds.
+* **The kill switch stays usable while a state poll fails.** A failed or
+  slow `GET /api/state` greyed it out with every other control, leaving
+  **Emergency stop**, which ends stop monitoring, as the only live control.
+  Engaging the kill switch needs nothing from the page, so it now follows
+  the Stop button's rule; **Clear latched stop** still waits for a fresh
+  state.
+* **Open circuit breakers are shown.** The warning banner carries one line
+  per open breaker (execution failures, rejection spike, slippage) with the
+  seconds remaining, so a paused bot no longer looks like a strategy with
+  no setups and a restart to "fix" it is not the first reflex.
+* **A corrupt paper-cash row no longer takes the dashboard offline.** The
+  state read returned 400, which the page showed as a lost connection and
+  disabled every control while the engine kept running; it now answers
+  with cash and equity unavailable and a `ledger_error` line. An action
+  that fails with a `ValueError` writes the activity line its answer
+  promises ("review local activity"), type name only.
+* **A tracked dust remainder is shown at its real size** (`0.00000004`)
+  instead of a row of zeros in the positions and trade tables.
+* **The scan itself now reaches a dust remainder.** The earlier fix let the
+  entry pass consolidate one, but the scan's decision still read the
+  remainder as a holding and abstained, so the pass never saw the pair
+  (found by the verification run); the decision now ignores a verified
+  dust remainder, and a position above dust is still "held".
+* **A failed audit write inside the protective tick no longer ends the
+  tick** before the other positions are checked.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

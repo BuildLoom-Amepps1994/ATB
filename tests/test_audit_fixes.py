@@ -85,6 +85,36 @@ def test_a_scan_entry_consolidates_a_verified_dust_remainder(engine, monkeypatch
     assert any('anchored on the new fill' in row['message'] for row in storage.rows('SELECT message FROM audit'))
 
 
+def test_the_scan_itself_reaches_and_consolidates_a_dust_remainder(engine, monkeypatch):
+    """End to end: ``scan_once`` must not hand the decision ``held=True`` for a dust row.
+
+    The earlier test calls ``_enter_candidates`` directly; the verification
+    pass found that ``scan_once`` still read the remainder as a holding, so
+    the decision abstained and the entry pass never saw the pair.
+    """
+    dust_row(engine)
+    engine.cfg['watchlist'] = ['BTC/USDT']                         # the pass enters at most two pairs per scan
+    monkeypatch.setattr(trader, 'entry_signal', lambda *a, **kw: (True, 'BUY setup', 100))
+    engine.running = True
+    engine.stop_event.clear()
+    rows = {row['symbol']: row for row in engine.scan_once(allow_orders=True)}
+    assert rows['BTC/USDT']['decision'] == 'enter'
+    merged = {p['symbol']: p for p in engine._active_positions('paper')}
+    assert merged['BTC/USDT']['qty'] > .05
+    assert any('anchored on the new fill' in row['message'] for row in storage.rows('SELECT message FROM audit'))
+
+
+def test_the_scan_still_reads_a_position_above_dust_as_held(engine, monkeypatch):
+    assert engine._buy('BTC/USDT', 200, 100, .04)
+    before = [p['qty'] for p in engine._active_positions('paper') if p['symbol'] == 'BTC/USDT']
+    monkeypatch.setattr(trader, 'entry_signal', lambda *a, **kw: (True, 'BUY setup', 100))
+    engine.running = True
+    engine.stop_event.clear()
+    rows = {row['symbol']: row for row in engine.scan_once(allow_orders=True)}
+    assert rows['BTC/USDT']['decision'] == 'hold'
+    assert [p['qty'] for p in engine._active_positions('paper') if p['symbol'] == 'BTC/USDT'] == before
+
+
 def test_a_scan_entry_still_withholds_a_tracked_position_above_dust(engine, monkeypatch):
     events = capture(monkeypatch)
     assert engine._buy('BTC/USDT', 200, 100, .04)
@@ -103,10 +133,13 @@ def test_live_snapshot_survives_a_corrupt_paper_ledger(engine):
     assert state['mode'] == 'live' and state['paper_cash'] is None
 
 
-def test_paper_snapshot_still_reports_a_corrupt_ledger(engine):
+def test_paper_snapshot_reports_a_corrupt_ledger_without_going_offline(engine):
+    # The dashboard lens: a failing state read took every control, the kill
+    # switch included, off the page. The state now carries the ledger error.
     storage.set_meta(engine._key('paper_cash'), 'nan')
-    with pytest.raises(ValueError):
-        engine.snapshot()
+    state = engine.snapshot()
+    assert state['mode'] == 'paper' and state['cash'] is None and state['equity'] is None
+    assert state['ledger_error'].startswith('The paper cash ledger is invalid')
 
 
 # ------------------------------------------------------------- paper reset

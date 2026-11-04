@@ -124,7 +124,11 @@ Fixed
   later-added key (the notional caps, the realised-loss and drawdown limits,
   the three new controls, the Trend sizing option) silently put that key
   back to its default. Now such a file requires a settings review and the
-  last-good values stay in force, as for any other damaged file; a file
+  last-good values stay in force, as for any other damaged file. The guard
+  holds when the last-good copy still carries the changed value (a hand
+  edit, a restored or copied `settings.json`, a build from before the
+  last-good copy existed); a save by an older build that already kept a
+  last-good copy rewrote both files, and that case is not detectable. A file
   missing only keys whose last-good value is the default is still adopted
   without review (a first upgrade).
 * **The consecutive-loss streak is read from the trade ledger** (today's

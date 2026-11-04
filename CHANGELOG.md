@@ -51,6 +51,22 @@ Fixed
   put above the current bid, so the merged position was sold at the next
   protective poll. The blended cost basis is kept for P/L
   (`tests/test_accounting_fixes.py`).
+* **The runaway exit-rate bound counts each pair's own orders.** It counted
+  every order on the exchange, so one protective exit that the venue kept
+  rejecting every poll used up the allowance (three times
+  `max_orders_per_minute`) and every other position's protective exit was
+  refused with "Runaway order rate; exits paused for review" until the
+  minute passed. The bound is unchanged per pair.
+* **An automated entry consolidates a verified dust remainder** (a tracked
+  quantity below the exchange minimum, which can never be sold on its own)
+  instead of withholding the pair as `held` for good; the merge is the one a
+  manual buy performs, anchored on the new fill. A tracked position above the
+  dust limit still withholds the pair.
+* **The live state snapshot survives a corrupt paper cash row** (it is
+  reported as `paper_cash: null`); in paper mode the corrupt ledger still
+  raises, as before.
+* **A paper reset clears the consecutive-loss record** along with the other
+  paper latches (`tests/test_audit_fixes.py`).
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

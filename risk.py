@@ -340,7 +340,7 @@ class RiskGate:
     # ------------------------------------------------------------ evaluation
     def _recent_orders(self, mode: str, seconds: float) -> list[dict]:
         since = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat(timespec='milliseconds')
-        return storage.rows('SELECT status,created_at,updated_at,intended_price,filled_price,side FROM order_journal '
+        return storage.rows('SELECT status,created_at,updated_at,intended_price,filled_price,side,symbol FROM order_journal '
                             'WHERE exchange=? AND mode=? AND created_at>=? ORDER BY created_at',
                             (self.engine.exchange_name, mode, since))
 
@@ -572,9 +572,12 @@ class RiskGate:
         else:
             check('kill_switch_exits', not switch['engaged'] or switch['allow_exits'],
                   'Kill switch engaged with exits blocked')
-            recent = self._recent_orders(mode, 60)
+            # The runaway bound counts the pair's own orders: one protective exit
+            # that the exchange keeps rejecting every poll must not use up the
+            # allowance that every other position's protective exit relies on.
+            recent = [row for row in self._recent_orders(mode, 60) if row['symbol'] == request.symbol]
             check('exit_order_rate', len(recent) < cfg['max_orders_per_minute'] * EXIT_RATE_MULTIPLE,
-                  'Runaway order rate; exits paused for review', recent=len(recent))
+                  f'Runaway order rate for {request.symbol}; its exits paused for review', recent=len(recent))
             check('position_tracked', any(p['symbol'] == request.symbol for p in positions),
                   'No tracked position exists for this exit')
         allowed = not failed

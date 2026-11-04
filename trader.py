@@ -2381,9 +2381,14 @@ class TradingEngine:
                 break
             positions = self._active_positions(self.mode)
             tradable = [p for p in positions if not self._is_dust(p, catalogue.get(p['symbol']), self.last_prices[p['symbol']])]
-            if len(tradable) >= self.cfg['max_positions'] or any(p['symbol'] == symbol for p in positions):
+            if len(tradable) >= self.cfg['max_positions'] or any(p['symbol'] == symbol for p in tradable):
                 self._withhold([candidate], 'max_positions' if len(tradable) >= self.cfg['max_positions'] else 'held')
                 continue
+            # A verified dust remainder (below the exchange minimum, so it can
+            # never be sold on its own) no longer withholds the pair for good:
+            # the entry consolidates it, as a manual buy does, with the stop,
+            # target and trail anchored on the new fill and the basis blended.
+            remainder = any(p['symbol'] == symbol for p in positions)
             if not self._marks_fresh(positions):
                 # Held assets value the equity every candidate is sized from.
                 with self.lock:
@@ -2429,7 +2434,7 @@ class TradingEngine:
             try:
                 filled = self._buy(symbol, budget, price, fraction, entry_candle=candle, kind='entry',
                                    signal_close=signal_close, atr=atr, spread=spread, decision_id=decision_id,
-                                   volume=volume)
+                                   volume=volume, merge_dust=remainder)
             except Exception as exc:
                 # The order path records its own outcome; anything escaping it is
                 # unexpected. Paper continues with the next candidate, live stops
@@ -2561,13 +2566,19 @@ class TradingEngine:
         with self.lock:
             mode, exchange = self.mode, self.exchange_name
             positions = self._active_positions(mode)
-            paper_cash = self._cash('paper')
             if mode == 'paper':
-                cash = paper_cash
-            elif self.latest_balance is not None and self.balance_updated_at is not None:
-                cash = float(self.latest_balance['free'].get('USDT', 0))
+                cash = paper_cash = self._cash('paper')
             else:
-                cash = None
+                # The paper ledger is informational here; a corrupt row must
+                # not take the live state (positions, halts, equity) offline.
+                try:
+                    paper_cash = self._cash('paper')
+                except (ValueError, TypeError):
+                    paper_cash = None
+                if self.latest_balance is not None and self.balance_updated_at is not None:
+                    cash = float(self.latest_balance['free'].get('USDT', 0))
+                else:
+                    cash = None
             equity = self._equity(mode, cash, positions) if cash is not None else None
             liquidation_factor = (1 - self.cfg['slippage_pct'] / 100) * (1 - self.cfg['fee_pct'] / 100)
             detailed = []
@@ -2597,7 +2608,8 @@ class TradingEngine:
                     'last_successful_scan': self.last_successful_scan, 'error': self.last_error,
                     'last_monitor': self.last_monitor, 'last_successful_monitor': self.last_successful_monitor,
                     'monitor_error': self.monitor_error,
-                    'risk_block': self.risk_block, 'paper_cash': round(paper_cash, 2),
+                    'risk_block': self.risk_block,
+                    'paper_cash': round(paper_cash, 2) if paper_cash is not None else None,
                     'cash': round(cash, 2) if cash is not None else None,
                     'equity': round(equity, 2) if equity is not None else None,
                     'valuation_price_basis': 'bid',

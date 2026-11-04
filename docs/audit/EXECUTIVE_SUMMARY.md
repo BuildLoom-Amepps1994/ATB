@@ -181,7 +181,7 @@ and tables in `PROFITABILITY_ANALYSIS.md` section 3.4); the rows marked
 | Shipped Trend (5 % band, volatility-scaled), validation window | annualised Sharpe 0.55; best of 26 variants 0.65; expected maximum of 26 no-skill variants 0.52 | in sample, selected on this window |
 | Deflated Sharpe of the shipped variant | 0.51 (a coin flip that its true Sharpe beats noise) | in sample |
 | Shipped Trend (5 % band), 11 single-pair accounts at the app's sizing, validation window, rerun 2026-11-04 | +1.8 % mean account against +62 % buy and hold; Sharpe 0.45, Sortino 0.70, Calmar 0.53, worst drawdown 4.5 %, invested 53 % of the time; deflated Sharpe 0.13 against 46 trials | in sample, selected on this window, measured on real candles |
-| Same rerun, development window (2020 to 2023) | +18.0 % mean account, of which +15.1 % in 2021; every account spent more than half of the split in one unbroken drawdown (777 to 1,233 days); deflated Sharpe 0.13 | in sample |
+| Same rerun, development window (2020 to 2023) | +18.0 % mean account, mean 2021 return +15.1 % (about 85 % of the summed profit); every account went more than half of the split (777 to 1,233 days) without a new equity high; deflated Sharpe 0.13 | in sample |
 | Position, same rerun, validation window | +0.36 % mean account, Sharpe 0.13, deflated Sharpe 0.07, invested 6 % of the time | in sample |
 | Forward paper cycle 1, Rapid, 18 h | -18 USDT on 10,000 | live prices, simulated fills |
 | Forward paper cycle 3, Trend, 13 h | -11 USDT unrealised on 20,000 | live prices, simulated fills |

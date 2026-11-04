@@ -66,7 +66,7 @@ experiment needs new out-of-sample months first.
    on the PC that holds the candles (`research/results/classic/wf_metrics.json`,
    `PROFITABILITY_ANALYSIS.md` section 3.4). Shipped Trend on validation,
    mean of 11 single-pair accounts: Sharpe 0.45, Sortino 0.70, Calmar 0.53,
-   longest drawdown 415 days, invested 53 % of the time, deflated
+   worst longest drawdown 415 days (ETH), invested 53 % of the time, deflated
    Sharpe 0.13; most of the development profit is 2021. The verdict did not change.
 3. Read the Trend 5 % band holdout once, after the paper run has given an
    independent signal.

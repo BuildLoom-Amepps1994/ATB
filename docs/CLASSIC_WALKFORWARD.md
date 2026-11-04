@@ -167,8 +167,8 @@ Rerun with equity statistics on 2026-11-04 on the operator's PC (v1.5.166,
 same trades; on validation the 11 single-pair accounts average a Sharpe of
 0.45, Sortino 0.70, Calmar 0.53, a worst drawdown of 4.5 % and 53 %
 of the time invested, and the deflated Sharpe ratio of the mean against 46
-trials is 0.13; on development every account spent more than half of the
-split in one unbroken drawdown (777 to 1,233 days). `docs/audit/PROFITABILITY_ANALYSIS.md` section 3.4 has the
+trials is 0.13; on development every account went more than half of the
+split (777 to 1,233 days) without a new equity high. `docs/audit/PROFITABILITY_ANALYSIS.md` section 3.4 has the
 run record, the data fingerprints and the tables.
 
 ## Portfolio rules (research/trend_portfolio.py, 2026-11-01)

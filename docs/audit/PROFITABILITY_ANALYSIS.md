@@ -7,9 +7,10 @@ data on 2026-11-04 (section 3.4) says the same at the equity level: the
 shipped Trend rule's validation Sharpe ratio averages 0.45 across 11
 single-pair accounts, its deflated Sharpe ratio against the 46 variants
 that read that data is 0.13 (0.95 would separate it from the best of
-that many lucky variants), most of its development profit (+15.1 of
-+18.0 %) is 2021, and every account spent more than half of the
-development split in one unbroken drawdown.
+that many lucky variants), most of its development profit is 2021 (mean
+2021 return +15.1 % against +18.0 % for the whole split, about 85 % of
+the summed profit), and every account went more than half of the
+development split without a new equity high.
 Nothing in this document is a forecast. Every figure is labelled with its
 source (backtest on real candles, forward paper run on live public prices,
 or synthetic). **No strategy has ever traded a live account.**
@@ -135,7 +136,8 @@ paper run, not another backtest on the same years, is the test of the
 shipped Trend rule. The rerun of section 3.4 used that count; since its
 result file was committed the tool counts 47, because the file's
 doubled-cost Trend block is a further candidate on the same data (at 47
-the deflated Sharpe ratios of section 3.4 move by about 0.001).
+the deflated Sharpe ratios of section 3.4 fall by 0.001 to 0.002; the
+verdict does not change).
 
 ### 3.4 Equity-level statistics, measured on the real candle data (rerun of 2026-11-04)
 
@@ -183,24 +185,37 @@ mean for holding the coin. The equity statistics are computed on each
 account's daily equity and averaged across the pairs; Sharpe, Sortino and
 volatility are annualised at 365.25 days. "Longest drawdown" is the
 longest stretch of days without a new equity high; a stretch still open
-at the split's end counts to the end, and every account here ends its
-split below its running high (Position's ADA account took no validation
-trade, so its "drawdown" is the whole split). The trade statistics pool the closed
-trades of the 11 accounts. The probabilistic Sharpe ratio is the
-probability that an account's true Sharpe is above zero; the deflated
-Sharpe ratio is the probability that the true Sharpe of the mean account
-is above the expected maximum Sharpe of 46 skill-less variants (the trial
-count of section 3.3 at the time of the run), which the harness put at
-0.074 per day, about 1.4 annualised, from the spread of the
-per-day Sharpe ratios across every pair, cost and split in the run
-(variance 0.001089). A deflated Sharpe under 0.95 means the result cannot be
-told from the best of that many lucky variants. The Monte Carlo row
-resamples the split's pooled trades 2,000 times (independently, with
-replacement, as many trades as the split holds), risks 8 % of equity per
-trade (the app's largest position, **not** the risk-based size the
-backtest used, so its terminal equities are not comparable with the
-account returns) and counts a run as ruined when equity is 20 % below its
-start at any point; its assumptions are recorded in the file.
+at the split's end counts to the end, and no account here ends its split
+at a new high (Position's ADA account took no validation trade, so its
+"drawdown" is the whole split). Where an account has no defined value
+(that ADA account has no Sharpe, Sortino, Calmar or probabilistic Sharpe,
+its equity never moved) the mean is over the ten accounts that have one,
+marked in the Pairs column; the account return, exposure and turnover
+means include it. The account means are the mean of the 11 per-pair
+returns rounded once (the file's summary stores them at three decimals).
+The trade statistics pool the closed trades of the 11 accounts, except
+"max losses in a row", which is the longest losing streak inside one
+account (the file's pooled figure counts runs across the concatenated
+accounts, which no account experienced). The probabilistic Sharpe ratio is
+the probability that an account's true Sharpe is above zero, using the
+account's own skew and kurtosis. The deflated Sharpe ratio takes the mean
+of the accounts' per-day Sharpe ratios, treats it as one Sharpe estimated
+over the shortest account's day count (1,112 on development, 487 on
+validation) with normal returns, and gives the probability that it exceeds
+the expected maximum Sharpe of 46 skill-less variants (the trial count of
+section 3.3 at the time of the run), which the harness put at 0.074 per
+day, about 1.4 annualised, from the spread of the per-day Sharpe ratios
+across every pair, strategy, cost and split in the run (86 runs, variance
+0.001089). A deflated Sharpe under 0.95 means the result cannot be told
+from the best of that many lucky variants. The Monte Carlo row resamples
+the split's pooled trades 2,000 times (independently, with replacement, as
+many trades as the split holds), puts 8 % of equity into each trade (the
+app's largest position; a trade's loss is 8 % of its net return, at most
+about 2 % of equity for the worst recorded trade; **not** the 0.65 %
+risk-based size the backtest used, so its terminal equities are not
+comparable with the account returns) and counts a run as ruined when
+equity is 20 % below its start at any point; its assumptions are recorded
+in the file.
 
 **Account and equity statistics (mean of the 11 single-pair accounts).**
 
@@ -211,22 +226,22 @@ start at any point; its assumptions are recorded in the file.
 | Trend 5 % band, doubled costs | development | 11 | +17.81 % | +1566.5 % | -11.34 % | 0.75 | 1.55 | 0.70 | 1233 days | 0.54 | 0.20 |
 | Trend 5 % band, doubled costs | validation | 11 | +1.78 % | +62.1 % | -4.43 % | 0.44 | 0.69 | 0.52 | 415 days | 0.53 | 0.17 |
 | Position, realistic costs | development | 11 | +1.96 % | +1569.8 % | -3.56 % | 0.35 | 0.89 | 0.51 | 1105 days | 0.03 | 0.17 |
-| Position, realistic costs | validation | 11 | +0.36 % | +62.5 % | -2.59 % | 0.13 | 0.58 | 0.46 | 486 days | 0.06 | 0.41 |
-| Position, doubled costs | development | 11 | +1.89 % | +1566.5 % | -3.57 % | 0.34 | 0.86 | 0.49 | 1105 days | 0.03 | 0.16 |
-| Position, doubled costs | validation | 11 | +0.32 % | +62.1 % | -2.58 % | 0.10 | 0.53 | 0.43 | 486 days | 0.06 | 0.41 |
+| Position, realistic costs | validation | 11 (10 with a Sharpe) | +0.36 % | +62.5 % | -2.59 % | 0.13 | 0.58 | 0.46 | 486 days | 0.06 | 0.41 |
+| Position, doubled costs | development | 11 | +1.88 % | +1566.5 % | -3.57 % | 0.34 | 0.86 | 0.49 | 1105 days | 0.03 | 0.16 |
+| Position, doubled costs | validation | 11 (10 with a Sharpe) | +0.31 % | +62.1 % | -2.58 % | 0.10 | 0.53 | 0.43 | 486 days | 0.06 | 0.41 |
 
 **Pooled trade statistics.**
 
-| Strategy, costs | Split | Trades | Wins | Profit factor | Expectancy | Payoff | ES 5 % | Max losses in a row | t | Mean trade 95 % CI |
+| Strategy, costs | Split | Trades | Wins | Profit factor | Expectancy | Payoff | ES 5 % | Max losses in a row (one account) | t | Mean trade 95 % CI |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | Trend 5 % band, realistic costs | development | 130 | 36 | 5.48 | +50.41 % | 14.3 | -25.1 % | 14 | 2.85 | [+19.7, +87.1] |
-| Trend 5 % band, realistic costs | validation | 44 | 20 | 3.42 | +17.73 % | 4.1 | -23.1 % | 5 | 2.08 | [+3.2, +35.7] |
+| Trend 5 % band, realistic costs | validation | 44 | 20 | 3.42 | +17.73 % | 4.1 | -23.1 % | 4 | 2.08 | [+3.2, +35.7] |
 | Trend 5 % band, doubled costs | development | 130 | 36 | 5.41 | +50.14 % | 14.1 | -25.2 % | 14 | 2.84 | [+19.4, +86.7] |
-| Trend 5 % band, doubled costs | validation | 44 | 20 | 3.36 | +17.50 % | 4.0 | -23.2 % | 5 | 2.05 | [+3.0, +35.4] |
-| Position, realistic costs | development | 58 | 31 | 2.88 | +6.42 % | 2.5 | -12.1 % | 6 | 3.03 | [+2.4, +10.9] |
-| Position, realistic costs | validation | 45 | 15 | 1.26 | +1.18 % | 2.5 | -12.1 % | 5 | 0.58 | [-2.3, +5.1] |
-| Position, doubled costs | development | 58 | 31 | 2.78 | +6.24 % | 2.4 | -12.3 % | 6 | 2.95 | [+2.2, +10.7] |
-| Position, doubled costs | validation | 45 | 15 | 1.21 | +1.01 % | 2.4 | -12.3 % | 5 | 0.49 | [-2.4, +4.9] |
+| Trend 5 % band, doubled costs | validation | 44 | 20 | 3.36 | +17.50 % | 4.0 | -23.2 % | 4 | 2.05 | [+3.0, +35.4] |
+| Position, realistic costs | development | 58 | 31 | 2.88 | +6.42 % | 2.5 | -12.1 % | 4 | 3.03 | [+2.4, +10.9] |
+| Position, realistic costs | validation | 45 | 15 | 1.26 | +1.18 % | 2.5 | -12.1 % | 4 | 0.58 | [-2.3, +5.1] |
+| Position, doubled costs | development | 58 | 31 | 2.78 | +6.24 % | 2.4 | -12.3 % | 4 | 2.95 | [+2.2, +10.7] |
+| Position, doubled costs | validation | 45 | 15 | 1.21 | +1.01 % | 2.4 | -12.3 % | 4 | 0.49 | [-2.4, +4.9] |
 
 **Selection adjustment and Monte Carlo risk of ruin.**
 
@@ -309,17 +324,21 @@ ends on 2023-12-31, so its 2024 column is one day.
   +1.8 % over 16 months against +62 % for holding the coins, with
   a mean Sharpe of 0.45, Sortino 0.70, Calmar 0.53, a worst drawdown of
   4.45 % and 53 % of the time invested. The deflated Sharpe
-  ratio of that mean is **0.13**: a 13 % chance that the true Sharpe beats
-  what the best of 46 skill-less variants would show. The profit sits in
-  two accounts (XRP +5.5 %, DOGE +5.3 %), SOL lost, and all of it was
-  made in 2024 (+2.07 % mean) while January to April 2025 lost (-0.25 %).
-* **The development profit is mostly one year.** +18.0 % over four years
-  (Sharpe 0.76) is +15.1 % in 2021 and +2.3 %, -1.2 % and +1.5 % in the
-  other years, and every account spent more than half of the development
-  split in one unbroken drawdown: the longest stretches without a new
-  equity high are 777 to 1,233 days, 66 % to 90 % of the split, and every
-  account ends 2023 below its running high. The deflated Sharpe ratio on
-  development is
+  ratio of that mean is **0.13**: a 13 % probability that the mean per-day
+  Sharpe exceeds what the best of 46 skill-less variants would show. Just
+  over half of the summed profit (54 %) is in two accounts (XRP +5.5 %,
+  DOGE +5.3 %), the other eight positive accounts gained +0.31 % to
+  +2.15 % each, SOL lost (-0.07 %), and all of it was made in 2024
+  (+2.07 % mean) while January to April 2025 lost (-0.25 %).
+* **The development profit is mostly one year.** The mean account made
+  +18.0 % over four years (Sharpe 0.76); the mean calendar returns are
+  +2.3 % in 2020, +15.1 % in 2021, -1.2 % in 2022 and +1.5 % in 2023
+  (they compound, so they do not add to the split return), and chaining
+  each account's years puts about 85 % of the summed profit in 2021. Every
+  account went more than half of the development split without a new
+  equity high: the longest such stretches are 777 to 1,233 days, 66 % to
+  90 % of the split, and no account ends 2023 at a new high. The deflated
+  Sharpe ratio on development is
   0.13, the same verdict.
 * **Position barely trades.** It is invested 3 % of the time on
   development and 6 % on validation; its validation mean account is
@@ -327,9 +346,9 @@ ends on 2023-12-31, so its 2024 column is one day.
   the eleven accounts lost on validation (DOT, LINK, LTC, TRX, XRP) and one (ADA) took no trade.
 * **Costs are not what decides it.** Doubling the per-fill cost moves the
   Trend validation mean from +1.82 % to +1.78 % and Position's from
-  +0.36 % to +0.32 %; the trades, not the fees, are the problem.
+  +0.36 % to +0.31 %; the trades, not the fees, are the problem.
 * **The risk of ruin figures are optimistic by construction.** Resampling
-  the 44 validation trades at 8 % of equity per trade gives a
+  the 44 validation trades with 8 % of equity in each trade gives a
   0.0 % probability of a 20 % loss and a median terminal equity of 1.74
   times the start, because those trades were selected on this window and
   are resampled as independent; the same exercise on the 130 development
@@ -339,9 +358,10 @@ ends on 2023-12-31, so its 2024 column is one day.
 * **The trial count has moved.** The run used 46, the count in force when
   the command was written. Because this result file commits a
   doubled-cost Trend block that `research.evidence` had not seen before,
-  the tool now counts 47; at 47 trials the Trend validation deflated
-  Sharpe is 0.13 (noise maximum 0.0743 per day instead of 0.0740).
-  Nothing in this section changes.
+  the tool now counts 47; at 47 trials the noise maximum is 0.0743 per
+  day instead of 0.0740 and the eight deflated Sharpe ratios fall by
+  0.001 to 0.002 (only the Trend development figure changes at two
+  decimals, from 0.13 to 0.12). The verdict does not change.
 
 ## 4. Forward paper trading (live public prices, simulated fills)
 

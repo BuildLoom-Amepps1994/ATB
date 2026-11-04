@@ -223,3 +223,76 @@ def test_engine_scan_timing_and_exit_marker_use_the_measured_offset(engine):
     saved = storage.get_meta(engine._key(f'last_exit.paper.BTC/USDT.{primary_tf}'))
     step = duration * 1000
     assert int(float(saved)) == (int((time.time() - 120) * 1000) // step - 1) * step
+
+
+def test_a_rejected_exchange_timestamp_remeasures_the_clock_offset(engine):
+    # The PC clock was corrected forward by two minutes; every exchange-stamped quote now looks stale.
+    engine.cfg['data_max_age_seconds'] = 30
+    engine.public.has = {'fetchTime': True}
+    engine.public.fetch_time = lambda: int((time.time() - 120) * 1000)
+    stamp = int((time.time() - 120) * 1000)
+    with pytest.raises(ValueError, match='stale'):
+        engine._observe_ticker('BTC/USDT', {'bid': 100, 'ask': 100.1, 'timestamp': stamp})
+    assert engine.data.clock_offset() == pytest.approx(120, abs=1)    # re-measured on the rejection
+    price, _, _ = engine._observe_ticker('BTC/USDT', {'bid': 100, 'ask': 100.1, 'timestamp': stamp})
+    assert price == 100 and engine._fresh('BTC/USDT')
+    calls = engine.data.metrics['clock_offset_measurements']
+    with pytest.raises(ValueError, match='stale'):
+        engine._observe_ticker('BTC/USDT', {'bid': 100, 'ask': 100.1, 'timestamp': stamp - 3_600_000})
+    assert engine.data.metrics['clock_offset_measurements'] == calls   # at most one forced measurement a minute
+
+
+# ------------------------------------------------------- monitor errors
+def test_an_exit_failure_in_the_protective_tick_is_reported_as_such(engine, monkeypatch):
+    events = capture(monkeypatch)
+    assert engine._buy('BTC/USDT', 200, 100, .04)
+    engine.running = True
+    monkeypatch.setattr(engine, '_protect_positions', lambda *a, **k: (_ for _ in ()).throw(ValueError('adapter refused')))
+    engine.public.price = 90
+    engine._monitor_if_due(force=True)
+    assert engine.monitor_error.startswith('Protective exit failed for BTC/USDT: ValueError')
+    assert engine.last_successful_monitor                          # the quote itself was fine
+    assert any(f['symbol'] == 'BTC/USDT' for kind, f in events if kind == 'monitor.exit_error')
+    assert any('Protective exit failed' in row['message'] for row in storage.rows("SELECT message FROM audit WHERE level='error'"))
+
+
+def test_a_quote_failure_in_the_protective_tick_is_still_reported_as_quotes(engine):
+    assert engine._buy('BTC/USDT', 200, 100, .04)
+    engine.running = True
+    engine.public.fetch_ticker = lambda symbol: (_ for _ in ()).throw(ccxt.NetworkError('down'))
+    engine._monitor_if_due(force=True)
+    assert engine.monitor_error == 'Protective quotes unavailable for 1 held asset(s)'
+
+
+# ------------------------------------------------------- scan tickers
+def test_the_bulk_ticker_read_only_asks_for_listed_pairs(engine):
+    asked = []
+    def fetch_tickers(symbols=None, params=None):
+        asked.append(list(symbols or []))
+        if any(s not in engine.public.markets for s in symbols):
+            raise ccxt.BadSymbol('unknown symbol')
+        return {s: engine.public.fetch_ticker(s) for s in symbols}
+    engine.public.fetch_tickers = fetch_tickers
+    engine.public.has = {'fetchTickers': True}
+    engine.cfg['watchlist'] = ['BTC/USDT', 'ETH/USDT', 'XYZ/USDT']
+    engine.scan_once(allow_orders=False)
+    assert asked and all('XYZ/USDT' not in symbols for symbols in asked)
+    assert 'BTC/USDT' in asked[0]
+
+
+# ------------------------------------------------------- prefetch stop
+def test_prefetch_stops_downloading_once_cancelled():
+    calls = []
+    class Exchange:
+        has = {}
+        options = {}
+        def fetch_ohlcv(self, symbol, tf, limit):
+            calls.append(symbol)
+            return [[hour * 3600 * 1000, 100, 101, 99, 100, 1000] for hour in range(1, 130)]
+    data = MarketData(Exchange(), wait=lambda _: False, concurrency=2)
+    stop = []
+    workers = data.prefetch([(f'S{i}/USDT', '1h', 175) for i in range(20)], cancelled=lambda: bool(stop))
+    stop.append(True)
+    for worker in workers:
+        worker.join(5)
+    assert len(calls) < 20

@@ -150,6 +150,7 @@ class MarketData:
         return self.read('load_markets')
 
     OFFSET_REFRESH_SECONDS = 900
+    FORCED_REFRESH_SECONDS = 60      # a rejected exchange timestamp may ask for an early re-measurement
 
     def clock_offset(self) -> float:
         """Local-minus-exchange seconds: the latest server-time measurement, else CCXT's figure (MEXC), else zero."""
@@ -180,7 +181,8 @@ class MarketData:
         if not callable(fetch) or (isinstance(has, dict) and has.get('fetchTime') is False):
             return None
         with self.lock:
-            if not force and self.monotonic() < self._clock_measured_mono + self.OFFSET_REFRESH_SECONDS:
+            window = self.FORCED_REFRESH_SECONDS if force else self.OFFSET_REFRESH_SECONDS
+            if self.monotonic() < self._clock_measured_mono + window:
                 return self._clock_measured
             # One attempt per refresh window, whatever its outcome.
             self._clock_measured_mono = self.monotonic()
@@ -334,11 +336,13 @@ class MarketData:
                 self.cache.pop(next(iter(self.cache)))
         return result.copy()
 
-    def prefetch(self, requests):
+    def prefetch(self, requests, *, cancelled=None):
         """Download uncached candle frames in the background, ``concurrency``-1 at a time.
 
         Returns at once. Results land in the cache; ``candles`` waits for a
         download in flight and re-raises a failure once instead of repeating it.
+        ``cancelled`` (a callable) stops the remaining downloads once it
+        returns true, so a Stop does not keep spending the rate budget.
         """
         if self.concurrency < 2:
             return []
@@ -348,7 +352,8 @@ class MarketData:
         def drain():
             while True:
                 with lock:
-                    if not work:
+                    if not work or (cancelled is not None and cancelled()):
+                        work.clear()
                         return
                     symbol, timeframe, limit = work.pop(0)
                 if self.cached_candles(symbol, timeframe, limit) is not None:

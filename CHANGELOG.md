@@ -84,7 +84,24 @@ Fixed
   measures local-minus-server from the exchange's public server time with
   the candle downloads, at most every 15 minutes, keeps the last value on a
   failed read and falls back to CCXT's figure; the scan schedule and the
-  same-candle re-entry marker use the same offset.
+  same-candle re-entry marker use the same offset. A quote whose exchange
+  timestamp is rejected as stale or future-dated (the sign of a PC clock
+  correction) triggers a re-measurement at most once a minute, so trailing
+  and trend exits no longer wait up to an hour for the next catalogue load.
+* **A failed protective exit is reported as such.** Any exception on the
+  exit path inside the protective tick (an adapter without market exits, an
+  unverified market, a balance or credential problem) was counted as a quote
+  failure and shown as "Protective quotes unavailable"; it is now reported
+  as `Protective exit failed for <pair>: <error>` on the dashboard, in the
+  audit log and as a `monitor.exit_error` event.
+* **Kraken's bulk ticker read asks only for listed pairs**; one unknown
+  symbol in the watchlist used to fail the whole read every scan and push
+  every quote through the one-request-per-second fallback.
+* **Streaming quotes keep their subscription when the symbol set is
+  unchanged but reordered** (every buy or sell reordered it and rebuilt the
+  websocket client).
+* **Candle prefetch stops at Stop** instead of finishing its queue against
+  the rate budget.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

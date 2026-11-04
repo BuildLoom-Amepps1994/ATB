@@ -800,6 +800,7 @@ class TradingEngine:
             except Exception:
                 tickers = {}
         self.metrics.incr('monitor.source.stream' if streamed else 'monitor.source.rest')
+        exit_error = None
         for position in positions:
             if not self._orders_allowed():
                 break
@@ -812,7 +813,11 @@ class TradingEngine:
                     if not ticker:
                         raise
                     price, _, _ = self._observe_ticker(symbol, self.data.ticker(symbol))
-                observed += 1
+            except Exception:
+                failures += 1
+                continue
+            observed += 1
+            try:
                 self._protect_positions(symbol, price)
                 if self._orders_allowed():
                     primary_tf = HORIZONS[self.cfg['time_horizon']][0]
@@ -827,15 +832,25 @@ class TradingEngine:
                         self._mark_positions(symbol, price, atr, False, stored_checked_at=price, source='monitor')
                 if not any(p['symbol'] == symbol for p in self._active_positions(self.mode)):
                     exited.add(symbol)
-            except Exception:
-                failures += 1
+            except Exception as exc:
+                # The quote was fine; the exit or trail itself failed (an
+                # adapter without market exits, an unverified market, a
+                # balance or credential problem). Say so, instead of
+                # reporting it as a quote outage, so the operator chases the
+                # right cause while the position stays open.
+                exit_error = f'Protective exit failed for {symbol}: {type(exc).__name__}; review required'
+                storage.audit('error', exit_error)
+                observability.event('monitor.exit_error', level='error', symbol=symbol, error=type(exc).__name__)
+                self.metrics.incr('monitor.exit_errors')
         # Finish-relative scheduling avoids hot loops on slow or failing reads.
         self._next_monitor = time.monotonic() + interval
         self.metrics.observe('monitor.cycle_ms', (time.monotonic() - started) * 1000)
         with self.lock:
             if observed:
                 self.last_successful_monitor = now()
-            if failures:
+            if exit_error:
+                self.monitor_error = exit_error
+            elif failures:
                 self.monitor_error = f'Protective quotes unavailable for {failures} held asset(s)'
         remaining = self._active_positions(self.mode)
         if self._marks_fresh(remaining) and self._orders_allowed():
@@ -999,6 +1014,15 @@ class TradingEngine:
             timestamp, basis = finite_positive(raw_timestamp) / 1000 + self._clock_offset(), 'exchange'
         if (not timestamp or timestamp > observed + 30
                 or observed - timestamp > self.cfg['data_max_age_seconds']):
+            if basis == 'exchange':
+                # A PC clock correction makes every exchange-stamped quote
+                # look stale or future-dated until the offset is measured
+                # again; re-measure now (at most once a minute) instead of
+                # waiting for the next candle download or catalogue load.
+                try:
+                    self.data.refresh_clock_offset(force=True)
+                except Exception:
+                    pass
             invalid('Ticker timestamp is stale or invalid')
         with self.lock:
             previous = self.last_price_times.get(symbol)
@@ -1938,12 +1962,14 @@ class TradingEngine:
             current = self.feed
             if current is not None:
                 current.set_symbols(self._feed_symbols(symbols))
-            try:
-                tickers = self.data.tickers(symbols)
-            except Exception:
-                tickers = {}
             catalogue = self._catalogue()
             tradable = [symbol for symbol in symbols if self._spot(symbol, catalogue.get(symbol))]
+            try:
+                # Only listed pairs: Kraken's bulk ticker read refuses the
+                # whole request over one unknown symbol.
+                tickers = self.data.tickers(tradable) if tradable else {}
+            except Exception:
+                tickers = {}
             wanted = [(symbol, primary_tf, 175) for symbol in tradable]
             # Trend reads only its daily candles: no confirmation timeframe and no BTC gate, so a
             # weekly download that fails cannot block its entries, and nothing is fetched for nothing.
@@ -1954,7 +1980,7 @@ class TradingEngine:
                     wanted.append((MARKET_SYMBOL, higher_tf, 85))
             # Background downloads overlap round trips; the loop below still
             # runs each symbol's protective checks before using its candles.
-            self.data.prefetch(wanted)
+            self.data.prefetch(wanted, cancelled=self.stop_event.is_set)
             for symbol in symbols:
                 if allow_orders and self.stop_event.is_set():
                     break

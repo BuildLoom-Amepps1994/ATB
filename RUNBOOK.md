@@ -195,6 +195,11 @@ How the feed subscribes:
   while such an intent exists and names its fill.
 * A live `pending` intent with no `submitted_at` never left the process; the
   engine closes it at start-up (`never sent; closed at startup`).
+* `Trading worker stopped: ...` in the activity log with no unresolved live
+  intent is a fault outside the order path (a locked database during a
+  protective poll, for example). It is not a durable halt: review the cause,
+  then press Start to resume the stored exits. The halt is durable only while
+  a live order outcome is open or the journal cannot be read.
 
 To clear a live halt, with the app closed and after checking every listed
 order against the exchange's own order history:

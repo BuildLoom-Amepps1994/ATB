@@ -543,6 +543,10 @@ class TradingEngine:
             # left behind when the operator moves to the other exchange.
             carried_switch = self.risk.kill_switch() if changed_exchange else None
             carried_latch = self.micro.latch() if changed_exchange else None    # the same for the micro stop
+            if changed_exchange:
+                # The switch's one database write comes before anything is committed, so a
+                # failure leaves the saved settings, the ledger scope and the clients as they were.
+                storage.abandon_stale_paper_intents(revised['exchange'])   # as at start-up, for the exchange now in use
             storage.save_settings(revised)
             changed_keys = sorted(key for key in revised if revised.get(key) != self.cfg.get(key))
             self.cfg = revised
@@ -551,7 +555,6 @@ class TradingEngine:
             changed_from = self.exchange_name
             if changed_exchange:
                 self.exchange_name = revised['exchange']
-                storage.abandon_stale_paper_intents(self.exchange_name)   # as at start-up, for the exchange now in use
                 self.public, self.data = candidate_public, candidate_data
                 self.paper = self._new_paper_exchange()
                 self._stop_feed()
@@ -701,7 +704,7 @@ class TradingEngine:
                 if self.stop_event.wait(delay):
                     break
         except Exception as exc:
-            self._ledger_failure(f'Trading worker stopped: {type(exc).__name__}; inspect local portfolio and monitoring status')
+            self._worker_failure(exc)
         finally:
             try:
                 # Still "running" here, so no stopped-mode micro action can start until this is done.
@@ -1193,6 +1196,40 @@ class TradingEngine:
             storage.audit('error', 'LIVE HALT: ' + description + '. Reconcile manually; no automatic resubmission.')
         except Exception:
             pass
+
+    def _worker_failure(self, exc: Exception) -> None:
+        """Stop the worker on an escaping error; halt live durably only while an order outcome is open.
+
+        The durable live halt exists for an order whose outcome could not be
+        established (RUNBOOK section 6). A fault outside the order path, such
+        as a locked database during a protective poll, leaves nothing at the
+        venue to reconcile; halting durably for it would switch off every
+        stored exit until the offline tool is run. Such a fault stops the
+        worker and is reported, and Start resumes the stored exits once the
+        cause has been reviewed. An unreadable journal is treated as open.
+        """
+        description = f'Trading worker stopped: {type(exc).__name__}; inspect local portfolio and monitoring status'
+        if self.mode == 'live':
+            try:
+                open_intents = storage.unresolved_orders(self.exchange_name)
+            except Exception:
+                open_intents = None
+            if open_intents is None or open_intents:
+                self._ledger_failure(description)
+                return
+            with self.lock:
+                self.risk_block = self.last_error = description
+                self.stop_event.set()
+            observability.event('engine.worker_error', level='error', description=description,
+                                error=type(exc).__name__, mode=self.mode)
+            self.metrics.incr('engine.worker_errors')
+            try:
+                storage.audit('error', description + '. No live order is open, so the halt is not durable: review the '
+                                       'cause, then Start again to resume the stored exits.')
+            except Exception:
+                pass
+            return
+        self._ledger_failure(description)
 
     def _report_exit_failure(self, symbol: str, exc: Exception, *, source: str) -> str:
         """Audit, event and count a failed protective exit; the position stays open."""
@@ -2168,16 +2205,20 @@ class TradingEngine:
                     atr = finite_positive(last['atr'])
                     if allow_orders and self._orders_allowed():
                         # Trend has no trailing stop: its exit is the close below the average.
+                        # The poll above may have tried the stored exit again at a newer bid; that bid
+                        # is the one this pass must not repeat (the mark is the poll's price then).
                         self._mark_positions(symbol, self.last_prices[symbol], 0.0 if horizon == 'trend' else atr,
                                              trend_broken(last, trend_rule=horizon == 'trend'),
-                                             stored_checked_at=protected_at)
+                                             stored_checked_at=self.last_prices[symbol] if protected_at is not None else None)
                     if held_before and not any(p['symbol'] == symbol for p in self._active_positions(self.mode)):
                         exited_symbols.add(symbol)
                     # HTF data gates entries only. Stops and trend exits above
                     # remain independent of a higher-timeframe API failure.
                     filters = self.cfg.get('market_filters', True)
                     higher_error = higher_candle_ts = None
-                    regime_ok, market_ok = False, None
+                    # Trend has no confirmation timeframe: its band above the 100-day average is its
+                    # regime, so nothing is reported as 'weak' or discounted for a gate it does not have.
+                    regime_ok, market_ok = not uses_higher, None
                     if uses_higher:
                         try:
                             higher = self.data.candles(symbol, higher_tf, limit=85)
@@ -2244,7 +2285,7 @@ class TradingEngine:
                                         'market': ('unavailable' if 'error' in market_state else 'uptrend'
                                                    if market_state.get('ok') else 'weak' if market_state else None),
                                         'atr_pct': round(atr / price * 100, 2),
-                                        'regime': 'uptrend' if regime_ok else 'weak',
+                                        'regime': ('uptrend' if regime_ok else 'weak') if uses_higher else None,
                                         'kind': 'MEME' if is_meme(symbol) else 'CORE' if symbol.split('/')[0] in ('BTC', 'ETH') else 'ALT',
                                         'status': reason, 'candidate': candidate, 'timeframe': primary_tf,
                                         'price_age_seconds': self._price_age(symbol),

@@ -281,6 +281,29 @@ Fixed
 * **A filled-but-unbooked live intent is named at start-up** (side, symbol,
   quantity, price, intent) with the reminder that no stop is monitored for
   it until it is booked.
+* **A fault outside the order path no longer halts live trading durably.**
+  Any exception that escaped the worker loop (a locked database during a
+  protective poll, for example) was treated as an unresolved order: the
+  durable `live_halt` flag was written, every stored exit stopped being
+  checked, and Start and the manual ticket were refused until the offline
+  tool was run although the journal held nothing to reconcile. Such a fault
+  now stops the worker and is recorded (audit line, `engine.worker_error`
+  event, `engine.worker_errors` metric); Start resumes the stored exits once
+  the cause has been reviewed. The durable halt is kept while a live order
+  outcome is open and when the journal cannot be read.
+* **A settings save that changes the exchange commits nothing until its one
+  database write has succeeded.** The stale-intent clean-up ran after the
+  settings file, the configuration and the ledger scope had moved to the new
+  exchange, so a failure left the engine scoped to it while quoting and
+  simulating on the old one.
+* **The scan's trailing pass no longer resubmits a stored exit at the bid the
+  protective poll just tried.** A stuck exit (a venue that keeps refusing the
+  sell) drew three orders per scan instead of two, each counting toward the
+  rejection-spike breaker and the per-pair exit-rate bound.
+* **Trend assessments carry no regime gate.** Every Trend pair was reported
+  with regime `weak` and its recorded confidence halved for a confirmation
+  timeframe the Trend rule does not read; the field is now empty for Trend
+  and the decision record states that no gate applied. No order changes.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

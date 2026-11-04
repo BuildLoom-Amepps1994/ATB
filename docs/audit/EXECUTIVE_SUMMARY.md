@@ -23,7 +23,9 @@ filled-but-unbooked order; a damaged settings file can no longer silently
 loosen a cap.
 
 What only the operator can do next: install the release that carries this
-branch and run the forward paper soak for at least one week (R-1); decide
+branch and run the forward paper soak for at least one week (R-1: the
+release was installed and the soak started on 2026-11-04, and the research
+half of R-1 is done, section 7); decide
 the conservative risk profile (R-14); and, before any live capital,
 exchange-placed stops (R-3) and the release signing decision (R-10).
 
@@ -156,7 +158,8 @@ runs against fakes and asserts behaviour (balances, journal rows, activity
 lines, gate verdicts), and the independent verification pass showed the
 regression tests of the defects it checked failing on the base commit. Nothing failed in the final run. Not run, because
 the container has no exchange access and no candle data: anything against
-a real MEXC or Kraken account, the research harness on `research/data`, and
+a real MEXC or Kraken account, the research harness on the candle data
+(rerun on the operator's PC on 2026-11-04 after the audit, section 7), and
 the Windows installer workflow (it runs on GitHub's runner at merge).
 `TEST_RESULTS.md` has the baseline, the per-file list and the financial
 invariants covered.
@@ -165,9 +168,11 @@ invariants covered.
 
 Every figure below is from a committed research result file, a holdout read
 once, or a forward paper cycle on the operator's PC. Nothing was simulated
-for this summary, and the equity-level statistics that need the candle data
-(`research/data`, not in the repository) still have to be rerun on the
-operator's PC with the commands in `PROFITABILITY_ANALYSIS.md`.
+for this summary. The equity-level statistics that need the candle data
+were measured on 2026-11-04 by rerunning the harness on the operator's PC
+(`research/results/classic/wf_metrics.json`; run record, data fingerprints
+and tables in `PROFITABILITY_ANALYSIS.md` section 3.4); the rows marked
+"rerun" come from that file.
 
 | Evidence | Result | Label |
 |---|---|---|
@@ -175,10 +180,13 @@ operator's PC with the commands in `PROFITABILITY_ANALYSIS.md`.
 | Position, holdout read once, 19 trades | +1.11 % mean trade, bootstrap interval [-3.5, +6.3] | out of sample, too few trades to conclude |
 | Shipped Trend (5 % band, volatility-scaled), validation window | annualised Sharpe 0.55; best of 26 variants 0.65; expected maximum of 26 no-skill variants 0.52 | in sample, selected on this window |
 | Deflated Sharpe of the shipped variant | 0.51 (a coin flip that its true Sharpe beats noise) | in sample |
+| Shipped Trend (5 % band), 11 single-pair accounts at the app's sizing, validation window, rerun 2026-11-04 | +1.8 % mean account against +62 % buy and hold; Sharpe 0.45, Sortino 0.70, Calmar 0.53, worst drawdown 4.5 %, invested 53 % of the time; deflated Sharpe 0.13 against 46 trials | in sample, selected on this window, measured on real candles |
+| Same rerun, development window (2020 to 2023) | +18.0 % mean account, mean 2021 return +15.1 % (about 85 % of the summed profit); every account went more than half of the split (777 to 1,233 days) without a new equity high; deflated Sharpe 0.13 | in sample |
+| Position, same rerun, validation window | +0.36 % mean account, Sharpe 0.13, deflated Sharpe 0.07, invested 6 % of the time | in sample |
 | Forward paper cycle 1, Rapid, 18 h | -18 USDT on 10,000 | live prices, simulated fills |
 | Forward paper cycle 3, Trend, 13 h | -11 USDT unrealised on 20,000 | live prices, simulated fills |
 | Forward paper cycle 4, Trend fixed vs volatility-scaled, 2.2 days | -68 USDT (-0.3 %) and -47 USDT (-0.2 %) on 20,000 each, no exits | live prices, simulated fills |
-| Forward paper cycle 5, paused after 38 minutes | each arm about 0.2-0.3 % down | live prices, simulated fills |
+| Forward paper cycle 5, paused after 38 minutes, resumed 2026-11-04 16:03 UTC on v1.5.166 as the one-week soak (R-1) | each arm about 0.2-0.3 % down at the pause; reported at the end of the week | live prices, simulated fills |
 
 The Trend 5 % band's own holdout has deliberately not been read; it is
 reserved for one read after the forward run (roadmap R-16). Doubling the
@@ -191,10 +199,14 @@ No. The shipped Trend variant's validation Sharpe (0.55) sits at the level
 the best of 26 skill-free variants would reach by chance (0.52), its
 deflated Sharpe is 0.51, the plain Trend rule lost on its holdout,
 Position's positive holdout rests on 19 trades with an interval that spans
-zero, and every forward paper cycle since 2026-10-30 is net negative. Across
-all protocols, 46 candidate variants have read the development and
-validation data, and the holdout window has been read at least six times,
-so only a forward paper run is still out of sample.
+zero, and every forward paper cycle since 2026-10-30 is net negative. The
+2026-11-04 rerun on the real candles agrees at the equity level: the
+shipped rule's validation Sharpe is 0.45 (mean of 11 single-pair
+accounts) with a deflated Sharpe of 0.13 against 46 trials, and most of
+its development profit is 2021. Across all protocols, 46 candidate
+variants (47 with the rerun's doubled-cost block) have read the
+development and validation data, and the holdout window has been read at
+least six times, so only a forward paper run is still out of sample.
 
 That is the honest state of the evidence, not a verdict that the strategy
 cannot work: a trend rule earns in bursts over full market cycles, and a few
@@ -240,7 +252,9 @@ acceptance checks. The sequence:
 
 1. **Now, by the operator**: merge the pull request (every merge publishes a
    release), install that release, and run the paper soak for at least one
-   week with streaming quotes off, then on (R-1). Decide whether to adopt
+   week with streaming quotes off, then on (R-1). Done on 2026-11-04 up to
+   the soak's start: v1.5.166 installed, the research rerun committed, the
+   soak running since 16:03 UTC and due to end about 2026-11-11. Decide whether to adopt
    the brief's conservative profile (R-14: 0.25 % risk per trade, 1 % daily
    loss, 5 % drawdown halt, 3 positions); it is documented, not applied.
    Decide what a manual position's exits should be (R-23).

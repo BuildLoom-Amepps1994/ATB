@@ -8,9 +8,11 @@ the review documents it links.
 
 Added
 
-* **Three risk-gate controls**, each enforced by `risk.RiskGate` on every
-  entry path (automatic, manual, paper and live) and each with an off switch
-  (0): `max_entry_atr_pct` (default 15 %) refuses an entry while the signal
+* **Three risk-gate controls**, enforced by `risk.RiskGate` on every engine
+  entry path (automatic and manual, paper and live; a micro (PAPER) entry
+  carries neither an ATR nor a turnover, so only the consecutive-loss
+  control reaches it) and each with an off switch (0, which also releases a
+  stored consecutive-loss latch): `max_entry_atr_pct` (default 15 %) refuses an entry while the signal
   candle's ATR exceeds that share of the price; `max_volume_share_pct`
   (default 0.5 %) refuses an order above that share of the pair's 24 h quote
   turnover and fails closed on a quote without turnover;
@@ -19,8 +21,11 @@ Added
   the day ends or `RESUME TRADING` clears it (`clear_loss_streak_stop`, also
   behind the dashboard's **Clear latched stop** button). The latch is durable
   and shown as `risk.loss_streak_stop`; exits are never blocked by any of the
-  three. At the defaults none of them binds in ordinary conditions
-  (`tests/test_risk_governance.py`).
+  three. At the defaults the volatility and liquidity controls do not bind
+  in ordinary conditions (the scan's own ATR filter and the 1,000,000 USDT
+  turnover floor sit inside them); four losing exits in a UTC day across
+  all pairs is possible in a choppy market, and the latch is then the
+  designed outcome (`tests/test_risk_governance.py`).
 * **Research statistics** (`research/metrics.py`, hand-worked tests in
   `tests/test_metrics.py`): profit factor, expectancy, payoff, win rate,
   trade-level expected shortfall, bootstrap interval of the mean trade, CAGR,

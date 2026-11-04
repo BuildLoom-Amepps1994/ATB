@@ -313,7 +313,11 @@ class RiskGate:
         record = self._streak_record(mode)
         count = self._streak_count(mode, record)
         latched_at = record['latched_at']
-        if limit > 0 and count >= limit and not latched_at:
+        if limit <= 0:
+            # Zero switches the control off: a latch stored before the setting
+            # was changed holds nothing. The record stays for the day's count.
+            latched_at = None
+        elif count >= limit and not latched_at:
             latched_at = _now_iso()
             storage.set_meta(self._key('loss_streak', mode), json.dumps({**record, 'latched_at': latched_at}))
             storage.audit('error', f'{mode.upper()} consecutive-loss stop latched: {count} losing exits in a row today '

@@ -127,15 +127,27 @@ def test_four_losing_exits_in_a_row_latch_entries_for_the_day(engine):
         losing_round_trip(engine)
     assert engine.risk.loss_streak('paper') == {'date': risk._today(), 'count': 3, 'latched_at': None}
     assert engine._buy('BTC/USDT', 200, 100, .04, volume=20000000)        # still allowed at three
-    position = engine._active_positions('paper')[0]
+    observe(engine, 'BTC/USDT')
+    assert engine._buy('ETH/USDT', 200, 100, .04, volume=20000000)        # a second holding, sold under the latch below
+    observe(engine, 'ETH/USDT')
+    position = next(p for p in engine._active_positions('paper') if p['symbol'] == 'BTC/USDT')
     assert engine._sell(position, 90, 'fourth loss')
     latched = engine.risk.loss_streak_stop('paper')
     assert latched
     assert not engine._buy('BTC/USDT', 200, 100, .04, volume=20000000)
     assert engine.risk.last_block['reasons'][0].startswith('Consecutive-loss stop latched')
-    # Exits remain possible while latched: a manual sell of a holding is not an entry.
+    # Exits remain possible while latched: a sell of a holding is not an entry.
     status = engine.risk.status()
     assert status['loss_streak_stop'] == latched and status['loss_streak']['count'] == 4
+    held = next(p for p in engine._active_positions('paper') if p['symbol'] == 'ETH/USDT')
+    assert engine._sell(held, 95, 'exit under the latch')
+    assert engine.risk.loss_streak('paper')['count'] == 5 and engine.risk.loss_streak_stop('paper') == latched
+    # Setting the limit to zero switches the control off, a stored latch included.
+    engine.cfg['max_consecutive_losses'] = 0
+    assert engine.risk.loss_streak_stop('paper') is None
+    assert engine._buy('BTC/USDT', 200, 100, .04, volume=20000000)
+    engine.cfg['max_consecutive_losses'] = 4
+    assert engine.risk.loss_streak_stop('paper') == latched           # the stored latch holds again once the control is on
     # Restart: the latch is durable.
     other = trader.TradingEngine()
     assert other.risk.loss_streak_stop('paper') == latched

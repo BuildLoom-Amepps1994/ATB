@@ -192,17 +192,21 @@ at a new high (Position's ADA account took no validation trade, so its
 its equity never moved) the mean is over the ten accounts that have one,
 marked in the Pairs column; the account return, exposure and turnover
 means include it. The account means are the mean of the 11 per-pair
-returns rounded once (the file's summary stores them at three decimals).
-The trade statistics pool the closed trades of the 11 accounts, except
-"max losses in a row", which is the longest losing streak inside one
-account (the file's pooled figure counts runs across the concatenated
-accounts, which no account experienced). The probabilistic Sharpe ratio is
+returns rounded once (the file's summary stores them at three decimals),
+and so is every other mean in the tables. The trade statistics pool the
+closed trades of the 11 accounts, except "max losses in a row", which is
+the longest losing streak inside one account (the file's pooled figure
+counts runs that continue across the boundary between two concatenated
+accounts: 5 instead of 4 on Trend validation, 6 instead of 4 on Position
+development and 5 instead of 4 on Position validation; on Trend development
+the two agree at 14, DOGE's own streak). The probabilistic Sharpe ratio is
 the probability that an account's true Sharpe is above zero, using the
 account's own skew and kurtosis. The deflated Sharpe ratio takes the mean
 of the accounts' per-day Sharpe ratios, treats it as one Sharpe estimated
 over the shortest account's day count (1,112 on development, 487 on
-validation) with normal returns, and gives the probability that it exceeds
-the expected maximum Sharpe of 46 skill-less variants (the trial count of
+validation) with normal returns, and gives the probability that the true
+Sharpe behind that estimate exceeds the expected maximum Sharpe of 46
+skill-less variants (the trial count of
 section 3.3 at the time of the run), which the harness put at 0.074 per
 day, about 1.4 annualised, from the spread of the per-day Sharpe ratios
 across every pair, strategy, cost and split in the run (86 runs, variance
@@ -228,7 +232,7 @@ in the file.
 | Position, realistic costs | development | 11 | +1.96 % | +1569.8 % | -3.56 % | 0.35 | 0.89 | 0.51 | 1105 days | 0.03 | 0.17 |
 | Position, realistic costs | validation | 11 (10 with a Sharpe) | +0.36 % | +62.5 % | -2.59 % | 0.13 | 0.58 | 0.46 | 486 days | 0.06 | 0.41 |
 | Position, doubled costs | development | 11 | +1.88 % | +1566.5 % | -3.57 % | 0.34 | 0.86 | 0.49 | 1105 days | 0.03 | 0.16 |
-| Position, doubled costs | validation | 11 (10 with a Sharpe) | +0.31 % | +62.1 % | -2.58 % | 0.10 | 0.53 | 0.43 | 486 days | 0.06 | 0.41 |
+| Position, doubled costs | validation | 11 (10 with a Sharpe) | +0.31 % | +62.1 % | -2.58 % | 0.09 | 0.53 | 0.43 | 486 days | 0.06 | 0.41 |
 
 **Pooled trade statistics.**
 
@@ -324,8 +328,10 @@ ends on 2023-12-31, so its 2024 column is one day.
   +1.8 % over 16 months against +62 % for holding the coins, with
   a mean Sharpe of 0.45, Sortino 0.70, Calmar 0.53, a worst drawdown of
   4.45 % and 53 % of the time invested. The deflated Sharpe
-  ratio of that mean is **0.13**: a 13 % probability that the mean per-day
-  Sharpe exceeds what the best of 46 skill-less variants would show. Just
+  ratio of that mean is **0.13**: given the observed mean per-day Sharpe
+  of 0.023, a 13 % probability that the true Sharpe behind it exceeds the
+  0.074 per day the best of 46 skill-less variants would be expected to
+  show. Just
   over half of the summed profit (54 %) is in two accounts (XRP +5.5 %,
   DOGE +5.3 %), the other eight positive accounts gained +0.31 % to
   +2.15 % each, SOL lost (-0.07 %), and all of it was made in 2024

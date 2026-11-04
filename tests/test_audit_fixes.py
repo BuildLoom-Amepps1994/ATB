@@ -296,3 +296,40 @@ def test_prefetch_stops_downloading_once_cancelled():
     for worker in workers:
         worker.join(5)
     assert len(calls) < 20
+
+
+# ------------------------------------------------------- live exits share a balance read
+def test_protective_exits_of_one_tick_share_a_single_balance_read(engine):
+    client = arm_fake_live(engine)
+    assert engine._buy('BTC/USDT', 800, 100, .04)
+    observe(engine, 'BTC/USDT')
+    assert engine._buy('ETH/USDT', 800, 100, .04)
+    reads = []                                                     # orders sent at the time of each balance read
+    original = client.fetch_balance
+    client.fetch_balance = lambda *a: reads.append(len(client.orders)) or original()
+    client.fill = {'id': 'sell', 'status': 'closed', 'filled': 1., 'cost': 90., 'average': 90., 'fee': {'currency': 'USDT', 'cost': .09}}
+    engine.running = True
+    engine.public.price = 90                                       # both stops breached
+    engine._monitor_if_due(force=True)
+    assert engine._active_positions('live') == []
+    assert sum(1 for order in client.orders if order[1][2] == 'sell') == 2
+    assert reads == [2, 4]      # after the two buys: one read before the first exit served both; the valuation read came after the fills
+
+
+def test_a_booked_sell_lowers_the_cached_free_amount_of_its_own_asset(engine):
+    client = arm_fake_live(engine)
+    assert engine._buy('BTC/USDT', 800, 100, .04)
+    position = engine._active_positions('live')[0]
+    client.fetch_balance = lambda *a: {'free': {'USDT': 10000., 'BTC': 1.}}
+    client.fill = {'id': 'sell', 'status': 'canceled', 'filled': .4, 'cost': 44., 'average': 110.,
+                   'fee': {'currency': 'USDT', 'cost': .044}}
+    assert engine._sell(position, 110, 'partial')
+    cached, _ = engine._tick_balance
+    assert cached['free']['BTC'] == pytest.approx(.6)
+    remainder = engine._active_positions('live')[0]
+    assert remainder['qty'] == pytest.approx(.6)
+    client.fill = {'id': 'sell2', 'status': 'closed', 'filled': .6, 'cost': 66., 'average': 110.,
+                   'fee': {'currency': 'USDT', 'cost': .066}}
+    assert engine._sell(remainder, 110, 'rest')                    # the cached read still serves within the window
+    assert client.orders[-1][1][3] == pytest.approx(.6)
+    assert engine._active_positions('live') == []

@@ -102,6 +102,12 @@ Fixed
   websocket client).
 * **Candle prefetch stops at Stop** instead of finishing its queue against
   the rate budget.
+* **Protective exits of one tick share a single live balance read**
+  (hardening review finding 6). Each exit read the account balance before
+  selling, so the exits of several positions waited one round trip each (a
+  second apiece on Kraken). A read taken in the same tick within three
+  seconds now serves the next exit; a booked sell lowers the cached free
+  amount of its own asset.
 
 ## Unreleased: Trend reads daily candles only; the week's changes reviewed
 

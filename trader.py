@@ -101,6 +101,7 @@ class TradingEngine:
         # Last (action, status, reasons) written to the event log per symbol.
         self._entry_trail: dict[tuple, tuple] = {}
         self.latest_balance = self.balance_updated_at = None
+        self._tick_balance: tuple[dict | None, float] = (None, 0.0)   # one live balance read per protective tick
         self.last_universe_update = 0.0
         self.discovered: list[str] = []
         self.risk_block = None
@@ -281,6 +282,27 @@ class TradingEngine:
             raise storage.ConfigValidationError('Live positions, orders, or current-day risk state belong to another or unverified API identity; reconcile before replacing credentials.')
         if bind and previous != fingerprint:
             storage.set_meta(meta, fingerprint)
+
+    EXIT_BALANCE_REUSE_SECONDS = 3.0
+
+    def _balance_for_exit(self, client) -> dict:
+        """One balance read serves every protective exit of a tick (hardening finding 6).
+
+        Selling one asset leaves the other assets' free balances unchanged,
+        so a read taken a few seconds earlier in the same tick is as good as
+        a fresh one for the next position's exit, and the exits of several
+        positions no longer wait one balance round trip each (a second apiece
+        on Kraken). Each booked sell lowers the cached free amount of its own
+        asset; anything older than a few seconds is read again.
+        """
+        with self.lock:
+            balance, taken = self._tick_balance
+        if balance is not None and time.monotonic() - taken <= self.EXIT_BALANCE_REUSE_SECONDS:
+            return balance
+        balance = self._read_balance(client)
+        with self.lock:
+            self._tick_balance = (balance, time.monotonic())
+        return balance
 
     def _read_balance(self, client=None) -> dict:
         # MEXC selects its spot wallet by type; Kraken forwards unknown fields
@@ -786,6 +808,8 @@ class TradingEngine:
         if not positions:
             return exited
         started = time.monotonic()
+        with self.lock:
+            self._tick_balance = (None, 0.0)
         held = [p['symbol'] for p in positions]
         current = self.feed          # read once: the settings thread can stop and clear it meanwhile
         streamed = current is not None and current.covers(held, max_age=self.STREAM_MAX_AGE_SECONDS)
@@ -1708,7 +1732,7 @@ class TradingEngine:
             client = self._ensure_private()
             if getattr(client, 'has', {}).get('createMarketOrder') is False:
                 raise storage.ConfigValidationError('This exchange adapter does not support market exits.')
-            balance = self._read_balance(client)
+            balance = self._balance_for_exit(client)
             available = finite_positive(balance.get('free', {}).get(symbol.split('/')[0]))
             if not available:
                 self.risk_block = f'No freely available tracked balance for {symbol}; manual review required'
@@ -1808,6 +1832,11 @@ class TradingEngine:
             if mode == 'live':
                 with self.lock:
                     self.balance_updated_at = None
+                    cached, _taken = self._tick_balance
+                    free = cached.get('free') if isinstance(cached, dict) and isinstance(cached.get('free'), dict) else None
+                    base = symbol.split('/')[0]
+                    if free is not None and isinstance(free.get(base), (int, float)) and not isinstance(free.get(base), bool):
+                        free[base] = max(0.0, float(free[base]) - filled)   # the cached read is used by the next exit
             # Reports first, each failure contained, then the safety checks,
             # which run whatever happened to the reports.
             try:

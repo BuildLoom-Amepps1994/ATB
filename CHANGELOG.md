@@ -214,6 +214,12 @@ Fixed
   dust remainder, and a position above dust is still "held".
 * **A failed audit write inside the protective tick no longer ends the
   tick** before the other positions are checked.
+* **The shared balance read of a protective tick carries each sale's cash
+  forward.** A later exit in the same tick valued the account without the
+  earlier exits' proceeds, so its realised-loss check could latch the
+  durable daily stop early (verification of the one-read-per-tick change);
+  the cached read now gains the proceeds and gives up the units consumed
+  including a base-denominated fee, and a live buy discards it.
 * **Research: the rotation and stop simulator bought a stopped coin back at
   the same day's open** (`research/trend_rotation.py`, now
   `trend-rotation-v2`), so every stop was charged without removing the

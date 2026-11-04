@@ -359,6 +359,7 @@ def test_a_booked_sell_lowers_the_cached_free_amount_of_its_own_asset(engine):
     assert engine._sell(position, 110, 'partial')
     cached, _ = engine._tick_balance
     assert cached['free']['BTC'] == pytest.approx(.6)
+    assert cached['free']['USDT'] == pytest.approx(10000 + 44 - .044)   # the proceeds serve the next exit's checks
     remainder = engine._active_positions('live')[0]
     assert remainder['qty'] == pytest.approx(.6)
     client.fill = {'id': 'sell2', 'status': 'closed', 'filled': .6, 'cost': 66., 'average': 110.,
@@ -369,6 +370,41 @@ def test_a_booked_sell_lowers_the_cached_free_amount_of_its_own_asset(engine):
 
 
 # ------------------------------------------------------- stop and prefetch
+def test_a_later_exit_in_the_same_tick_values_the_account_with_the_earlier_proceeds(engine, monkeypatch):
+    """Verification of F-8: the shared read must carry each sale's cash forward.
+
+    Otherwise the second exit's realised-loss check sees an equity short of
+    the first exit's proceeds and can latch the durable daily stop early.
+    """
+    client = arm_fake_live(engine)
+    assert engine._buy('BTC/USDT', 800, 100, .04)
+    observe(engine, 'BTC/USDT')
+    assert engine._buy('ETH/USDT', 800, 100, .04)
+    observe(engine, 'ETH/USDT')
+    client.fetch_balance = lambda *a: {'free': {'USDT': 100., 'BTC': 1., 'ETH': 1.}}
+    seen = []
+    monkeypatch.setattr(engine.risk, 'observe_realized', lambda mode, equity: seen.append(equity))
+    client.fill = {'id': 's1', 'status': 'closed', 'filled': 1., 'cost': 110., 'average': 110.,
+                   'fee': {'currency': 'USDT', 'cost': .11}}
+    btc, eth = sorted(engine._active_positions('live'), key=lambda p: p['symbol'])
+    assert engine._sell(btc, 110, 'first')
+    assert engine._sell(eth, 110, 'second')
+    assert len(seen) == 2
+    assert seen[1] == pytest.approx(100 + 2 * (110 - .11), rel=1e-6)   # both sales' cash, not the stale read plus one
+
+
+def test_a_booked_sell_gives_up_a_base_denominated_fee_from_the_cached_read(engine):
+    client = arm_fake_live(engine)
+    assert engine._buy('BTC/USDT', 800, 100, .04)
+    position = engine._active_positions('live')[0]
+    client.fetch_balance = lambda *a: {'free': {'USDT': 10000., 'BTC': 1.}}
+    client.fill = {'id': 'sell', 'status': 'canceled', 'filled': .4, 'cost': 44., 'average': 110.,
+                   'fee': {'currency': 'BTC', 'cost': .004}}
+    assert engine._sell(position, 110, 'partial')
+    cached, _ = engine._tick_balance
+    assert cached['free']['BTC'] == pytest.approx(1 - .404)
+
+
 def test_a_stop_during_the_workers_final_feed_close_does_not_stick_as_stopping(engine):
     class Closing:                                     # the worker thread after it cleared `running`
         def is_alive(self):

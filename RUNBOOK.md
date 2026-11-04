@@ -211,7 +211,14 @@ acknowledged and what it filled (`submitted_at`, `acked_at`,
 holding and its stop for a buy; the sale for a sell), then add
 `--acknowledge-unbooked-fills` to the command above; the audit line records
 the acknowledgement. There is deliberately no automatic booking from the
-journal: it does not hold the fill's fee.
+journal: it does not hold the fill's fee. The refusal covers `filled` rows
+only: an `acked`, `submitted` or `uncertain` row may also have filled at the
+exchange without the journal knowing, so check each one in the exchange's
+order history and book any fill the same way before clearing. Bringing the
+ledger in line means editing `portfolio.sqlite3` by hand (a position row
+with its stop and target for a buy; a trade row and the position change
+for a sell) after copying the data folder; a reviewed repair command is
+roadmap item R-2 in `docs/audit/IMPROVEMENT_ROADMAP.md`.
 
 The probe on **Connect** helps: for each unresolved intent it reports whether
 the exchange knows an order with that client order id and what state it is in.

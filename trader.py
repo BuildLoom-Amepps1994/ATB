@@ -1720,6 +1720,7 @@ class TradingEngine:
             if mode == 'live':
                 with self.lock:
                     self.balance_updated_at = None
+                    self._tick_balance = (None, 0.0)   # the shared read predates this purchase; the next exit reads again
             # Reports first, each failure contained, then the safety checks,
             # which run whatever happened to the reports.
             try:
@@ -1874,14 +1875,23 @@ class TradingEngine:
                 if intent:
                     storage.update_order_intent(intent, 'accounted', order_id=order_id, db=db)
             booked = True
+            # The account's cash after this sale, taken before the cached read is credited below.
+            cash_after = (cash if mode == 'paper' else float(balance['free'].get('USDT', 0) or 0)) + proceeds
             if mode == 'live':
                 with self.lock:
                     self.balance_updated_at = None
                     cached, _taken = self._tick_balance
                     free = cached.get('free') if isinstance(cached, dict) and isinstance(cached.get('free'), dict) else None
                     base = symbol.split('/')[0]
-                    if free is not None and isinstance(free.get(base), (int, float)) and not isinstance(free.get(base), bool):
-                        free[base] = max(0.0, float(free[base]) - filled)   # the cached read is used by the next exit
+                    if free is not None:
+                        # The cached read serves the next exit of this tick: it gives up the
+                        # units this sale consumed (fill plus a base-denominated fee) and
+                        # gains the proceeds, so a later exit's realised-loss check values
+                        # the account with this sale's cash, not without it.
+                        for asset, delta in ((base, -consumed), ('USDT', proceeds)):
+                            held = free.get(asset, 0.0 if delta > 0 else None)
+                            if isinstance(held, (int, float)) and not isinstance(held, bool):
+                                free[asset] = max(0.0, float(held) + delta)
             # Reports first, each failure contained, then the safety checks,
             # which run whatever happened to the reports.
             try:
@@ -1895,7 +1905,6 @@ class TradingEngine:
             # once: a manual close runs with the worker stopped, so no later
             # valuation may see the crossing before a profit or the UTC day hides it.
             try:
-                cash_after = (cash if mode == 'paper' else float(balance['free'].get('USDT', 0) or 0)) + proceeds
                 self.risk.observe_realized(mode, self._equity(mode, cash_after, self._active_positions(mode)))
             except Exception as exc:
                 self._quiet_audit(f'Realised-loss check after the {symbol} exit failed ({type(exc).__name__}); '

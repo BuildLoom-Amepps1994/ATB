@@ -85,7 +85,8 @@ every exchange is a fake).
 Not run here, because the container has no exchange access and no candle
 data: anything against a real MEXC or Kraken account (the suspected defects
 and assumptions in `CRITICAL_DEFECTS.md` sections 3 and 5), the research
-harness on `research/data` (the commands are in
-`PROFITABILITY_ANALYSIS.md`), and the Windows installer workflow, which runs
+harness on the candle data (the commands are in
+`PROFITABILITY_ANALYSIS.md`; the operator's PC ran them on 2026-11-04 after
+the audit, its section 3.4), and the Windows installer workflow, which runs
 on GitHub's runner when the pull request merges.
 

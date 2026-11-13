@@ -93,7 +93,10 @@ confirmed and capital-relevant, in small commits with regression tests
 Two things the method cannot do: reach an exchange (so Kraken's client
 order id format, MEXC's ticker clock and the paper engine's cost realism
 stay unverified), and read the real candle data (so the equity-level
-statistics are reported as NOT RUN rather than estimated).
+statistics were reported as NOT RUN rather than estimated). The second
+gap was closed after the audit: on 2026-11-04 the operator's PC reran the
+harness on the real candles, read-only, and `PROFITABILITY_ANALYSIS.md`
+section 3.4 carries the measured values with the run record.
 
 ## 4. Architecture
 
@@ -328,5 +331,7 @@ Lens ids (`accounting-1`) are the finders' numbering; `F-`, `D-`, `S-` and
 It did not place or simulate a live order against an exchange, read any
 credential, change a strategy parameter or a default, enable live trading,
 or read the Trend holdout a second time. It did not measure anything on real
-candle data: `BACKTEST_VALIDATION.md` and `PROFITABILITY_ANALYSIS.md` say
-exactly which numbers are therefore NOT RUN and how to run them.
+candle data: `BACKTEST_VALIDATION.md` and `PROFITABILITY_ANALYSIS.md` said
+exactly which numbers were therefore NOT RUN and how to run them; the
+operator's PC ran them on 2026-11-04 (`PROFITABILITY_ANALYSIS.md` section
+3.4), which did not change the verdict.
